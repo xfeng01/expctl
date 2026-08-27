@@ -8,6 +8,8 @@ expctl is deliberately **not** a scheduler, pipeline engine, or tracking
 server (use Snakemake, submitit, DVC, or W&B for those). It does one thing:
 make the handoff itself safe and auditable.
 
+中文使用指南：[docs/usage.zh.md](docs/usage.zh.md)
+
 ## The protocol
 
 - `expctl/requests/<id>.toml` — an **immutable request**. It pins the

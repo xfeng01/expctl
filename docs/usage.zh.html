@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>expctl 中文使用指南</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;700&family=Noto+Sans+SC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #F5F7FA;
+    --surface: #FFFFFF;
+    --ink: #1B2430;
+    --muted: #5B6776;
+    --accent: #1F5FBF;
+    --accent-ink: #164A96;
+    --accent-soft: #E6EEFB;
+    --code-bg: #EEF2F7;
+    --code-ink: #24303F;
+    --rule: #D8DEE7;
+    --state-requested: #5B6776;
+    --state-submitted: #9A6200;
+    --state-collected: #1E7A45;
+    --warn-bg: #FFF6E5;
+    --warn-rule: #E5C57A;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121820;
+      --surface: #1A222D;
+      --ink: #E6EAF0;
+      --muted: #98A4B4;
+      --accent: #7FB0FF;
+      --accent-ink: #A8C8FF;
+      --accent-soft: #1E2F48;
+      --code-bg: #0E141B;
+      --code-ink: #D5DCE6;
+      --rule: #2A3442;
+      --state-requested: #98A4B4;
+      --state-submitted: #E0A93A;
+      --state-collected: #5CC488;
+      --warn-bg: #2A2416;
+      --warn-rule: #6B5420;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #121820;
+    --surface: #1A222D;
+    --ink: #E6EAF0;
+    --muted: #98A4B4;
+    --accent: #7FB0FF;
+    --accent-ink: #A8C8FF;
+    --accent-soft: #1E2F48;
+    --code-bg: #0E141B;
+    --code-ink: #D5DCE6;
+    --rule: #2A3442;
+    --state-requested: #98A4B4;
+    --state-submitted: #E0A93A;
+    --state-collected: #5CC488;
+    --warn-bg: #2A2416;
+    --warn-rule: #6B5420;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: 16px;
+    line-height: 1.8;
+    -webkit-font-smoothing: antialiased;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    html { scroll-behavior: smooth; }
+  }
+
+  .page {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 56px 24px 96px;
+    display: grid;
+    grid-template-columns: 200px minmax(0, 720px);
+    column-gap: 56px;
+    row-gap: 40px;
+  }
+  header { grid-column: 1 / -1; }
+  nav { grid-column: 1; align-self: start; position: sticky; top: 24px; }
+  main { grid-column: 2; min-width: 0; }
+  @media (max-width: 900px) {
+    .page { grid-template-columns: minmax(0, 1fr); padding-top: 40px; }
+    nav { position: static; grid-column: 1; }
+    main { grid-column: 1; }
+  }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 12px;
+  }
+  h1, h2, h3 {
+    font-family: "Noto Serif SC", "Songti SC", "SimSun", serif;
+    font-weight: 700;
+    line-height: 1.3;
+    text-wrap: balance;
+    margin: 0;
+  }
+  h1 { font-size: 40px; letter-spacing: 0.01em; }
+  h2 { font-size: 24px; margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--rule); }
+  h2:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+  h3 { font-size: 17px; font-weight: 600; margin-top: 32px; font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  h2 .num {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--accent);
+    letter-spacing: 0.08em;
+    margin-right: 12px;
+    vertical-align: 3px;
+  }
+  .lede { font-size: 18px; max-width: 720px; margin: 20px 0 0; color: var(--ink); }
+  p { margin: 14px 0; }
+  p.muted, .muted { color: var(--muted); }
+  a { color: var(--accent-ink); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  strong { font-weight: 700; }
+  code {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.9em;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
+
+  /* flow strip */
+  .flow {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin-top: 32px;
+    counter-reset: step;
+  }
+  .flow .step {
+    position: relative;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 14px 16px 16px;
+  }
+  .flow .step .who {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .flow .step .who::before { counter-increment: step; content: counter(step) " · "; color: var(--accent); }
+  .flow .step .what { font-weight: 500; margin-top: 6px; }
+  .flow .step .file { margin-top: 6px; font-size: 13px; color: var(--muted); }
+  .flow .step .file code { font-size: 12px; }
+  .flow .step:not(:last-child)::after {
+    content: "→";
+    position: absolute;
+    right: -12px;
+    top: 50%;
+    transform: translateY(-55%);
+    color: var(--accent);
+    background: var(--bg);
+    padding: 0 2px;
+    font-size: 16px;
+    z-index: 1;
+  }
+  @media (max-width: 720px) {
+    .flow { grid-template-columns: 1fr; }
+    .flow .step:not(:last-child)::after { content: "↓"; right: auto; left: 50%; top: 100%; transform: translate(-50%, -30%); }
+  }
+
+  /* nav */
+  nav .navtitle {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  nav ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  nav a { color: var(--ink); text-decoration: none; font-size: 14px; display: flex; gap: 10px; }
+  nav a:hover { color: var(--accent-ink); }
+  nav a .n { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 12px; color: var(--accent); min-width: 1.6em; }
+  @media (max-width: 900px) {
+    nav ol { flex-direction: row; flex-wrap: wrap; gap: 6px 18px; }
+  }
+
+  /* code blocks */
+  pre {
+    position: relative;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 18px 18px 16px;
+    margin: 18px 0;
+    overflow-x: auto;
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 13.5px;
+    line-height: 1.7;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; color: inherit; }
+  pre[data-lang]::before {
+    content: attr(data-lang);
+    position: absolute;
+    top: 6px; right: 12px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  pre .c { color: var(--muted); }
+  pre .k { color: var(--accent-ink); }
+
+  /* tables */
+  .table-wrap { overflow-x: auto; margin: 18px 0; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; vertical-align: top; padding: 10px 14px; border-bottom: 1px solid var(--rule); }
+  th { font-weight: 500; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); background: var(--bg); }
+  tr:last-child td { border-bottom: 0; }
+  td:first-child { white-space: nowrap; }
+  td code { white-space: nowrap; }
+
+  /* state pills */
+  .pill {
+    display: inline-block;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11.5px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    line-height: 1.6;
+    white-space: nowrap;
+  }
+  .pill.requested { color: var(--state-requested); }
+  .pill.submitted { color: var(--state-submitted); }
+  .pill.collected { color: var(--state-collected); }
+
+  /* callouts */
+  .note {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 12px 16px;
+    border-radius: 0 6px 6px 0;
+    margin: 18px 0;
+  }
+  .warn {
+    border-left: 3px solid var(--warn-rule);
+    background: var(--warn-bg);
+    padding: 12px 16px;
+    border-radius: 0 6px 6px 0;
+    margin: 18px 0;
+  }
+  .note p, .warn p { margin: 0; }
+
+  ul, ol.steps { padding-left: 1.4em; margin: 12px 0; }
+  li { margin: 6px 0; }
+  ol.steps > li { padding-left: 4px; }
+  ol.steps > li::marker { font-family: "IBM Plex Mono", ui-monospace, monospace; color: var(--accent); font-weight: 500; }
+
+  .tree { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 13.5px; line-height: 1.7; }
+  .tree .c { color: var(--muted); }
+
+  .states {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin: 18px 0;
+  }
+  .states div {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 12px 14px;
+    font-size: 14px;
+  }
+  .states div .pill { margin-top: 6px; }
+  @media (max-width: 720px) { .states { grid-template-columns: 1fr 1fr; } }
+
+  footer { grid-column: 2; color: var(--muted); font-size: 13px; border-top: 1px solid var(--rule); padding-top: 20px; }
+  @media (max-width: 900px) { footer { grid-column: 1; } }
+</style>
+
+<div class="page">
+  <header>
+    <p class="eyebrow">expctl · v0.2.0 · 异步实验交接</p>
+    <h1>expctl 中文使用指南</h1>
+    <p class="lede">
+      expctl 用 Git 仓库中的请求、回执和结果文件交接异步实验。实验设计者与集群操作者不必同时在线，也能确认运行了哪一版代码、使用了哪些参数，并追溯结果来源。
+    </p>
+    <div class="flow" aria-label="交接流程">
+      <div class="step">
+        <div class="who">设计实验的人</div>
+        <div class="what">发布请求并固定代码版本</div>
+        <div class="file"><code>expctl/requests/&lt;id&gt;.toml</code></div>
+      </div>
+      <div class="step">
+        <div class="who">跑实验的人</div>
+        <div class="what">验证请求并提交到 SLURM</div>
+        <div class="file">生成回执 <code>receipt.json</code></div>
+      </div>
+      <div class="step">
+        <div class="who">跑实验的人</div>
+        <div class="what">收集日志和指标</div>
+        <div class="file"><code>expctl/results/&lt;id&gt;/</code></div>
+      </div>
+      <div class="step">
+        <div class="who">设计实验的人</div>
+        <div class="what">审阅结果并记录结论</div>
+        <div class="file">报告、实验笔记</div>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:18px;max-width:720px">
+      expctl 不替代 SLURM、工作流引擎或实验跟踪平台；它只负责让实验交接可验证、可审计。本文所称“发布请求”是指将请求推送到 Git，“提交作业”是指运行 <code>expctl submit</code>。回执生成后，请求文件不得再修改。
+    </p>
+  </header>
+
+  <nav aria-label="目录">
+    <div class="navtitle">目录</div>
+    <ol>
+      <li><a href="#install"><span class="n">一</span>安装</a></li>
+      <li><a href="#init"><span class="n">二</span>初始化项目</a></li>
+      <li><a href="#author"><span class="n">三</span>创建请求</a></li>
+      <li><a href="#runner"><span class="n">四</span>提交与收集</a></li>
+      <li><a href="#request"><span class="n">五</span>请求文件</a></li>
+      <li><a href="#config"><span class="n">六</span>配置参考</a></li>
+      <li><a href="#commands"><span class="n">七</span>命令与状态</a></li>
+      <li><a href="#trouble"><span class="n">八</span>异常处理</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <h2 id="install"><span class="num">一</span>安装（每台机器一次）</h2>
+    <p>所有机器都需要 Git 和 Python 3.11 或更高版本。负责提交作业的集群环境还需要 <code>sbatch</code>、<code>squeue</code>、<code>sacct</code>；启用节点预算时还会使用 <code>scontrol</code>。推荐使用 <code>uv</code> 安装：</p>
+<pre data-lang="bash"><code>uv tool install git+https://github.com/xfeng01/expctl</code></pre>
+    <p>更新：</p>
+<pre data-lang="bash"><code>uv tool upgrade expctl</code></pre>
+    <div class="note"><p><strong>零安装方式</strong>：只复制 <code>src/expctl/core.py</code>，运行 <code>python core.py &lt;command&gt;</code>。该文件仅依赖 Python 标准库；Git 和相应的 SLURM 命令仍须存在。所有命令都应在 Git 工作树内运行。</p></div>
+
+    <h2 id="init"><span class="num">二</span>初始化项目</h2>
+    <p>在项目仓库中运行：</p>
+<pre data-lang="bash"><code>expctl init</code></pre>
+    <p>该命令只补齐缺失项，不覆盖已有文件：</p>
+<pre class="tree"><code>expctl.toml                  <span class="c"># 仓库级策略</span>
+expctl/
+├── requests/               <span class="c"># 实验请求</span>
+├── results/                <span class="c"># 回执、日志、指标和报告</span>
+└── templates/request.toml  <span class="c"># 请求模板</span></code></pre>
+    <p>随后编辑 <code>expctl.toml</code>，至少确认允许的 SLURM 参数、节点上限、共享运行时目录和 worktree 位置（见“配置参考”）。</p>
+    <p>若修改 <code>paths.root</code>，需将 <code>init</code> 生成的目录移动到新位置。将配置、请求、模板和结果元数据纳入版本控制；不要提交数据集、模型权重、缓存或密钥。</p>
+    <div class="note"><p>expctl 只读写文件，不会自动执行 <code>git add</code>、<code>git commit</code> 或 <code>git push</code>。</p></div>
+
+    <h2 id="author"><span class="num">三</span>创建并发布实验请求</h2>
+    <ol class="steps">
+      <li>提交并推送本次实验所需的脚本、配置和评测代码。</li>
+      <li>将 <code>&lt;root&gt;/templates/request.toml</code> 复制为 <code>&lt;root&gt;/requests/&lt;id&gt;.toml</code>，填写请求字段。</li>
+      <li>使用完整的 40 位提交哈希固定代码版本并验证请求：
+<pre data-lang="bash"><code>git rev-parse HEAD
+expctl validate 20260901-lr-sweep</code></pre></li>
+      <li>将请求文件提交并推送到 Git 仓库。</li>
+    </ol>
+    <p><code>validate</code> 会检查请求格式、固定提交是否存在，以及该提交中的作业脚本是否包含所有 <code>scheduler.required_script_lines</code>。回执生成前可以修正并重新发布请求；回执生成后必须保持文件字节不变。</p>
+
+    <h2 id="runner"><span class="num">四</span>提交、查看和收集</h2>
+    <p>在集群上的项目仓库里：</p>
+<pre data-lang="bash"><code>git pull --ff-only
+expctl list
+expctl show &lt;id&gt;
+expctl submit &lt;id&gt; --dry-run
+expctl submit &lt;id&gt;</code></pre>
+    <p><code>--dry-run</code> 会验证请求并输出固定提交、worktree 路径、<code>sbatch</code> 命令和声明的节点数。它不会创建 worktree、链接共享目录、检查运行时依赖或节点预算，也不会调用 <code>sbatch</code>。</p>
+    <p>正式提交时，expctl 会创建或验证位于固定提交上的 detached worktree，链接共享目录，检查 <code>notes.requirements</code> 和节点预算，再调用 <code>sbatch --parsable</code> 并写入回执。已有回执的请求不能再次提交。</p>
+    <div class="note"><p>若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 <code>receipt.json</code>。</p></div>
+
+    <h3>看进度</h3>
+<pre data-lang="bash"><code>expctl status &lt;id&gt;</code></pre>
+    <p><code>in_queue: true</code> 表示 <code>squeue</code> 仍能查到该作业或其数组任务。作业离开队列后，expctl 改用 <code>sacct</code> 返回状态和退出码；查询失败或无记录时返回 <code>UNKNOWN</code>。</p>
+
+    <h3>收集结果</h3>
+<pre data-lang="bash"><code>expctl collect &lt;id&gt;</code></pre>
+    <p>确认作业结束且日志写入完成后再运行 <code>collect</code>。它会校验请求哈希，将匹配的日志复制到 <code>&lt;root&gt;/results/&lt;id&gt;/logs/</code>，按文件提取指标到 <code>metrics.json</code>，并将 <code>sacct</code> 结果写入回执。</p>
+    <p><code>collect</code> 不会等待作业，也不会判断日志是否完整；没有匹配日志时会报错。完成后应审阅原始日志，按 <code>decision_rule</code> 写入 <code>report.md</code>，再提交并推送结果目录。</p>
+
+    <h2 id="request"><span class="num">五</span>请求文件参考</h2>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>字段</th><th>约束与含义</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td>形如 <code>20260901-lr-sweep</code>；必须与文件名一致，并匹配 <code>^[0-9]{8}-[a-z0-9][a-z0-9-]*$</code></td></tr>
+        <tr><td><code>title</code></td><td>非空的实验标题</td></tr>
+        <tr><td><code>question</code></td><td>本实验要消除的不确定性</td></tr>
+        <tr><td><code>decision_rule</code></td><td>哪种结果会改变下一步决策</td></tr>
+        <tr><td><code>code.commit</code></td><td>完整的 40 位 Git 提交哈希；这是实际运行的代码版本</td></tr>
+        <tr><td><code>code.branch</code></td><td>仅供阅读的分支标签，不参与检出或校验</td></tr>
+        <tr><td><code>code.worktree</code></td><td>实验 worktree 的目录名；一个请求应使用一个唯一名称</td></tr>
+        <tr><td><code>slurm.script</code></td><td>固定提交中的仓库相对路径，不得越出仓库</td></tr>
+        <tr><td><code>slurm.max_concurrent_nodes</code></td><td>本请求最坏情况下的并发节点数，至少为 1，且不能超过非零的 <code>scheduler.max_total_nodes</code>；该值由请求者声明，工具不会从作业脚本推导</td></tr>
+        <tr><td><code>slurm.env</code></td><td>传给 <code>sbatch --export</code> 的环境变量；名称须匹配 <code>[A-Za-z_][A-Za-z0-9_]*</code> 且不能是 <code>GROUPS</code>，值必须是字符串且不能包含逗号或换行</td></tr>
+        <tr><td><code>outputs.log_glob</code></td><td>相对于实验 worktree 的 glob，不得越出 worktree，且必须包含 <code>{job_id}</code></td></tr>
+        <tr><td><code>outputs.metrics</code></td><td>非空指标名数组；可提取的名称须匹配 <code>[A-Za-z_][A-Za-z0-9_.-]*</code>，对应值必须是独占一行的数字</td></tr>
+        <tr><td><code>notes.requirements</code></td><td>可选的 worktree 相对路径数组；正式提交前逐项检查是否存在</td></tr>
+        <tr><td><code>notes.instructions</code></td><td>可选的操作说明；expctl 不解释其内容</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>支持 <code>name: 1.2</code>、<code>name = 1.2</code> 和 <code>name  1.2</code> 三种完整行。指标名必须完全匹配；单个日志中同名指标出现多次时保留最后一个值，未找到的指标不写入结果。<code>metrics.json</code> 按日志文件分组。</p>
+
+    <h2 id="config"><span class="num">六</span>配置参考</h2>
+<pre data-lang="toml"><code>version = 1
+
+[paths]
+root = "expctl"
+
+[scheduler]
+required_script_lines = ["#SBATCH -p my-partition"]
+max_total_nodes = 4
+
+[runtime]
+shared_dirs = [".venv", "data", "runs", "logs"]
+create_missing = ["runs", "logs"]
+
+[worktree]
+root = ".."</code></pre>
+    <ul>
+      <li><code>paths.root</code>：请求、结果和模板的仓库相对目录。</li>
+      <li><code>scheduler.required_script_lines</code>：必须在固定提交的作业脚本中完整、逐行匹配的文本。</li>
+      <li><code>scheduler.max_total_nodes</code>：当前用户的跨作业节点上限；<code>0</code> 表示禁用检查。</li>
+      <li><code>runtime.shared_dirs</code>：从主工作树链接到实验 worktree 的顶层目录名。源目录不存在时跳过。</li>
+      <li><code>runtime.create_missing</code>：提交前可自动创建的共享目录，必须是 <code>shared_dirs</code> 的子集。</li>
+      <li><code>worktree.root</code>：实验 worktree 的父目录；相对路径以仓库根目录为基准。</li>
+    </ul>
+    <p>节点预算的计算方式：<code>RUNNING</code> 和 <code>COMPLETING</code> 作业按实际节点名去重，<code>PENDING</code> 作业按 <code>squeue</code> 报告的节点数累加，再加上请求中的 <code>slurm.max_concurrent_nodes</code>。数组任务使用 <code>squeue -r</code> 展开，因此该检查有意偏保守。</p>
+    <div class="warn"><p><code>--skip-node-check</code> 会跳过节点预算检查，只应在操作者明确授权后使用。</p></div>
+
+    <h2 id="commands"><span class="num">七</span>命令与状态</h2>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>命令</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>expctl init</code></td><td>补齐默认配置和目录结构</td></tr>
+        <tr><td><code>expctl list</code></td><td>列出请求及其仓库状态</td></tr>
+        <tr><td><code>expctl validate &lt;id&gt;</code></td><td>验证请求、固定提交和作业脚本策略</td></tr>
+        <tr><td><code>expctl show &lt;id&gt;</code></td><td>将验证后的请求输出为 JSON</td></tr>
+        <tr><td><code>expctl submit &lt;id&gt;</code></td><td>准备 worktree、检查依赖和预算，并提交 SLURM 作业</td></tr>
+        <tr><td><code>expctl submit &lt;id&gt; --dry-run</code></td><td>验证并预览提交，不创建资源或调用 SLURM</td></tr>
+        <tr><td><code>expctl submit &lt;id&gt; --worktree-root &lt;dir&gt;</code></td><td>本次提交使用指定的 worktree 父目录</td></tr>
+        <tr><td><code>expctl status &lt;id&gt;</code></td><td>查询队列；不在队列时查询记账记录</td></tr>
+        <tr><td><code>expctl collect &lt;id&gt;</code></td><td>复制日志、提取指标并更新回执</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <p>标准状态：</p>
+    <div class="states">
+      <div>有效请求，无回执<br><span class="pill requested">requested</span></div>
+      <div>已生成回执<br><span class="pill submitted">submitted</span></div>
+      <div>已执行 collect<br><span class="pill collected">collected</span></div>
+      <div>请求验证失败或回执 JSON 无效<br><code>invalid</code></div>
+    </div>
+    <p>“已审阅”不是工具状态；结论由操作者写入 <code>report.md</code> 或项目自己的实验记录。</p>
+
+    <h2 id="trouble"><span class="num">八</span>异常处理与自动化约定</h2>
+    <ul>
+      <li><strong>请求在提交作业后被修改</strong>：恢复与回执中 <code>request_sha256</code> 完全一致的文件；否则 <code>collect</code> 会拒绝执行。</li>
+      <li><strong>节点预算不足</strong>：等待已有作业释放节点后重试。不要通过修改旧请求或静默重提绕过限制。</li>
+      <li><strong>作业失败、超时或被抢占</strong>：保留原回执和日志，在报告中记录失败原因；重跑时创建新 ID 和新 worktree 名称。</li>
+      <li><strong>日志未找到</strong>：核对作业是否结束、<code>outputs.log_glob</code> 是否包含正确的 <code>{job_id}</code> 位置，以及日志是否写在固定 worktree 中。</li>
+      <li><strong>自动化或 AI 操作</strong>：先执行并审阅 <code>--dry-run</code>，再明确授权正式提交。expctl 不会自动重试、重新提交、提交 Git 变更或判定实验结论。</li>
+    </ul>
+  </main>
+
+  <footer>
+    源文件：expctl 仓库 <code>docs/usage.zh.md</code>。工具本身：<a href="https://github.com/xfeng01/expctl">github.com/xfeng01/expctl</a>。
+  </footer>
+</div>
+
+</html>
