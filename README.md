@@ -33,7 +33,7 @@ commit that produced it.
 ## Install
 
 ```bash
-uv tool install git+<this-repository-url>     # or: uv tool install /path/to/expctl
+uv tool install git+ssh://git@github.com/xfeng01/expctl   # or: uv tool install /path/to/expctl
 ```
 
 Zero-install fallback: the whole tool is one stdlib-only file. Copy
