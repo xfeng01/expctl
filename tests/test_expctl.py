@@ -55,7 +55,7 @@ metrics = ["gen_ppl"]
 
 def _example_repo(tmp_path: Path, request_text: str = EXAMPLE_REQUEST) -> Path:
     (tmp_path / "expctl.toml").write_text(EXAMPLE_CONFIG, encoding="utf-8")
-    requests = tmp_path / "experiments" / "requests"
+    requests = tmp_path / "expctl" / "requests"
     requests.mkdir(parents=True)
     (requests / f"{EXAMPLE_ID}.toml").write_text(request_text, encoding="utf-8")
     return tmp_path
@@ -70,10 +70,36 @@ def test_init_creates_skeleton_and_is_idempotent(tmp_path: Path) -> None:
     created = init_repo(tmp_path)
 
     assert "expctl.toml" in created
-    assert (tmp_path / "experiments" / "templates" / "request.toml").is_file()
-    assert (tmp_path / "experiments" / "requests" / ".gitkeep").is_file()
+    assert (tmp_path / "expctl" / "templates" / "request.toml").is_file()
+    assert (tmp_path / "expctl" / "requests" / ".gitkeep").is_file()
     assert load_config(tmp_path).max_total_nodes == 0
     assert init_repo(tmp_path) == []
+
+
+def test_root_directory_is_configurable(tmp_path: Path) -> None:
+    config_text = EXAMPLE_CONFIG.replace(
+        "[scheduler]", '[paths]\nroot = "handoffs/cluster"\n\n[scheduler]'
+    )
+    (tmp_path / "expctl.toml").write_text(config_text, encoding="utf-8")
+    requests = tmp_path / "handoffs" / "cluster" / "requests"
+    requests.mkdir(parents=True)
+    (requests / f"{EXAMPLE_ID}.toml").write_text(EXAMPLE_REQUEST, encoding="utf-8")
+
+    config = load_config(tmp_path)
+    _, path = load_request(tmp_path, config, EXAMPLE_ID, check_git=False)
+
+    assert config.root == "handoffs/cluster"
+    assert path.parent == requests
+
+
+def test_root_directory_must_stay_inside_the_repo(tmp_path: Path) -> None:
+    config_text = EXAMPLE_CONFIG.replace(
+        "[scheduler]", '[paths]\nroot = "../elsewhere"\n\n[scheduler]'
+    )
+    (tmp_path / "expctl.toml").write_text(config_text, encoding="utf-8")
+
+    with pytest.raises(ExpctlError, match="paths.root"):
+        load_config(tmp_path)
 
 
 def test_wellformed_request_validates(tmp_path: Path) -> None:

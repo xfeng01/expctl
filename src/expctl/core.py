@@ -4,12 +4,13 @@ The whole tool lives in this one file on purpose: on a machine where nothing
 can be installed, copy `core.py` anywhere and run `python core.py <command>`
 (Python 3.11+, stdlib only).
 
-Protocol: an immutable request file (`experiments/requests/<id>.toml`) pins the
+Protocol: an immutable request file (`<root>/requests/<id>.toml`) pins the
 exact commit, entrypoint, and resource envelope of a run. Submitting writes a
-receipt (`experiments/results/<id>/receipt.json`); collecting copies logs and
+receipt (`<root>/results/<id>/receipt.json`); collecting copies logs and
 scrapes metrics next to it. State is defined by which files exist — requests
-are never edited after submission. Per-repository policy (required scheduler
-flags, node ceiling, shared runtime directories) lives in `expctl.toml`.
+are never edited after submission. `<root>` is `expctl/` unless `expctl.toml`
+says otherwise; that file also holds the per-repository policy (required
+scheduler flags, node ceiling, shared runtime directories).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from typing import Any
 
 
 CONFIG_NAME = "expctl.toml"
+DEFAULT_ROOT = "expctl"
 DEFAULT_SHARED_DIRS = (".venv", "data", "runs", "logs")
 DEFAULT_CREATE_MISSING = ("runs", "logs")
 
@@ -49,6 +51,10 @@ METRIC_LINE_RE = re.compile(
 STARTER_CONFIG = """\
 # expctl repository policy. Commit this next to the code it governs.
 version = 1
+
+[paths]
+# Directory (relative to the repo root) holding requests/, results/, templates/.
+root = "expctl"
 
 [scheduler]
 # Verbatim lines that must appear in the job script at the pinned commit.
@@ -104,6 +110,7 @@ class ExpctlError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class Config:
+    root: str
     required_script_lines: tuple[str, ...]
     max_total_nodes: int
     shared_dirs: tuple[str, ...]
@@ -171,11 +178,16 @@ def load_config(repo: Path) -> Config:
         raise ExpctlError(f"{CONFIG_NAME} version must be 1")
 
     tables: dict[str, dict[str, Any]] = {}
-    for name in ("scheduler", "runtime", "worktree"):
+    for name in ("paths", "scheduler", "runtime", "worktree"):
         table = data.get(name, {})
         if not isinstance(table, dict):
             raise ExpctlError(f"[{name}] in {CONFIG_NAME} must be a table")
         tables[name] = table
+
+    data_root = tables["paths"].get("root", DEFAULT_ROOT)
+    if not isinstance(data_root, str) or not data_root.strip():
+        raise ExpctlError("paths.root must be a non-empty string")
+    _relative_path(data_root, "paths.root")
 
     max_total = tables["scheduler"].get("max_total_nodes", 0)
     if not isinstance(max_total, int) or isinstance(max_total, bool) or max_total < 0:
@@ -203,6 +215,7 @@ def load_config(repo: Path) -> Config:
         raise ExpctlError("worktree.root must be a non-empty string")
 
     return Config(
+        root=data_root,
         required_script_lines=_config_list(
             tables["scheduler"], "required_script_lines", "scheduler", ()
         ),
@@ -214,11 +227,12 @@ def load_config(repo: Path) -> Config:
 
 
 def init_repo(repo: Path) -> list[str]:
+    root = repo / DEFAULT_ROOT
     entries = (
         (repo / CONFIG_NAME, STARTER_CONFIG),
-        (repo / "experiments" / "templates" / "request.toml", STARTER_TEMPLATE),
-        (repo / "experiments" / "requests" / ".gitkeep", ""),
-        (repo / "experiments" / "results" / ".gitkeep", ""),
+        (root / "templates" / "request.toml", STARTER_TEMPLATE),
+        (root / "requests" / ".gitkeep", ""),
+        (root / "results" / ".gitkeep", ""),
     )
     created: list[str] = []
     for path, content in entries:
@@ -230,16 +244,16 @@ def init_repo(repo: Path) -> list[str]:
     return created
 
 
-def request_path(repo: Path, experiment_id: str) -> Path:
+def request_path(repo: Path, config: Config, experiment_id: str) -> Path:
     if not ID_RE.fullmatch(experiment_id):
         raise ExpctlError(
             "experiment ID must look like YYYYMMDD-lowercase-short-name"
         )
-    return repo / "experiments" / "requests" / f"{experiment_id}.toml"
+    return repo / config.root / "requests" / f"{experiment_id}.toml"
 
 
-def result_dir(repo: Path, experiment_id: str) -> Path:
-    return repo / "experiments" / "results" / experiment_id
+def result_dir(repo: Path, config: Config, experiment_id: str) -> Path:
+    return repo / config.root / "results" / experiment_id
 
 
 def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
@@ -275,7 +289,7 @@ def load_request(
     *,
     check_git: bool = True,
 ) -> tuple[dict[str, Any], Path]:
-    path = request_path(repo, experiment_id)
+    path = request_path(repo, config, experiment_id)
     if not path.is_file():
         raise ExpctlError(f"request not found: {path}")
     try:
@@ -498,7 +512,7 @@ def submit_request(
     worktree_root: Path | None,
 ) -> dict[str, Any]:
     request, path = load_request(repo, config, experiment_id)
-    receipt_path = result_dir(repo, experiment_id) / "receipt.json"
+    receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
     if receipt_path.exists():
         raise ExpctlError(
             f"receipt already exists: {receipt_path}; use a new request ID for reruns"
@@ -576,7 +590,7 @@ def _queue_status(repo: Path, job_id: str) -> list[dict[str, str]]:
 
 def status_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
     load_request(repo, config, experiment_id, check_git=False)
-    receipt_path = result_dir(repo, experiment_id) / "receipt.json"
+    receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
     if not receipt_path.is_file():
         raise ExpctlError(
             f"not submitted yet: no receipt at {receipt_path}"
@@ -637,7 +651,7 @@ def _scheduler_status(repo: Path, job_id: str) -> dict[str, Any]:
 
 def collect_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
     request, path = load_request(repo, config, experiment_id)
-    destination = result_dir(repo, experiment_id)
+    destination = result_dir(repo, config, experiment_id)
     receipt_path = destination / "receipt.json"
     if not receipt_path.is_file():
         raise ExpctlError(f"submission receipt not found: {receipt_path}")
@@ -689,13 +703,13 @@ def collect_request(repo: Path, config: Config, experiment_id: str) -> dict[str,
 
 
 def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
-    requests_dir = repo / "experiments" / "requests"
+    requests_dir = repo / config.root / "requests"
     rows: list[dict[str, str]] = []
     for path in sorted(requests_dir.glob("*.toml")):
         experiment_id = path.stem
         try:
             data, _ = load_request(repo, config, experiment_id)
-            receipt = result_dir(repo, experiment_id) / "receipt.json"
+            receipt = result_dir(repo, config, experiment_id) / "receipt.json"
             status = "requested"
             if receipt.is_file():
                 status = json.loads(receipt.read_text(encoding="utf-8")).get(
@@ -717,7 +731,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser(
-        "init", help="create expctl.toml and the experiments/ skeleton"
+        "init", help=f"create {CONFIG_NAME} and the {DEFAULT_ROOT}/ skeleton"
     )
 
     subparsers.add_parser("list", help="list requests and their repository state")

@@ -10,15 +10,16 @@ make the handoff itself safe and auditable.
 
 ## The protocol
 
-- `experiments/requests/<id>.toml` — an **immutable request**. It pins the
+- `expctl/requests/<id>.toml` — an **immutable request**. It pins the
   exact Git commit, the SLURM entrypoint, the resource envelope, the expected
   logs, and the decision rule the result feeds.
-- `experiments/results/<id>/receipt.json` — written when the request is
+- `expctl/results/<id>/receipt.json` — written when the request is
   submitted: job ID, who, when, from which worktree.
-- `experiments/results/<id>/` — collected logs and scraped metrics, pushed
+- `expctl/results/<id>/` — collected logs and scraped metrics, pushed
   back for the author to read.
 - `expctl.toml` — per-repository policy: required scheduler flags, node
-  ceiling, shared runtime directories.
+  ceiling, shared runtime directories, and the name of the directory above
+  (`expctl/` by default; change `[paths] root` if that name is taken).
 
 State is defined by which files exist:
 
@@ -45,17 +46,17 @@ Zero-install fallback: the whole tool is one stdlib-only file. Copy
 In the project repository:
 
 ```bash
-expctl init          # creates expctl.toml + experiments/ skeleton
+expctl init          # creates expctl.toml + expctl/ skeleton
 # edit expctl.toml: partitions, node ceiling, shared dirs
 ```
 
 Author side:
 
 ```bash
-# copy experiments/templates/request.toml to experiments/requests/<id>.toml,
+# copy expctl/templates/request.toml to expctl/requests/<id>.toml,
 # pin a full 40-character commit, then:
 expctl validate <id>
-git add experiments/requests/<id>.toml && git commit && git push
+git add expctl/requests/<id>.toml && git commit && git push
 ```
 
 Runner side (on the cluster):
@@ -68,14 +69,14 @@ expctl submit <id> --dry-run    # preview commit, worktree, sbatch command
 expctl submit <id>              # detached worktree + budget check + sbatch
 expctl status <id>              # squeue while running, sacct afterwards
 expctl collect <id>             # copy logs, scrape metrics, update receipt
-# write experiments/results/<id>/report.md, then commit and push results/
+# write expctl/results/<id>/report.md, then commit and push results/
 ```
 
 ## Commands
 
 | command | what it does |
 |---|---|
-| `init` | create `expctl.toml` and the `experiments/` skeleton |
+| `init` | create `expctl.toml` and the `expctl/` skeleton |
 | `list` | all requests with their state (`requested` / `submitted` / `collected` / `invalid`) |
 | `validate <id>` | schema check, plus: pinned commit exists and its job script contains every `required_script_lines` entry |
 | `show <id>` | print the validated request as JSON |
@@ -118,6 +119,10 @@ instructions = "free text for the runner"
 
 ```toml
 version = 1
+
+[paths]
+# Directory (relative to the repo root) holding requests/, results/, templates/.
+root = "expctl"
 
 [scheduler]
 # Verbatim lines that must appear in the job script at the pinned commit.

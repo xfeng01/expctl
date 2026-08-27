@@ -1,6 +1,6 @@
 [project]
 name = "expctl"
-version = "0.1.0"
+version = "0.2.0"
 description = "Repository-backed asynchronous experiment handoff: pinned requests in, receipts and collected results out."
 readme = "README.md"
 requires-python = ">=3.11"
