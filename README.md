@@ -43,6 +43,10 @@ Zero-install fallback: the whole tool is one stdlib-only file. Copy
 `src/expctl/core.py` to the target machine and run `python core.py <command>`
 (Python 3.11+).
 
+`submit`, `status`, and `collect` run on the cluster host (POSIX, SLURM tools
+on `PATH`). `init`, `list`, `validate`, and `show` work anywhere, including
+Windows. `expctl --version` prints the installed version.
+
 ## Quickstart
 
 In the project repository:
@@ -155,11 +159,18 @@ The request/receipt protocol is designed so an agent can act as the runner:
 everything it needs is in the repository, every resource-consuming step has a
 preview (`--dry-run`) for an approval gate, and nothing is retried or
 resubmitted implicitly. Pair it with an agent skill that encodes your
-project's stopping conditions; see the `cdlm-experiment-runner` skill in the
-first consumer project for a template.
+project's stopping conditions: copy
+[`examples/skill/SKILL.md`](examples/skill/SKILL.md) into your project and
+add its own rules.
 
 ## Development
 
 ```bash
 uv run pytest -q
 ```
+
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

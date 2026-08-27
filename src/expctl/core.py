@@ -31,6 +31,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
+# Kept in sync with pyproject.toml by tests; duplicated here so the single-file
+# copy still knows its version.
+__version__ = "0.3.0"
+
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
 DEFAULT_SHARED_DIRS = (".venv", "data", "runs", "logs")
@@ -727,6 +731,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="expctl",
         description="Manage repository-backed asynchronous experiment handoffs.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"expctl {__version__}"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

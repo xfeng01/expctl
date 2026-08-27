@@ -26,10 +26,11 @@ expctl 不替代 SLURM、工作流引擎或实验跟踪平台。它只负责让�
 uv tool install git+https://github.com/xfeng01/expctl
 ```
 
-更新：
+更新，以及查看当前安装的版本：
 
 ```bash
 uv tool upgrade expctl
+expctl --version
 ```
 
 若目标机器不能安装包，可只复制 `src/expctl/core.py`，然后运行：

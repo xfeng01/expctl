@@ -293,7 +293,7 @@
 
 <div class="page">
   <header>
-    <p class="eyebrow">expctl · v0.2.0 · 异步实验交接</p>
+    <p class="eyebrow">expctl · v0.3.0 · 异步实验交接</p>
     <h1>expctl 中文使用指南</h1>
     <p class="lede">
       expctl 用 Git 仓库中的请求、回执和结果文件交接异步实验。实验设计者与集群操作者不必同时在线，也能确认运行了哪一版代码、使用了哪些参数，并追溯结果来源。
@@ -343,8 +343,9 @@
     <h2 id="install"><span class="num">一</span>安装（每台机器一次）</h2>
     <p>所有机器都需要 Git 和 Python 3.11 或更高版本。负责提交作业的集群环境还需要 <code>sbatch</code>、<code>squeue</code>、<code>sacct</code>；启用节点预算时还会使用 <code>scontrol</code>。推荐使用 <code>uv</code> 安装：</p>
 <pre data-lang="bash"><code>uv tool install git+https://github.com/xfeng01/expctl</code></pre>
-    <p>更新：</p>
-<pre data-lang="bash"><code>uv tool upgrade expctl</code></pre>
+    <p>更新，以及查看当前安装的版本：</p>
+<pre data-lang="bash"><code>uv tool upgrade expctl
+expctl --version</code></pre>
     <div class="note"><p><strong>零安装方式</strong>：只复制 <code>src/expctl/core.py</code>，运行 <code>python core.py &lt;command&gt;</code>。该文件仅依赖 Python 标准库；Git 和相应的 SLURM 命令仍须存在。所有命令都应在 Git 工作树内运行。</p></div>
 
     <h2 id="init"><span class="num">二</span>初始化项目</h2>

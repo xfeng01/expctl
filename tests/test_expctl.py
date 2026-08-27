@@ -1,9 +1,11 @@
+import tomllib
 from pathlib import Path
 
 import pytest
 
 from expctl.core import (
     ExpctlError,
+    __version__,
     build_sbatch_command,
     extract_metrics,
     init_repo,
@@ -174,3 +176,11 @@ def test_status_before_submission_is_a_clear_error(tmp_path: Path) -> None:
 
     with pytest.raises(ExpctlError, match="not submitted yet"):
         status_request(repo, config, EXAMPLE_ID)
+
+
+def test_version_matches_pyproject() -> None:
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        declared = tomllib.load(handle)["project"]["version"]
+
+    assert __version__ == declared
