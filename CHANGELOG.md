@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 — 2026-08-27
+
+- `submit` no longer fails when the checkout itself materialises an output
+  directory listed in `runtime.create_missing` (e.g. tracked files under
+  `logs/`): the directory is kept and the job writes into the worktree copy,
+  which is where `collect` reads. Input directories in that state are still an
+  error. The receipt records the decision per directory under `runtime_dirs`.
+
 ## 0.3.0 — 2026-08-26
 
 - `expctl --version`.

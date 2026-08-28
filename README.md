@@ -148,6 +148,13 @@ create_missing = ["runs", "logs"]
 root = ".."
 ```
 
+Notes on the shared directories: each entry is symlinked into the experiment
+worktree. If the checkout itself already contains one of the `create_missing`
+(output) directories — tracked log files under `logs/`, say — it is kept and
+the job writes there; `collect` reads from the worktree either way. An *input*
+directory in that state is an error. The receipt lists the outcome per
+directory under `runtime_dirs`.
+
 Notes on the node budget: every pending array task counts as a reserved node,
 so the check is deliberately conservative — it can refuse a submission that a
 `%N` throttle would in fact keep within budget. Waiting for the queue to

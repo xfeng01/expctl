@@ -33,7 +33,7 @@ from typing import Any
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -417,22 +417,44 @@ def _ensure_worktree(repo: Path, worktree: Path, commit: str) -> None:
     )
 
 
-def _ensure_runtime_links(repo: Path, config: Config, worktree: Path) -> None:
+def _ensure_runtime_links(repo: Path, config: Config, worktree: Path) -> dict[str, str]:
+    """Symlink the shared runtime directories into the worktree.
+
+    Returns {name: "linked" | "already-linked" | "kept-checkout-dir" | "absent"}.
+    An output directory (one listed in `create_missing`, e.g. `logs/`) that the
+    checkout itself materialised -- tracked log files, say -- is left in place:
+    the job then writes into the worktree copy, which is where `collect` reads.
+    An input directory in that state is an error, because the job would read
+    the checkout's copy instead of the shared data.
+    """
+    status: dict[str, str] = {}
     for name in config.shared_dirs:
         source = repo / name
         destination = worktree / name
         if name in config.create_missing:
             source.mkdir(exist_ok=True)
         if not source.exists():
+            status[name] = "absent"
             continue
-        if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or destination.exists():
             try:
-                if destination.resolve() == source.resolve():
-                    continue
+                same = destination.resolve() == source.resolve()
             except OSError:
-                pass
+                same = False
+            if same:
+                status[name] = "already-linked"
+                continue
+            if (
+                name in config.create_missing
+                and destination.is_dir()
+                and not destination.is_symlink()
+            ):
+                status[name] = "kept-checkout-dir"
+                continue
             raise ExpctlError(f"runtime link destination already exists: {destination}")
         destination.symlink_to(source.resolve(), target_is_directory=True)
+        status[name] = "linked"
+    return status
 
 
 def _check_requirements(worktree: Path, request: dict[str, Any]) -> None:
@@ -540,7 +562,7 @@ def submit_request(
         return preview
 
     _ensure_worktree(repo, worktree, code["commit"])
-    _ensure_runtime_links(repo, config, worktree)
+    runtime_dirs = _ensure_runtime_links(repo, config, worktree)
     _check_requirements(worktree, request)
     budget = None
     if config.max_total_nodes and not skip_node_check:
@@ -564,6 +586,7 @@ def submit_request(
         "submitted_by": getpass.getuser(),
         "status": "submitted",
         "node_budget": budget,
+        "runtime_dirs": runtime_dirs,
         "sbatch_command": command,
     }
     receipt_path.parent.mkdir(parents=True, exist_ok=True)

@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 
 from expctl.core import (
+    Config,
+    _ensure_runtime_links,
     ExpctlError,
     __version__,
     build_sbatch_command,
@@ -184,3 +186,44 @@ def test_version_matches_pyproject() -> None:
         declared = tomllib.load(handle)["project"]["version"]
 
     assert __version__ == declared
+
+
+def _symlinks_allowed(tmp_path: Path) -> bool:
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(tmp_path, target_is_directory=True)
+    except OSError:
+        return False
+    probe.unlink()
+    return True
+
+
+def test_output_dir_materialised_by_the_checkout_is_kept(tmp_path: Path) -> None:
+    if not _symlinks_allowed(tmp_path):
+        pytest.skip("symlinks not permitted here")
+    repo, worktree = tmp_path / "repo", tmp_path / "wt"
+    (repo / "data").mkdir(parents=True)
+    (repo / "logs").mkdir()
+    # Tracked log files put a real logs/ directory into every checkout.
+    (worktree / "logs").mkdir(parents=True)
+    (worktree / "logs" / "old-job.out").write_text("tracked", encoding="utf-8")
+    config = Config(
+        root="expctl", required_script_lines=(), max_total_nodes=0,
+        shared_dirs=("data", "logs", "runs"), create_missing=("runs", "logs"),
+        worktree_root="..",
+    )
+
+    status = _ensure_runtime_links(repo, config, worktree)
+
+    assert status == {"data": "linked", "logs": "kept-checkout-dir", "runs": "linked"}
+    assert (worktree / "data").is_symlink() and (worktree / "runs").is_symlink()
+    assert (worktree / "logs" / "old-job.out").is_file()
+    # Re-running is idempotent.
+    assert _ensure_runtime_links(repo, config, worktree)["data"] == "already-linked"
+
+    # An INPUT directory the checkout materialised is still an error: the job
+    # would read the checkout's copy instead of the shared data.
+    (worktree / "data").unlink()
+    (worktree / "data").mkdir()
+    with pytest.raises(ExpctlError, match="already exists"):
+        _ensure_runtime_links(repo, config, worktree)
