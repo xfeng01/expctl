@@ -35,8 +35,10 @@ weaken the repository's own cluster and branch rules here.
   it. Do not substitute ad hoc `git`/`sbatch` commands and do not vendor a copy
   into the repository.
 - Never select a newer branch head in place of `code.commit`.
-- Never edit a request after its receipt exists. Create a new request for a
-  rerun, corrected checkpoint, or changed environment.
+- Never edit a request or delete its receipt after the receipt exists. A
+  rerun of unchanged code is `expctl rerun <id> --reason "..."` (a new
+  request ID); a corrected checkpoint or changed code is a new request
+  written by the author.
 - Never add checkpoints, datasets, credentials, caches, or unreviewed
   sensitive output to Git.
 - Do not use `--skip-node-check` autonomously. If scheduler status is

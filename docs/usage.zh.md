@@ -99,7 +99,7 @@ expctl submit <id>
 3. 若启用节点预算，查询当前用户的 SLURM 作业并校验上限；
 4. 调用 `sbatch --parsable`，将作业号和请求哈希写入回执。
 
-已有回执的请求不能再次提交。若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 `receipt.json`。
+已有回执的请求不能再次提交：`submit` 会报出那次提交的作业号、提交人和 `sacct` 终态。需要再跑一次时用 `expctl rerun <id>`（见第八节），不要删除回执。若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 `receipt.json`。
 
 查看状态：
 
@@ -142,6 +142,8 @@ expctl collect <id>
 | `outputs.metrics` | 非空指标名数组；可提取的名称须匹配 `[A-Za-z_][A-Za-z0-9_.-]*`，对应值必须是独占一行的数字 |
 | `notes.requirements` | 可选的 worktree 相对路径数组；正式提交前逐项检查是否存在 |
 | `notes.instructions` | 可选的操作说明；expctl 不解释其内容 |
+| `rerun_of` | 可选，顶层字段；由 `expctl rerun` 写入，指向被重跑的请求 ID |
+| `rerun_reason` | 可选，顶层字段；`expctl rerun --reason` 记录的重跑原因 |
 
 支持 `name: 1.2`、`name = 1.2` 和 `name  1.2` 三种完整行。指标名必须完全匹配；单个日志中同名指标出现多次时保留最后一个值，未找到的指标不写入结果。`metrics.json` 按日志文件分组。
 
@@ -187,6 +189,7 @@ root = ".."
 | `expctl submit <id> --worktree-root <dir>` | 本次提交使用指定的 worktree 父目录 |
 | `expctl status <id>` | 查询队列；不在队列时查询记账记录 |
 | `expctl collect <id>` | 复制日志、提取指标并更新回执 |
+| `expctl rerun <id> [--as <new-id>] [--reason <text>]` | 把已提交的请求复制为新 ID（默认 `<id>-r2`、`-r3`……），写入 `rerun_of`，供再次提交；commit 和 worktree 不变 |
 
 `expctl list` 显示的标准状态：
 
@@ -203,6 +206,6 @@ invalid    请求验证失败，或回执不是有效的 JSON
 
 - **请求在提交作业后被修改**：恢复与回执中 `request_sha256` 完全一致的文件；否则 `collect` 会拒绝执行。
 - **节点预算不足**：等待已有作业释放节点后重试。不要通过修改旧请求或静默重提绕过限制。
-- **作业失败、超时或被抢占**：保留原回执和日志，在报告中记录失败原因；重跑时创建新 ID 和新 worktree 名称。
+- **作业失败、超时或被抢占**：保留原回执和日志，在报告中记录失败原因。代码不需要改动时（抢占、节点故障、共享环境未就绪），运行方直接执行 `expctl rerun <id> --reason "preempted"`，提交生成的 `<id>-r2.toml`，再 `expctl submit <id>-r2`；commit 和 worktree 不变，位于固定提交上的已有 worktree 会被复用。需要改代码时由请求方修正、提交，并发布固定新提交的新请求。任何情况下都不要删除回执重提。
 - **日志未找到**：核对作业是否结束、`outputs.log_glob` 是否包含正确的 `{job_id}` 位置，以及日志是否写在固定 worktree 中。
 - **自动化或 AI 操作**：先执行并审阅 `--dry-run`，再明确授权正式提交。expctl 不会自动重试、重新提交、提交 Git 变更或判定实验结论。

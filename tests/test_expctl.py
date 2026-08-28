@@ -1,11 +1,14 @@
+import json
 import tomllib
 from pathlib import Path
 
 import pytest
 
+import expctl.core as core
 from expctl.core import (
     Config,
     _ensure_runtime_links,
+    _receipt_summary,
     ExpctlError,
     __version__,
     build_sbatch_command,
@@ -13,6 +16,7 @@ from expctl.core import (
     init_repo,
     load_config,
     load_request,
+    rerun_request,
     status_request,
 )
 
@@ -178,6 +182,123 @@ def test_status_before_submission_is_a_clear_error(tmp_path: Path) -> None:
 
     with pytest.raises(ExpctlError, match="not submitted yet"):
         status_request(repo, config, EXAMPLE_ID)
+
+
+def _fake_receipt(repo: Path, experiment_id: str) -> Path:
+    directory = repo / "expctl" / "results" / experiment_id
+    directory.mkdir(parents=True)
+    receipt = directory / "receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "job_id": "123",
+                "status": "submitted",
+                "submitted_at": "2026-08-28T00:26:08+00:00",
+                "submitted_by": "peng",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return receipt
+
+
+def test_rerun_needs_a_receipt(tmp_path: Path) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+
+    with pytest.raises(ExpctlError, match="no receipt"):
+        rerun_request(repo, config, EXAMPLE_ID, check_git=False)
+
+
+def test_rerun_copies_the_request_under_the_next_id(tmp_path: Path) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    _fake_receipt(repo, EXAMPLE_ID)
+    original, original_path = load_request(repo, config, EXAMPLE_ID, check_git=False)
+
+    result = rerun_request(
+        repo, config, EXAMPLE_ID, reason="preempted", check_git=False
+    )
+
+    assert result == {
+        "experiment_id": f"{EXAMPLE_ID}-r2",
+        "rerun_of": EXAMPLE_ID,
+        "path": f"expctl/requests/{EXAMPLE_ID}-r2.toml",
+        "commit": "0" * 40,
+        "worktree": "myproject-example",
+    }
+    copy, copy_path = load_request(repo, config, f"{EXAMPLE_ID}-r2", check_git=False)
+    assert copy["rerun_of"] == EXAMPLE_ID
+    assert copy["rerun_reason"] == "preempted"
+    assert copy["code"] == original["code"]
+    assert copy["slurm"] == original["slurm"]
+    # Byte-for-byte the same file apart from the header lines.
+    copy_lines = copy_path.read_text(encoding="utf-8").splitlines()
+    original_lines = original_path.read_text(encoding="utf-8").splitlines()
+    assert copy_lines[:4] == [
+        "version = 1",
+        f'id = "{EXAMPLE_ID}-r2"',
+        f'rerun_of = "{EXAMPLE_ID}"',
+        'rerun_reason = "preempted"',
+    ]
+    assert copy_lines[4:] == original_lines[2:]
+    # The original request and its receipt are untouched.
+    assert original_path.read_text(encoding="utf-8") == EXAMPLE_REQUEST
+    assert (repo / "expctl" / "results" / EXAMPLE_ID / "receipt.json").is_file()
+
+    # Rerunning the rerun points at its immediate predecessor and drops the
+    # old reason.
+    _fake_receipt(repo, f"{EXAMPLE_ID}-r2")
+    again = rerun_request(repo, config, f"{EXAMPLE_ID}-r2", check_git=False)
+
+    assert again["experiment_id"] == f"{EXAMPLE_ID}-r3"
+    third, _ = load_request(repo, config, f"{EXAMPLE_ID}-r3", check_git=False)
+    assert third["rerun_of"] == f"{EXAMPLE_ID}-r2"
+    assert "rerun_reason" not in third
+
+
+def test_rerun_keeps_crlf_and_honours_an_explicit_id(tmp_path: Path) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    request = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    request.write_bytes(EXAMPLE_REQUEST.replace("\n", "\r\n").encode("utf-8"))
+    _fake_receipt(repo, EXAMPLE_ID)
+
+    result = rerun_request(
+        repo, config, EXAMPLE_ID, new_id="20260102-example", check_git=False
+    )
+
+    copy = repo / "expctl" / "requests" / "20260102-example.toml"
+    assert result["experiment_id"] == "20260102-example"
+    assert b"\n" not in copy.read_bytes().replace(b"\r\n", b"")
+    with pytest.raises(ExpctlError, match="already exists"):
+        rerun_request(repo, config, EXAMPLE_ID, new_id=EXAMPLE_ID, check_git=False)
+
+
+def test_rerun_of_must_be_an_experiment_id(tmp_path: Path) -> None:
+    text = EXAMPLE_REQUEST.replace('title = ', 'rerun_of = "nope"\ntitle = ')
+    repo = _example_repo(tmp_path, text)
+    config = load_config(repo)
+
+    with pytest.raises(ExpctlError, match="rerun_of"):
+        load_request(repo, config, EXAMPLE_ID, check_git=False)
+
+
+def test_receipt_summary_names_job_submitter_and_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = _fake_receipt(tmp_path, EXAMPLE_ID)
+    monkeypatch.setattr(
+        core, "_scheduler_status", lambda repo, job_id: {"state": "FAILED"}
+    )
+
+    assert _receipt_summary(tmp_path, receipt) == (
+        "job 123, submitted 2026-08-28T00:26:08+00:00 by peng, "
+        "receipt status submitted, sacct FAILED"
+    )
+
+    receipt.write_text("{not json", encoding="utf-8")
+    assert _receipt_summary(tmp_path, receipt) == "unreadable receipt"
 
 
 def test_version_matches_pyproject() -> None:

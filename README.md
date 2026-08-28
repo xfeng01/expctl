@@ -76,6 +76,7 @@ expctl submit <id>              # detached worktree + budget check + sbatch
 expctl status <id>              # squeue while running, sacct afterwards
 expctl collect <id>             # copy logs, scrape metrics, update receipt
 # write expctl/results/<id>/report.md, then commit and push results/
+expctl rerun <id> --reason "preempted"   # same code again? new request <id>-r2
 ```
 
 ## Commands
@@ -89,6 +90,26 @@ expctl collect <id>             # copy logs, scrape metrics, update receipt
 | `submit <id>` | create/verify a detached worktree at the pinned commit, symlink shared runtime dirs, verify `notes.requirements`, check the cross-job node budget via `squeue`, run `sbatch --parsable`, write the receipt. `--dry-run` previews; `--skip-node-check` needs explicit operator authorization |
 | `status <id>` | queue state per task (`squeue`), falling back to accounting (`sacct`) once the job left the queue |
 | `collect <id>` | copy logs matching `outputs.log_glob` into `results/<id>/logs/`, scrape `outputs.metrics` into `metrics.json`, record the scheduler verdict |
+| `rerun <id>` | copy a submitted request to `<id>-r2` (or `--as NEW_ID`) with `rerun_of` pointing back and `--reason` recorded; same commit, same worktree. Commit the copy, then `submit` it |
+
+## When a job fails
+
+A request is submitted exactly once: `submit` refuses while the receipt
+exists and reports how that submission ended (job ID, submitter, `sacct`
+verdict). Running the same code again is a new request, and the runner can
+make it without waiting for the author:
+
+```bash
+expctl rerun <id> --reason "preempted"          # writes requests/<id>-r2.toml
+git add expctl/requests/<id>-r2.toml && git commit -m "rerun <id>: preempted"
+expctl submit <id>-r2
+```
+
+The copy differs from the original only in its `id` line plus `rerun_of` and
+`rerun_reason`. Commit and worktree are unchanged, so `submit` reuses the
+existing worktree; the failed run's receipt and logs stay in `results/<id>/`.
+If the fix needs a code change, that is the author's job: commit it and write
+a request pinning the new commit. Never delete a receipt to resubmit.
 
 ## Request format
 
@@ -120,6 +141,9 @@ metrics = ["gen_ppl"]             # scraped from `name: value` log lines
 requirements = ["runs/ckpt.pt"]   # must exist on the cluster before submit
 instructions = "free text for the runner"
 ```
+
+Copies made by `expctl rerun` carry two extra top-level keys, `rerun_of`
+(the predecessor's ID) and optionally `rerun_reason`.
 
 ## Configuration (`expctl.toml`)
 

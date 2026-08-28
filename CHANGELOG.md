@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2 — 2026-08-28
+
+- `expctl rerun <id> [--as NEW_ID] [--reason TEXT]`: copy a submitted request
+  to `<id>-r2` (then `-r3`, ...) with top-level `rerun_of` and `rerun_reason`
+  keys, so the runner can rerun unchanged code without waiting for the author
+  and without touching the failed run's receipt. Commit and worktree stay the
+  same; `submit` reuses a worktree that sits at the pinned commit.
+- `submit` on a request that already has a receipt now says how that
+  submission ended (job ID, submitter, `sacct` verdict) and points at `rerun`,
+  instead of inviting a manual receipt deletion.
+- Requests accept optional top-level `rerun_of` (an experiment ID) and
+  `rerun_reason` (a string).
+
 ## 0.3.1 — 2026-08-27
 
 - `submit` no longer fails when the checkout itself materialises an output

@@ -8,9 +8,10 @@ Protocol: an immutable request file (`<root>/requests/<id>.toml`) pins the
 exact commit, entrypoint, and resource envelope of a run. Submitting writes a
 receipt (`<root>/results/<id>/receipt.json`); collecting copies logs and
 scrapes metrics next to it. State is defined by which files exist — requests
-are never edited after submission. `<root>` is `expctl/` unless `expctl.toml`
-says otherwise; that file also holds the per-repository policy (required
-scheduler flags, node ceiling, shared runtime directories).
+are never edited after submission; running one again is a new request
+(`expctl rerun` copies it under a fresh ID). `<root>` is `expctl/` unless
+`expctl.toml` says otherwise; that file also holds the per-repository policy
+(required scheduler flags, node ceiling, shared runtime directories).
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from typing import Any
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -44,6 +45,9 @@ ID_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]*$")
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9.][A-Za-z0-9._-]*$")
+RERUN_SUFFIX_RE = re.compile(r"-r\d+$")
+# The top-level `id = "..."` line of a request file, as `rerun` rewrites it.
+ID_LINE_RE = re.compile(r"""^id\s*=\s*(['"])[^'"]*\1\s*(#.*)?$""")
 # Matches "name: value", "name = value", and column-aligned "name   value"
 # lines, so both dedicated machine-readable blocks and plain metric dumps work.
 METRIC_LINE_RE = re.compile(
@@ -321,6 +325,13 @@ def validate_request(
         raise ExpctlError("request.id must look like YYYYMMDD-lowercase-short-name")
     if path.stem != experiment_id:
         raise ExpctlError(f"request.id must match filename: {path.name}")
+    rerun_of = data.get("rerun_of")
+    if rerun_of is not None and (
+        not isinstance(rerun_of, str) or not ID_RE.fullmatch(rerun_of)
+    ):
+        raise ExpctlError("request.rerun_of must be an experiment ID")
+    if "rerun_reason" in data and not isinstance(data["rerun_reason"], str):
+        raise ExpctlError("request.rerun_reason must be a string")
     for key in ("title", "question", "decision_rule"):
         _text(data, key)
 
@@ -541,7 +552,9 @@ def submit_request(
     receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
     if receipt_path.exists():
         raise ExpctlError(
-            f"receipt already exists: {receipt_path}; use a new request ID for reruns"
+            f"receipt already exists: {receipt_path} "
+            f"({_receipt_summary(repo, receipt_path)}). A request is submitted "
+            f"once; to run it again: expctl rerun {experiment_id}"
         )
 
     code = _table(request, "code")
@@ -729,10 +742,116 @@ def collect_request(repo: Path, config: Config, experiment_id: str) -> dict[str,
     return collection
 
 
+def _receipt_summary(repo: Path, receipt_path: Path) -> str:
+    """One line about an existing receipt: who submitted what, and how it ended."""
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "unreadable receipt"
+    parts: list[str] = []
+    job_id = receipt.get("job_id")
+    if job_id:
+        parts.append(f"job {job_id}")
+    when, who = receipt.get("submitted_at"), receipt.get("submitted_by")
+    if when or who:
+        parts.append(
+            " ".join(filter(None, ["submitted", when, f"by {who}" if who else ""]))
+        )
+    if receipt.get("status"):
+        parts.append(f"receipt status {receipt['status']}")
+    if job_id:
+        try:
+            state = _scheduler_status(repo, str(job_id))["state"]
+        except ExpctlError:  # no sacct on this host
+            state = "UNKNOWN"
+        if state != "UNKNOWN":
+            parts.append(f"sacct {state}")
+    return ", ".join(parts) or "no details"
+
+
+def _next_rerun_id(repo: Path, config: Config, experiment_id: str) -> str:
+    base = RERUN_SUFFIX_RE.sub("", experiment_id)
+    number = 2
+    while request_path(repo, config, f"{base}-r{number}").exists():
+        number += 1
+    return f"{base}-r{number}"
+
+
+def rerun_request(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    new_id: str | None = None,
+    reason: str | None = None,
+    check_git: bool = True,
+) -> dict[str, Any]:
+    """Copy a submitted request under a new ID so it can be submitted again.
+
+    The copy is byte-identical apart from the top-level `id` line, which is
+    followed by `rerun_of` (and `rerun_reason` when given); any earlier
+    `rerun_of`/`rerun_reason` lines are dropped so the chain always points at
+    the immediate predecessor. Commit and worktree stay the same: `submit`
+    reuses an existing worktree that sits at the pinned commit. The original
+    request, its receipt, and its logs are untouched.
+    """
+    _, path = load_request(repo, config, experiment_id, check_git=False)
+    receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
+    if not receipt_path.is_file():
+        raise ExpctlError(
+            f"nothing to rerun: {experiment_id} has no receipt; submit it instead"
+        )
+    if new_id is None:
+        new_id = _next_rerun_id(repo, config, experiment_id)
+    new_path = request_path(repo, config, new_id)
+    if new_path.exists():
+        raise ExpctlError(f"request already exists: {new_path}")
+    if reason is not None and any(c in reason for c in "\"\\\n\r"):
+        raise ExpctlError(
+            "rerun reason cannot contain quotes, backslashes, or newlines"
+        )
+
+    output: list[str] = []
+    replaced = in_table = False
+    with path.open(encoding="utf-8", newline="") as handle:  # keep CRLF as is
+        source = handle.read()
+    for line in source.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        newline = line[len(body):]
+        if body.lstrip().startswith("["):
+            in_table = True
+        if not in_table and not replaced and ID_LINE_RE.match(body):
+            output.append(f'id = "{new_id}"{newline}')
+            output.append(f'rerun_of = "{experiment_id}"{newline}')
+            if reason is not None:
+                output.append(f'rerun_reason = "{reason}"{newline}')
+            replaced = True
+            continue
+        if not in_table and re.match(r"^rerun_(of|reason)\s*=", body):
+            continue
+        output.append(line)
+    if not replaced:
+        raise ExpctlError(f"could not find the top-level id line in {path}")
+
+    new_path.write_text("".join(output), encoding="utf-8", newline="")
+    try:
+        request, _ = load_request(repo, config, new_id, check_git=check_git)
+    except ExpctlError:
+        new_path.unlink()
+        raise
+    return {
+        "experiment_id": new_id,
+        "rerun_of": experiment_id,
+        "path": str(new_path.relative_to(repo)).replace("\\", "/"),
+        "commit": request["code"]["commit"],
+        "worktree": request["code"]["worktree"],
+    }
+
+
 def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
     requests_dir = repo / config.root / "requests"
     rows: list[dict[str, str]] = []
-    for path in sorted(requests_dir.glob("*.toml")):
+    for path in sorted(requests_dir.glob("*.toml"), key=lambda p: p.stem):
         experiment_id = path.stem
         try:
             data, _ = load_request(repo, config, experiment_id)
@@ -793,6 +912,21 @@ def _parser() -> argparse.ArgumentParser:
 
     collect = subparsers.add_parser("collect", help="copy logs and extract metrics")
     collect.add_argument("experiment_id")
+
+    rerun = subparsers.add_parser(
+        "rerun",
+        help="copy a submitted request to a new ID so it can be submitted again",
+    )
+    rerun.add_argument("experiment_id")
+    rerun.add_argument(
+        "--as",
+        dest="new_id",
+        metavar="NEW_ID",
+        help="ID for the copy (default: <id>-r2, then -r3, ...)",
+    )
+    rerun.add_argument(
+        "--reason", help='recorded in the copy as rerun_reason, e.g. "preempted"'
+    )
     return parser
 
 
@@ -838,6 +972,20 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "collect":
             result = collect_request(repo, config, args.experiment_id)
             print(json.dumps(result, indent=2, sort_keys=True))
+        elif args.command == "rerun":
+            result = rerun_request(
+                repo,
+                config,
+                args.experiment_id,
+                new_id=args.new_id,
+                reason=args.reason,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            print(
+                f"next: git add {result['path']} && git commit, "
+                f"then expctl submit {result['experiment_id']}",
+                file=sys.stderr,
+            )
         return 0
     except ExpctlError as exc:
         print(f"error: {exc}", file=sys.stderr)
