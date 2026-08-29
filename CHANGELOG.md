@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0 — 2026-08-29
+
+- `expctl new` now refuses uncommitted changes that are absent from the pinned
+  `HEAD`; `--allow-dirty` provides an explicit, visible override.
+- `expctl list` now supports repeatable `--status` filters, newest/oldest
+  sorting, and `--limit`. It defaults to newest first and caches Git validation
+  for requests sharing a commit and script.
+- Added `expctl doctor [--json]` to report repository readiness, worktree-root
+  safety and writability, POSIX locking, and required SLURM commands.
+
 ## 0.5.0 — 2026-08-29
 
 - Added `expctl new <id>` to create a request from the repository template and

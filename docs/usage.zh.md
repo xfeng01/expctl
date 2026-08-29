@@ -61,6 +61,14 @@ expctl/
 
 随后编辑 `expctl.toml`，至少确认允许的 SLURM 参数、节点上限、共享运行时目录和 worktree 位置。若修改 `paths.root`，再次运行 `expctl init` 会在新位置补齐目录，但不会移动或删除旧目录。
 
+可随时检查仓库配置、目录权限和集群依赖：
+
+```bash
+expctl doctor
+```
+
+`doctor` 分别报告仓库是否可用、当前机器是否具备 POSIX 锁和 SLURM 命令。任一必需检查失败时退出码为 `1`；使用 `--json` 可供脚本读取。
+
 将 `expctl.toml`、请求、模板和结果元数据纳入版本控制。不要提交数据集、模型权重、缓存或密钥。expctl 只读写文件，不会自动执行 `git add`、`git commit` 或 `git push`。
 
 ## 三、创建并发布实验请求
@@ -71,6 +79,8 @@ expctl/
    ```bash
    expctl new 20260901-lr-sweep
    ```
+
+   若工作树存在未提交改动，`new` 默认拒绝创建，因为这些内容不属于固定的 `HEAD`。应先提交或暂存；只有明确接受该风险时才使用 `--allow-dirty`。
 
 3. 编辑生成的请求，填写实验问题、判定规则、SLURM 脚本、输出和指标，然后验证：
 
@@ -95,6 +105,8 @@ expctl submit <id>
 ```
 
 `expctl list` 在交互终端中自动显示按终端宽度对齐的表格，中文按实际显示宽度计算，过长标题以 `…` 截断；状态在支持颜色的终端中会着色。对于带有效作业号的 `submitted` 回执，它会把所有作业号合并为一次 `squeue` 查询，再把已离开队列的作业合并为一次 `sacct` 查询；数组任务同时存在多种状态时显示 `MIXED`。查询是只读的，不修改回执；若 SLURM 命令缺失、查询失败或部分作业无状态，受影响的行安全回退为 `submitted`，并且只在标准错误输出一条警告。输出到管道或文件时仍使用纯净、稳定的 TSV；JSON 同样只写入标准输出。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color`（以及标准 `NO_COLOR` 环境变量）关闭颜色。
+
+`list` 默认按 ID 从新到旧排列；可用 `--sort oldest` 反转。`--status running,failed` 按实时或回执状态筛选且不区分大小写，`--limit 20` 在筛选和排序后限制数量。相同 commit 和脚本的 Git 校验会在单次列表中复用。
 
 `new`、`submit`、`status`、`collect` 和 `rerun` 在交互终端中显示简洁摘要和建议的下一步；输出到管道或文件时保持 JSON。需要在终端中获取 JSON 时使用 `--json`。
 
@@ -194,8 +206,9 @@ root = ".."
 | 命令 | 作用 |
 |---|---|
 | `expctl init` | 补齐配置和 `paths.root` 指定的目录结构 |
-| `expctl new <id> [--json]` | 从模板创建请求，并填写当前 Git commit、branch 和 worktree 名称 |
-| `expctl list [--table\|--tsv\|--json] [--no-color]` | 列出请求及其仓库状态；在集群上刷新已提交作业状态，终端默认表格，管道默认 TSV |
+| `expctl doctor [--json]` | 检查仓库结构、worktree 位置、POSIX 锁和 SLURM 命令 |
+| `expctl new <id> [--allow-dirty] [--json]` | 从模板创建请求并填写 Git 元数据；默认拒绝未提交改动 |
+| `expctl list [--table\|--tsv\|--json] [--status <states>] [--sort newest\|oldest] [--limit <n>] [--no-color]` | 列出请求及实时状态；默认从新到旧，终端表格，管道 TSV |
 | `expctl validate <id>` | 验证请求、固定提交和作业脚本策略 |
 | `expctl show <id>` | 将验证后的请求输出为 JSON |
 | `expctl submit <id> [--json]` | 准备 worktree、检查依赖和预算，并提交 SLURM 作业 |

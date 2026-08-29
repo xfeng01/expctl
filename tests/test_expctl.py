@@ -163,12 +163,15 @@ def test_new_request_fills_git_identity_and_never_overwrites(
     template.parent.mkdir()
     template.write_text(core.STARTER_TEMPLATE, encoding="utf-8")
     monkeypatch.setattr(core, "_git_text", lambda *args: "a" * 40 + "\n")
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        output = "" if args[:2] == ["git", "status"] else "feature/better-ux\n"
+        return subprocess.CompletedProcess(args, 0, output, "")
+
     monkeypatch.setattr(
         core,
         "_run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            [], 0, "feature/better-ux\n", ""
-        ),
+        fake_run,
     )
     experiment_id = "20260102-new-sweep"
 
@@ -193,6 +196,7 @@ def test_new_request_uses_real_git_metadata(tmp_path: Path) -> None:
     repo.mkdir()
     _git(repo, "init", "-q")
     init_repo(repo)
+    (repo / "train.py").write_text("version = 1\n", encoding="utf-8")
     _git(repo, "add", ".")
     _git(
         repo,
@@ -207,12 +211,16 @@ def test_new_request_uses_real_git_metadata(tmp_path: Path) -> None:
     )
     config = load_config(repo)
     experiment_id = "20260103-real-git"
+    (repo / "train.py").write_text("version = 2\n", encoding="utf-8")
 
-    result = core.new_request(repo, config, experiment_id)
+    with pytest.raises(ExpctlError, match="not included in the pinned HEAD"):
+        core.new_request(repo, config, experiment_id)
+    result = core.new_request(repo, config, experiment_id, allow_dirty=True)
 
     assert result["commit"] == _git(repo, "rev-parse", "HEAD")
     assert result["branch"] == _git(repo, "branch", "--show-current")
     assert result["worktree"] == "my-project-real-git"
+    assert any("train.py" in change for change in result["uncommitted_changes"])
     request, _ = load_request(repo, config, experiment_id, check_git=False)
     assert request["code"]["commit"] == result["commit"]
 
@@ -411,7 +419,121 @@ def test_list_tsv_is_single_line_per_request_and_parser_exposes_formats() -> Non
     )
     assert collect_args.worktree_root == Path("worktrees")
     assert core._parser().parse_args(["new", EXAMPLE_ID]).json is False
+    assert (
+        core._parser().parse_args(["new", EXAMPLE_ID, "--allow-dirty"]).allow_dirty
+        is True
+    )
     assert core._parser().parse_args(["status", EXAMPLE_ID, "--json"]).json is True
+    list_args = core._parser().parse_args(
+        [
+            "list",
+            "--status",
+            "running,failed",
+            "--status",
+            "requested",
+            "--sort",
+            "oldest",
+            "--limit",
+            "2",
+        ]
+    )
+    assert list_args.status == [("running", "failed"), ("requested",)]
+    assert list_args.sort == "oldest" and list_args.limit == 2
+
+
+def test_list_filters_sorts_and_limits_after_live_status_resolution() -> None:
+    rows = [
+        {"id": "20260101-old", "status": "requested", "title": "old"},
+        {"id": "20260103-new", "status": "RUNNING", "title": "new"},
+        {"id": "20260102-middle", "status": "FAILED", "title": "middle"},
+    ]
+
+    selected = core._select_list_rows(
+        rows,
+        statuses={"running", "failed"},
+        sort_order="newest",
+        limit=1,
+    )
+
+    assert selected == [rows[1]]
+
+
+def test_list_caches_git_validation_for_shared_commits_and_scripts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    second_id = "20260102-second"
+    second = EXAMPLE_REQUEST.replace(EXAMPLE_ID, second_id)
+    (repo / "expctl" / "requests" / f"{second_id}.toml").write_text(
+        second, encoding="utf-8"
+    )
+    config = load_config(repo)
+    calls = {"commit": 0, "script": 0}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert args[1] == "cat-file"
+        calls["commit"] += 1
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def fake_git_text(repo: Path, *args: str) -> str:
+        assert args[0] == "show"
+        calls["script"] += 1
+        return "#SBATCH -p example-partition\n#SBATCH --nodes=1\n"
+
+    monkeypatch.setattr(core, "_run", fake_run)
+    monkeypatch.setattr(core, "_git_text", fake_git_text)
+
+    rows = core.list_requests(repo, config)
+
+    assert [row["id"] for row in rows] == [EXAMPLE_ID, second_id]
+    assert calls == {"commit": 1, "script": 1}
+
+
+def test_doctor_reports_repository_and_cluster_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    template = repo / "expctl" / "templates" / "request.toml"
+    template.parent.mkdir()
+    template.write_text(core.STARTER_TEMPLATE, encoding="utf-8")
+    (repo / "expctl" / "results").mkdir()
+    monkeypatch.setattr(core.shutil, "which", lambda command: f"/bin/{command}")
+    monkeypatch.setattr(core, "fcntl", object())
+
+    result = core.doctor_repo(repo)
+
+    assert result["repository_ready"] is True
+    assert result["cluster_ready"] is True
+    assert all(check["ok"] for check in result["checks"])
+    rendered = core._render_doctor_result(result)
+    assert "EXPCTL DOCTOR" in rendered and "Cluster ready:    yes" in rendered
+    assert core._parser().parse_args(["doctor", "--json"]).json is True
+
+
+def test_doctor_json_returns_nonzero_when_cluster_is_not_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = {
+        "repository": str(tmp_path),
+        "repository_ready": True,
+        "cluster_ready": False,
+        "checks": [
+            {
+                "name": "sbatch",
+                "ok": False,
+                "detail": "not found on PATH",
+                "scope": "cluster",
+                "required": True,
+            }
+        ],
+    }
+    monkeypatch.setattr(core, "find_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(core, "doctor_repo", lambda repo: result)
+
+    assert core.main(["doctor", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out) == result
 
 
 def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
@@ -437,6 +559,17 @@ def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
 
     assert core.main(["list", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == rows
+
+    filtered_rows = [
+        *rows,
+        {"id": "20260102-running", "status": "RUNNING", "title": "active"},
+        {"id": "20260103-failed", "status": "FAILED", "title": "failed"},
+    ]
+    monkeypatch.setattr(core, "list_requests", lambda repo, loaded: filtered_rows)
+    assert (
+        core.main(["list", "--json", "--status", "running,failed", "--limit", "1"]) == 0
+    )
+    assert json.loads(capsys.readouterr().out) == [filtered_rows[2]]
 
 
 def test_status_cli_uses_a_human_summary_on_tty_and_honors_json(
@@ -537,6 +670,7 @@ def test_list_refreshes_submitted_receipts_without_mutating_them(
     monkeypatch.setattr(
         core, "load_request", lambda *args, **kwargs: (request, request_path)
     )
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         core,
         "_live_scheduler_statuses",
@@ -634,6 +768,7 @@ def test_list_warns_once_when_live_status_is_unavailable(
     monkeypatch.setattr(
         core, "load_request", lambda *args, **kwargs: (request, request_path)
     )
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         core,
         "_live_scheduler_statuses",

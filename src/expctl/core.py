@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -707,21 +707,59 @@ def validate_request(
         _relative_path(item, "notes.requirements")
 
     if check_git:
-        _run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=repo)
-        script_lines = _git_text(repo, "show", f"{commit}:{script}").splitlines()
-        active_script_lines = _slurm_preamble(script_lines)
-        for required in config.required_script_lines:
-            if required not in active_script_lines:
-                raise ExpctlError(
-                    f"{script} at {commit[:12]} is missing the required line: "
-                    f"{required}"
-                )
-        verified_nodes = _script_max_concurrent_nodes(script_lines, script)
-        if verified_nodes > max_nodes:
-            raise ExpctlError(
-                f"{script} can use {verified_nodes} concurrent nodes, exceeding "
-                f"slurm.max_concurrent_nodes={max_nodes}"
-            )
+        _validate_request_git(repo, config, data)
+
+
+def _validate_request_git(
+    repo: Path,
+    config: Config,
+    request: dict[str, Any],
+    *,
+    commit_cache: dict[str, str | None] | None = None,
+    script_cache: dict[tuple[str, str], tuple[int | None, str | None]] | None = None,
+) -> None:
+    """Validate pinned Git content, optionally reusing results across requests."""
+    commit = request["code"]["commit"]
+    script = request["slurm"]["script"]
+    max_nodes = request["slurm"]["max_concurrent_nodes"]
+    commit_cache = {} if commit_cache is None else commit_cache
+    script_cache = {} if script_cache is None else script_cache
+
+    if commit not in commit_cache:
+        try:
+            _run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=repo)
+        except ExpctlError as exc:
+            commit_cache[commit] = str(exc)
+        else:
+            commit_cache[commit] = None
+    if error := commit_cache[commit]:
+        raise ExpctlError(error)
+
+    cache_key = (commit, script)
+    if cache_key not in script_cache:
+        try:
+            script_lines = _git_text(repo, "show", f"{commit}:{script}").splitlines()
+            active_script_lines = _slurm_preamble(script_lines)
+            for required in config.required_script_lines:
+                if required not in active_script_lines:
+                    raise ExpctlError(
+                        f"{script} at {commit[:12]} is missing the required line: "
+                        f"{required}"
+                    )
+            verified_nodes = _script_max_concurrent_nodes(script_lines, script)
+        except ExpctlError as exc:
+            script_cache[cache_key] = (None, str(exc))
+        else:
+            script_cache[cache_key] = (verified_nodes, None)
+    verified_nodes, error = script_cache[cache_key]
+    if error:
+        raise ExpctlError(error)
+    assert verified_nodes is not None
+    if verified_nodes > max_nodes:
+        raise ExpctlError(
+            f"{script} can use {verified_nodes} concurrent nodes, exceeding "
+            f"slurm.max_concurrent_nodes={max_nodes}"
+        )
 
 
 def _request_hash(path: Path) -> str:
@@ -739,6 +777,20 @@ def _new_worktree_name(repo: Path, experiment_id: str) -> str:
     repository_name = repository_name.lower() or "experiment"
     short_name = experiment_id.split("-", 1)[1]
     return _plain_name(f"{repository_name}-{short_name}", "generated code.worktree")
+
+
+def _uncommitted_changes(repo: Path) -> list[str]:
+    result = _run(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+        cwd=repo,
+    )
+    return [line for line in result.stdout.splitlines() if line]
 
 
 def _render_new_request(
@@ -788,10 +840,25 @@ def _render_new_request(
     return "".join(output)
 
 
-def new_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
+def new_request(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    allow_dirty: bool = False,
+) -> dict[str, Any]:
     destination = request_path(repo, config, experiment_id)
     if destination.exists():
         raise ExpctlError(f"request already exists: {destination}")
+    uncommitted = _uncommitted_changes(repo)
+    if uncommitted and not allow_dirty:
+        preview = "\n  - ".join(uncommitted[:10])
+        suffix = "\n  - ..." if len(uncommitted) > 10 else ""
+        raise ExpctlError(
+            "uncommitted changes are not included in the pinned HEAD commit:\n"
+            f"  - {preview}{suffix}\n"
+            "commit or stash them first, or rerun with --allow-dirty"
+        )
     template_path = repo / config.root / "templates" / "request.toml"
     try:
         template = template_path.read_text(encoding="utf-8")
@@ -829,6 +896,150 @@ def new_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any
         "branch": branch,
         "commit": commit,
         "worktree": worktree,
+        "uncommitted_changes": uncommitted,
+    }
+
+
+def _doctor_entry(
+    name: str,
+    ok: bool,
+    detail: str,
+    *,
+    scope: str,
+    required: bool = True,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "ok": ok,
+        "detail": detail,
+        "scope": scope,
+        "required": required,
+    }
+
+
+def doctor_repo(repo: Path) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    git_path = shutil.which("git")
+    checks.append(
+        _doctor_entry(
+            "Git",
+            git_path is not None,
+            git_path or "not found on PATH",
+            scope="repository",
+        )
+    )
+
+    config: Config | None = None
+    try:
+        config = load_config(repo)
+    except ExpctlError as exc:
+        checks.append(
+            _doctor_entry("Configuration", False, str(exc), scope="repository")
+        )
+    else:
+        checks.append(
+            _doctor_entry(
+                "Configuration",
+                True,
+                str(repo / CONFIG_NAME),
+                scope="repository",
+            )
+        )
+        data_root = repo / config.root
+        for name, path, kind in (
+            ("Request template", data_root / "templates" / "request.toml", "file"),
+            ("Requests directory", data_root / "requests", "directory"),
+            ("Results directory", data_root / "results", "directory"),
+        ):
+            ok = path.is_file() if kind == "file" else path.is_dir()
+            checks.append(
+                _doctor_entry(
+                    name,
+                    ok,
+                    str(path) if ok else f"missing {kind}: {path}",
+                    scope="repository",
+                )
+            )
+
+        worktree_root = (repo / config.worktree_root).resolve()
+        location_safe = not (
+            worktree_root == repo.resolve() or repo.resolve() in worktree_root.parents
+        )
+        writable_path = worktree_root
+        while not writable_path.exists() and writable_path != writable_path.parent:
+            writable_path = writable_path.parent
+        writable = writable_path.is_dir() and os.access(writable_path, os.W_OK)
+        root_ok = (
+            location_safe
+            and writable
+            and not (worktree_root.exists() and not worktree_root.is_dir())
+        )
+        reasons: list[str] = []
+        if not location_safe:
+            reasons.append("must not be inside the repository")
+        if not writable:
+            reasons.append(f"nearest existing parent is not writable: {writable_path}")
+        if worktree_root.exists() and not worktree_root.is_dir():
+            reasons.append("path exists but is not a directory")
+        checks.append(
+            _doctor_entry(
+                "Worktree root",
+                root_ok,
+                str(worktree_root) if root_ok else "; ".join(reasons),
+                scope="repository",
+            )
+        )
+
+    checks.append(
+        _doctor_entry(
+            "POSIX locking",
+            fcntl is not None,
+            "available" if fcntl is not None else "fcntl unavailable",
+            scope="cluster",
+        )
+    )
+    for command in ("sbatch", "squeue", "sacct"):
+        command_path = shutil.which(command)
+        checks.append(
+            _doctor_entry(
+                command,
+                command_path is not None,
+                command_path or "not found on PATH",
+                scope="cluster",
+            )
+        )
+    scontrol_path = shutil.which("scontrol")
+    scontrol_required = bool(config and config.max_total_nodes)
+    checks.append(
+        _doctor_entry(
+            "scontrol",
+            scontrol_path is not None,
+            scontrol_path
+            or (
+                "not found on PATH"
+                if scontrol_required
+                else "not found; only required when node budgeting is enabled"
+            ),
+            scope="cluster",
+            required=scontrol_required,
+        )
+    )
+
+    repository_ready = all(
+        check["ok"]
+        for check in checks
+        if check["scope"] == "repository" and check["required"]
+    )
+    cluster_ready = repository_ready and all(
+        check["ok"]
+        for check in checks
+        if check["scope"] == "cluster" and check["required"]
+    )
+    return {
+        "repository": str(repo),
+        "repository_ready": repository_ready,
+        "cluster_ready": cluster_ready,
+        "checks": checks,
     }
 
 
@@ -1850,12 +2061,49 @@ def _render_new_result(result: dict[str, Any]) -> str:
             ("Commit", result["commit"]),
             ("Branch", result["branch"]),
             ("Worktree", result["worktree"]),
+            (
+                "Uncommitted",
+                len(result.get("uncommitted_changes", [])) or None,
+            ),
         ],
         next_steps=[
             f"Edit {path}",
             shlex.join(["expctl", "validate", experiment_id]),
         ],
     )
+
+
+def _render_doctor_result(result: dict[str, Any]) -> str:
+    checks = result["checks"]
+    name_width = max(len(str(check["name"])) for check in checks)
+    lines = [
+        "EXPCTL DOCTOR",
+        f"Repository ready: {'yes' if result['repository_ready'] else 'no'}",
+        f"Cluster ready:    {'yes' if result['cluster_ready'] else 'no'}",
+        "",
+    ]
+    for check in checks:
+        if check["ok"]:
+            status = "OK"
+        elif check["required"]:
+            status = "FAIL"
+        else:
+            status = "OPTIONAL"
+        lines.append(
+            f"{check['name']!s:<{name_width}}  {status:<8}  "
+            f"{_safe_list_cell(check['detail'])}"
+        )
+    if not result["repository_ready"]:
+        lines.extend(["", "Next:", "  Fix the failed repository checks above."])
+    elif not result["cluster_ready"]:
+        lines.extend(
+            [
+                "",
+                "Next:",
+                "  Run expctl on a POSIX cluster host with the missing SLURM tools.",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _render_submit_result(
@@ -2179,10 +2427,19 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
     requests_dir = repo / config.root / "requests"
     rows: list[dict[str, str]] = []
     submitted_rows: dict[str, list[dict[str, str]]] = {}
+    commit_cache: dict[str, str | None] = {}
+    script_cache: dict[tuple[str, str], tuple[int | None, str | None]] = {}
     for path in sorted(requests_dir.glob("*.toml"), key=lambda p: p.stem):
         experiment_id = path.stem
         try:
-            data, _ = load_request(repo, config, experiment_id)
+            data, _ = load_request(repo, config, experiment_id, check_git=False)
+            _validate_request_git(
+                repo,
+                config,
+                data,
+                commit_cache=commit_cache,
+                script_cache=script_cache,
+            )
             receipt = result_dir(repo, config, experiment_id) / "receipt.json"
             status = "requested"
             if receipt.is_file():
@@ -2217,6 +2474,39 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
     return rows
 
 
+def _status_filter_argument(value: str) -> tuple[str, ...]:
+    statuses = tuple(status.strip().casefold() for status in value.split(","))
+    if not statuses or any(not status for status in statuses):
+        raise argparse.ArgumentTypeError(
+            "statuses must be a comma-separated list, for example running,failed"
+        )
+    return statuses
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _select_list_rows(
+    rows: list[dict[str, str]],
+    *,
+    statuses: set[str],
+    sort_order: str,
+    limit: int | None,
+) -> list[dict[str, str]]:
+    selected = [
+        row for row in rows if not statuses or row["status"].casefold() in statuses
+    ]
+    selected.sort(key=lambda row: row["id"], reverse=sort_order == "newest")
+    return selected[:limit] if limit is not None else selected
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="expctl",
@@ -2229,10 +2519,22 @@ def _parser() -> argparse.ArgumentParser:
         "init", help=f"create {CONFIG_NAME} and the configured data skeleton"
     )
 
+    doctor = subparsers.add_parser(
+        "doctor", help="check repository configuration and cluster dependencies"
+    )
+    doctor.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
+    )
+
     new = subparsers.add_parser(
         "new", help="create a request from the repository template"
     )
     new.add_argument("experiment_id", metavar="ID")
+    new.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="create the request even when changes are not included in HEAD",
+    )
     new.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
@@ -2265,6 +2567,26 @@ def _parser() -> argparse.ArgumentParser:
     listing.set_defaults(list_format="auto")
     listing.add_argument(
         "--no-color", action="store_true", help="disable status colors in table output"
+    )
+    listing.add_argument(
+        "--status",
+        action="append",
+        default=[],
+        type=_status_filter_argument,
+        metavar="STATUS[,STATUS...]",
+        help="include only these stored or live statuses; may be repeated",
+    )
+    listing.add_argument(
+        "--sort",
+        choices=("newest", "oldest"),
+        default="newest",
+        help="sort by experiment ID (default: newest)",
+    )
+    listing.add_argument(
+        "--limit",
+        type=_positive_int,
+        metavar="N",
+        help="show at most N experiments after filtering and sorting",
     )
 
     validate = subparsers.add_parser("validate", help="validate one request")
@@ -2348,14 +2670,32 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print("Nothing to do; expctl files already exist.")
             return 0
+        if args.command == "doctor":
+            result = doctor_repo(repo)
+            _print_command_result(
+                result, _render_doctor_result(result), force_json=args.json
+            )
+            return 0 if result["cluster_ready"] else 1
         config = load_config(repo)
         if args.command == "new":
-            result = new_request(repo, config, args.experiment_id)
+            result = new_request(
+                repo,
+                config,
+                args.experiment_id,
+                allow_dirty=args.allow_dirty,
+            )
             _print_command_result(
                 result, _render_new_result(result), force_json=args.json
             )
         elif args.command == "list":
             rows = list_requests(repo, config)
+            statuses = {status for group in args.status for status in group}
+            rows = _select_list_rows(
+                rows,
+                statuses=statuses,
+                sort_order=args.sort,
+                limit=args.limit,
+            )
             output_format = args.list_format
             if output_format == "auto":
                 output_format = "table" if sys.stdout.isatty() else "tsv"

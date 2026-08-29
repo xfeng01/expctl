@@ -33,11 +33,14 @@ Complete command reference:
 # Initialize expctl in the current repository.
 expctl init
 
-# Create a request from the repository template and fill in Git metadata.
-expctl new <id> [--json]
+# Check repository configuration and cluster dependencies.
+expctl doctor [--json]
 
-# List experiment requests. Choose at most one output format.
-expctl list [--table | --tsv | --json] [--no-color]
+# Create a request from the repository template and fill in Git metadata.
+expctl new <id> [--allow-dirty] [--json]
+
+# List, filter, sort, and limit experiment requests.
+expctl list [--table | --tsv | --json] [--status STATUS[,STATUS...]] [--sort newest|oldest] [--limit N] [--no-color]
 
 # Print one validated request as JSON.
 expctl show <id>
@@ -66,20 +69,28 @@ expctl <command> --help
 `--skip-node-check` bypasses the cross-job node-budget check and requires
 explicit operator authorization.
 
+`new` refuses a dirty working tree because uncommitted changes are not part of
+the pinned `HEAD`; `--allow-dirty` is an explicit override. `doctor` reports
+repository and cluster readiness and exits nonzero unless both are ready.
+
 In a terminal, `list` renders an aligned table. Redirected output defaults to
 TSV. For example:
 
 ```text
 EXPERIMENT ID                 STATUS     TITLE
 ----------------------------  ---------  ---------------------------
-20260829-decoder-cross-probe  RUNNING    Decoder block-RoPE probe
-20260829-decoder-metric       PENDING    Decoder-induced metric
 20260829-stagger-control      FAILED     Iso-cost stagger control
+20260829-decoder-metric       PENDING    Decoder-induced metric
+20260829-decoder-cross-probe  RUNNING    Decoder block-RoPE probe
 ```
 
 Mixed array-task states show `MIXED`. If SLURM is unavailable or returns no
 state, `list` warns once on stderr and keeps the affected rows as `submitted`.
 Receipts are never modified by a refresh.
+
+`list` sorts newest IDs first by default. `--status` is case-insensitive, may
+contain comma-separated values, and may be repeated. Filtering uses refreshed
+SLURM states; repeated commit/script validation is cached within each listing.
 
 `new`, `submit`, `status`, `collect`, and `rerun` show concise summaries and a
 suggested next step in an interactive terminal. Redirected output stays JSON;
