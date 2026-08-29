@@ -117,9 +117,9 @@ newline-delimited JSON.
 result directory afterward. `clean` only removes a verified worktree after
 collection and refuses one still claimed by an uncollected rerun.
 
-Human-oriented lifecycle commands show concise summaries and a suggested next
-step in a terminal. Redirected output stays JSON unless the command emits raw
-logs; use `--json` to force JSON where supported.
+Human-oriented lifecycle commands show aligned detail and next-step tables in
+a terminal. Redirected output stays JSON unless the command emits raw logs;
+use `--json` to force JSON where supported.
 
 `submit`, `status`, `logs --follow`, `cancel`, `collect`, and `clean` run on the
 cluster host. The other commands also work on Windows; non-following `logs`

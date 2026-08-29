@@ -2884,6 +2884,47 @@ def rerun_request(
     }
 
 
+def _render_table(headers: tuple[str, ...], rows: list[tuple[object, ...]]) -> str:
+    """Render a compact, control-safe table using terminal display widths."""
+    if not rows:
+        return ""
+    if any(len(row) != len(headers) for row in rows):
+        raise ValueError("table rows must match the header width")
+    safe_headers = tuple(_safe_list_cell(header) for header in headers)
+    safe_rows = [tuple(_safe_list_cell(value) for value in row) for row in rows]
+    widths = tuple(
+        max(
+            _display_width(header),
+            *(_display_width(row[index]) for row in safe_rows),
+        )
+        for index, header in enumerate(safe_headers)
+    )
+
+    def render_row(row: tuple[str, ...]) -> str:
+        return "  ".join(
+            _fit_list_cell(value, width)
+            for value, width in zip(row, widths, strict=True)
+        ).rstrip()
+
+    rule = _list_rule_character()
+    separator = "  ".join(rule * width for width in widths).rstrip()
+    return "\n".join(
+        [render_row(safe_headers), separator, *(render_row(row) for row in safe_rows)]
+    )
+
+
+def _render_next_steps(next_steps: list[str]) -> str:
+    return "\n".join(
+        [
+            "NEXT STEPS",
+            _render_table(
+                ("STEP", "ACTION"),
+                [(index, step) for index, step in enumerate(next_steps, start=1)],
+            ),
+        ]
+    )
+
+
 def _render_summary(
     heading: str,
     fields: list[tuple[str, object]],
@@ -2891,15 +2932,11 @@ def _render_summary(
     next_steps: list[str] | None = None,
 ) -> str:
     visible = [(label, value) for label, value in fields if value not in (None, "")]
-    width = max((len(label) for label, _ in visible), default=0)
     lines = [heading]
-    lines.extend(
-        f"{label + ':':<{width + 1}}  {_safe_list_cell(value)}"
-        for label, value in visible
-    )
+    if visible:
+        lines.append(_render_table(("FIELD", "VALUE"), visible))
     if next_steps:
-        lines.extend(["", "Next:"])
-        lines.extend(f"  {_safe_list_cell(step)}" for step in next_steps)
+        lines.extend(["", _render_next_steps(next_steps)])
     return "\n".join(lines)
 
 
@@ -2935,8 +2972,9 @@ def _render_validate_summary(
     env = slurm.get("env", {})
     shown_metrics = ", ".join(metrics[:6]) + (", ..." if len(metrics) > 6 else "")
     return _render_summary(
-        f"valid: {experiment_id}",
+        "REQUEST VALID",
         [
+            ("Experiment", experiment_id),
             ("Commit", f"{code['commit'][:12]} ({code['branch']})"),
             ("Script", slurm["script"]),
             (
@@ -2956,16 +2994,32 @@ def _render_doctor_result(
     result: dict[str, Any], *, require_cluster: bool = False
 ) -> str:
     checks = result["checks"]
-    name_width = max(len(str(check["name"])) for check in checks)
-    cluster_note = ""
-    if not result["cluster_ready"] and not require_cluster:
-        cluster_note = " (informational here; --cluster makes it required)"
+    cluster_note = (
+        "informational here; --cluster makes it required"
+        if not result["cluster_ready"] and not require_cluster
+        else ""
+    )
     lines = [
         "EXPCTL DOCTOR",
-        f"Repository ready: {'yes' if result['repository_ready'] else 'no'}",
-        f"Cluster ready:    {'yes' if result['cluster_ready'] else 'no'}{cluster_note}",
+        _render_table(
+            ("AREA", "STATUS", "NOTE"),
+            [
+                (
+                    "Repository",
+                    "READY" if result["repository_ready"] else "NOT READY",
+                    "",
+                ),
+                (
+                    "Cluster",
+                    "READY" if result["cluster_ready"] else "NOT READY",
+                    cluster_note,
+                ),
+            ],
+        ),
         "",
+        "CHECKS",
     ]
+    check_rows: list[tuple[object, ...]] = []
     for check in checks:
         if check["ok"]:
             status = "OK"
@@ -2975,31 +3029,23 @@ def _render_doctor_result(
             status = "FAIL"
         else:
             status = "OPTIONAL"
-        lines.append(
-            f"{check['name']!s:<{name_width}}  {status:<8}  "
-            f"{_safe_list_cell(check['detail'])}"
-        )
+        check_rows.append((check["name"], status, check["detail"]))
+    lines.append(_render_table(("CHECK", "STATUS", "DETAIL"), check_rows))
     if not result["repository_ready"]:
-        lines.extend(["", "Next:", "  Fix the failed repository checks above."])
+        next_steps = ["Fix the failed repository checks above."]
     elif not result["cluster_ready"] and require_cluster:
-        lines.extend(
-            [
-                "",
-                "Next:",
-                "  Run expctl on a POSIX cluster host with the missing SLURM tools.",
-            ]
-        )
+        next_steps = [
+            "Run expctl on a POSIX cluster host with the missing SLURM tools."
+        ]
     elif not result["cluster_ready"]:
-        lines.extend(
-            [
-                "",
-                "Next:",
-                (
-                    "  Repository is ready for authoring. On the cluster host, run: "
-                    "expctl doctor --cluster"
-                ),
-            ]
-        )
+        next_steps = [
+            "Repository is ready for authoring.",
+            "On the cluster host, run: expctl doctor --cluster",
+        ]
+    else:
+        next_steps = []
+    if next_steps:
+        lines.extend(["", _render_next_steps(next_steps)])
     return "\n".join(lines)
 
 
@@ -3037,7 +3083,7 @@ def _render_submit_result(
     return _render_summary(
         "SUBMITTED",
         fields,
-        next_steps=[shlex.join(["expctl", "status", experiment_id])],
+        next_steps=[shlex.join(["expctl", "status", experiment_id, "--watch"])],
     )
 
 
@@ -3123,8 +3169,7 @@ def _render_status_result(result: dict[str, Any], *, result_path: str) -> str:
     elif receipt_status == "collected":
         next_steps = [shlex.join(["expctl", "report", experiment_id])]
     elif not _status_is_terminal(result):
-        command = shlex.join(["expctl", "status", experiment_id])
-        next_steps = [f"Wait for SLURM, then run: {command}"]
+        next_steps = [shlex.join(["expctl", "status", experiment_id, "--watch"])]
     else:
         next_steps = [shlex.join(["expctl", "collect", experiment_id])]
     return _render_summary("EXPERIMENT STATUS", fields, next_steps=next_steps)
@@ -3159,9 +3204,7 @@ def _render_cancel_result(result: dict[str, Any]) -> str:
     )
 
 
-def _render_collect_result(
-    result: dict[str, Any], *, experiment_id: str, result_path: str
-) -> str:
+def _render_collect_result(result: dict[str, Any], *, experiment_id: str) -> str:
     scheduler = result.get("scheduler", {})
     scheduler_state = (
         scheduler.get("state") if isinstance(scheduler, dict) else scheduler
@@ -3176,10 +3219,7 @@ def _render_collect_result(
             ("Metrics", result.get("metrics_file")),
             ("Missing", ", ".join(missing) if missing else "none"),
         ],
-        next_steps=[
-            shlex.join(["expctl", "report", experiment_id])
-            + f"  # scaffold {result_path}/report.md"
-        ],
+        next_steps=[shlex.join(["expctl", "report", experiment_id])],
     )
 
 
@@ -3961,15 +4001,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.experiment_id,
                 worktree_root=args.worktree_root,
             )
-            result_path = str(
-                result_dir(repo, config, args.experiment_id).relative_to(repo)
-            ).replace("\\", "/")
             _print_command_result(
                 result,
                 _render_collect_result(
                     result,
                     experiment_id=args.experiment_id,
-                    result_path=result_path,
                 ),
                 force_json=args.json,
             )

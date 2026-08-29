@@ -186,7 +186,9 @@ def test_new_request_fills_git_identity_and_never_overwrites(
     assert request["code"]["commit"] == "a" * 40
     assert request["code"]["branch"] == "feature/better-ux"
     assert request["code"]["worktree"].endswith("-new-sweep")
-    assert "Next:" in core._render_new_result(result)
+    rendered = core._render_new_result(result)
+    assert "FIELD" in rendered and "VALUE" in rendered
+    assert "NEXT STEPS" in rendered and "ACTION" in rendered
     original = path.read_text(encoding="utf-8")
     with pytest.raises(ExpctlError, match="already exists"):
         core.new_request(repo, config, experiment_id)
@@ -422,6 +424,22 @@ def test_list_table_colors_status_only_when_requested() -> None:
     assert colored.endswith("done")
 
 
+def test_summary_table_aligns_cjk_and_sanitizes_control_characters() -> None:
+    rendered = core._render_summary(
+        "SUMMARY",
+        [("实验", "中文 value"), ("Detail", "line one\nline two\x1b[31m")],
+        next_steps=["expctl status 20260829-example --watch"],
+    )
+
+    lines = rendered.splitlines()
+    assert lines[0] == "SUMMARY"
+    assert lines[1].startswith("FIELD   VALUE")
+    assert lines[2][6:8] == "  "
+    assert "实验    中文 value" in rendered
+    assert "line one line two?[31m" in rendered
+    assert "NEXT STEPS\nSTEP  ACTION" in rendered
+
+
 def test_list_tsv_is_single_line_per_request_and_parser_exposes_formats() -> None:
     rows = [{"id": EXAMPLE_ID, "status": "requested", "title": "a\tb\nc"}]
 
@@ -520,7 +538,9 @@ def test_doctor_reports_repository_and_cluster_readiness(
     assert result["cluster_ready"] is True
     assert all(check["ok"] for check in result["checks"])
     rendered = core._render_doctor_result(result)
-    assert "EXPCTL DOCTOR" in rendered and "Cluster ready:    yes" in rendered
+    assert "EXPCTL DOCTOR" in rendered
+    assert "AREA" in rendered and "STATUS" in rendered and "Cluster" in rendered
+    assert "READY" in rendered
     assert core._parser().parse_args(["doctor", "--json"]).json is True
 
 
@@ -625,7 +645,8 @@ def test_status_cli_uses_a_human_summary_on_tty_and_honors_json(
     assert core.main(["status", EXAMPLE_ID]) == 0
     human = capsys.readouterr().out
     assert "EXPERIMENT STATUS" in human
-    assert "Status:" in human and "COMPLETED" in human
+    assert "FIELD" in human and "VALUE" in human
+    assert "Status" in human and "COMPLETED" in human
     assert f"expctl collect {EXAMPLE_ID}" in human
 
     assert core.main(["status", EXAMPLE_ID, "--json"]) == 0
@@ -659,7 +680,6 @@ def test_human_result_renderers_include_lifecycle_next_steps() -> None:
             "scheduler": {"state": "COMPLETED"},
         },
         experiment_id=EXAMPLE_ID,
-        result_path=f"expctl/results/{EXAMPLE_ID}",
     )
     rerun_text = core._render_rerun_result(
         {
@@ -1716,10 +1736,11 @@ def test_validate_cli_prints_a_summary_on_a_terminal(
     monkeypatch.setattr(core.sys.stdout, "isatty", lambda: True)
     assert core.main(["validate", EXAMPLE_ID]) == 0
     human = capsys.readouterr().out
-    assert human.startswith(f"valid: {EXAMPLE_ID}\n")
+    assert human.startswith("REQUEST VALID\n")
+    assert EXAMPLE_ID in human
     assert "2 verified / 4 declared" in human
     assert "scripts/sweep.slurm" in human and "NUM_SAMPLES=256" in human
-    assert "Metrics:" in human and "gen_ppl" in human
+    assert "Metrics" in human and "gen_ppl" in human
 
 
 def _collected_receipt(repo: Path, experiment_id: str) -> Path:
