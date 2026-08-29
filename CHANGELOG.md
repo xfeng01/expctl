@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.3 — 2026-08-29
+
+- `expctl list` now batches all submitted job IDs into one `squeue` query and
+  one `sacct` query for jobs no longer queued, avoiding per-experiment
+  scheduler round trips.
+- Failed, unavailable, or incomplete live refreshes emit one warning on
+  stderr while affected rows retain `submitted`; TSV and JSON stdout remain
+  machine-readable and receipts remain unchanged.
+- Reorganized the README into a concise English command reference and added a
+  compact `list` output example.
+
 ## 0.4.2 — 2026-08-29
 
 - `expctl list` now refreshes confirmed `submitted` receipts from SLURM:

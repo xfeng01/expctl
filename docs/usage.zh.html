@@ -293,7 +293,7 @@
 
 <div class="page">
   <header>
-    <p class="eyebrow">expctl · v0.4.2 · 异步实验交接</p>
+    <p class="eyebrow">expctl · v0.4.3 · 异步实验交接</p>
     <h1>expctl 中文使用指南</h1>
     <p class="lede">
       expctl 用 Git 仓库中的请求、回执和结果文件交接异步实验。实验设计者与集群操作者不必同时在线，也能确认运行了哪一版代码、使用了哪些参数，并追溯结果来源。
@@ -379,7 +379,7 @@ expctl list
 expctl show &lt;id&gt;
 expctl submit &lt;id&gt; --dry-run
 expctl submit &lt;id&gt;</code></pre>
-    <p><code>expctl list</code> 在交互终端中自动显示按终端宽度对齐的表格，中文按实际宽度计算，长标题以省略号截断；管道或文件输出保持稳定 TSV。对于带有效作业号的 <code>submitted</code> 回执，它会先用 <code>squeue</code> 查询排队或运行状态，离开队列后再用 <code>sacct</code> 查询最终结果；数组任务有多种状态时显示 <code>MIXED</code>。查询只读且不修改回执；SLURM 命令缺失或查询不可用时安全回退为 <code>submitted</code>。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式，并用 <code>--no-color</code> 关闭颜色。</p>
+    <p><code>expctl list</code> 在交互终端中自动显示按终端宽度对齐的表格，中文按实际宽度计算，长标题以省略号截断；管道或文件输出保持稳定 TSV。对于带有效作业号的 <code>submitted</code> 回执，它会把所有作业号合并为一次 <code>squeue</code> 查询，再把已离开队列的作业合并为一次 <code>sacct</code> 查询；数组任务有多种状态时显示 <code>MIXED</code>。查询只读且不修改回执；SLURM 命令缺失、查询失败或部分作业无状态时，受影响的行安全回退为 <code>submitted</code>，并且只在标准错误输出一条警告，因此 TSV 和 JSON 标准输出仍保持纯净。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式，并用 <code>--no-color</code> 关闭颜色。</p>
     <p><code>--dry-run</code> 会验证请求并输出固定提交、worktree 路径、<code>sbatch</code> 命令、声明节点上限和推导节点上限。它不会创建 worktree、链接共享目录、检查运行时依赖或当前节点预算，也不会调用 <code>sbatch</code>。</p>
     <p>正式提交时，expctl 会先独占 <code>preparing</code> 回执，再创建或验证属于当前仓库、位于固定提交且内容干净的 detached worktree，检查资源和节点预算，清除宿主 <code>SBATCH_*</code> 覆盖项，最后调用 <code>sbatch --parsable</code> 并原子完成回执。无法确认作业号时回执保留为 <code>submission_unknown</code>，必须人工对账，不能自动重试。</p>
     <div class="note"><p>若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 <code>receipt.json</code>。</p></div>

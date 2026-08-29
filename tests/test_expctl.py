@@ -343,7 +343,11 @@ def test_list_refreshes_submitted_receipts_without_mutating_them(
     monkeypatch.setattr(
         core, "load_request", lambda *args, **kwargs: (request, request_path)
     )
-    monkeypatch.setattr(core, "_live_scheduler_status", lambda *args: "RUNNING")
+    monkeypatch.setattr(
+        core,
+        "_live_scheduler_statuses",
+        lambda *args: ({"123": "RUNNING"}, None),
+    )
 
     assert core.list_requests(repo, config) == [
         {"id": EXAMPLE_ID, "status": "RUNNING", "title": "Example sweep"}
@@ -355,31 +359,34 @@ def test_live_list_status_summarizes_queue_and_accounting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(core.shutil, "which", lambda command: f"/bin/{command}")
-    monkeypatch.setattr(
-        core,
-        "_queue_status",
-        lambda *args: [
-            {"job": "123_1", "state": "RUNNING", "reason": "None"},
-            {"job": "123_2", "state": "PENDING", "reason": "Resources"},
-        ],
-    )
+    calls: list[list[str]] = []
 
-    assert core._live_scheduler_status(tmp_path, "123") == "MIXED"
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if args[0] == "squeue":
+            assert args[args.index("-j") + 1] == "123,456"
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                "123_1|RUNNING|None\n123_2|PENDING|Resources\n",
+                "",
+            )
+        assert args[0] == "sacct"
+        assert args[args.index("-j") + 1] == "456"
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            "456|FAILED|1:0\n456.batch|FAILED|1:0\n",
+            "",
+        )
 
-    monkeypatch.setattr(core, "_queue_status", lambda *args: [])
-    monkeypatch.setattr(
-        core,
-        "_scheduler_status",
-        lambda *args: {
-            "state": "COMPLETED,FAILED",
-            "jobs": [
-                {"job_id": "123", "state": "FAILED", "exit_code": "1:0"},
-                {"job_id": "123_1", "state": "COMPLETED", "exit_code": "0:0"},
-            ],
-        },
-    )
+    monkeypatch.setattr(core, "_run", fake_run)
 
-    assert core._live_scheduler_status(tmp_path, "123") == "FAILED"
+    statuses, warning = core._live_scheduler_statuses(tmp_path, ["123", "456"])
+
+    assert statuses == {"123": "MIXED", "456": "FAILED"}
+    assert warning is None
+    assert [call[0] for call in calls] == ["squeue", "sacct"]
 
 
 def test_live_list_status_falls_back_when_slurm_is_unavailable(
@@ -388,20 +395,66 @@ def test_live_list_status_falls_back_when_slurm_is_unavailable(
     monkeypatch.setattr(core.shutil, "which", lambda command: None)
     monkeypatch.setattr(
         core,
-        "_queue_status",
+        "_queue_statuses",
         lambda *args: pytest.fail("squeue should not be called when it is unavailable"),
     )
 
-    assert core._live_scheduler_status(tmp_path, "123") is None
+    statuses, warning = core._live_scheduler_statuses(tmp_path, ["123", "456"])
+    assert statuses == {}
+    assert warning == "squeue not found; showing stored receipt states"
     assert core._slurm_state_name("CANCELLED by 456") == "CANCELLED"
 
     monkeypatch.setattr(core.shutil, "which", lambda command: f"/bin/{command}")
     monkeypatch.setattr(
         core,
-        "_queue_status",
+        "_queue_statuses",
         lambda *args: (_ for _ in ()).throw(ExpctlError("controller unavailable")),
     )
-    assert core._live_scheduler_status(tmp_path, "123") is None
+    statuses, warning = core._live_scheduler_statuses(tmp_path, ["123", "456"])
+    assert statuses == {}
+    assert warning == "controller unavailable; showing stored receipt states"
+
+    monkeypatch.setattr(core, "_queue_statuses", lambda *args: [])
+    monkeypatch.setattr(core, "_scheduler_status_rows", lambda *args: [])
+    statuses, warning = core._live_scheduler_statuses(tmp_path, ["123", "456"])
+    assert statuses == {}
+    assert warning == (
+        "SLURM returned no state for 2 submitted job(s); showing stored receipt states"
+    )
+
+
+def test_list_warns_once_when_live_status_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    receipt_dir = repo / "expctl" / "results" / EXAMPLE_ID
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "receipt.json").write_text(
+        json.dumps({"job_id": "123", "status": "submitted"}), encoding="utf-8"
+    )
+    request = tomllib.loads(EXAMPLE_REQUEST)
+    request_path = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    monkeypatch.setattr(
+        core, "load_request", lambda *args, **kwargs: (request, request_path)
+    )
+    monkeypatch.setattr(
+        core,
+        "_live_scheduler_statuses",
+        lambda *args: ({}, "squeue not found; showing stored receipt states"),
+    )
+    monkeypatch.setattr(core, "find_repo_root", lambda: repo)
+    monkeypatch.setattr(core, "load_config", lambda loaded: config)
+
+    assert core.main(["list", "--json"]) == 0
+    captured = capsys.readouterr()
+
+    assert json.loads(captured.out)[0]["status"] == "submitted"
+    assert captured.err == (
+        "warning: squeue not found; showing stored receipt states\n"
+    )
 
 
 def test_invalid_id_is_rejected(tmp_path: Path) -> None:

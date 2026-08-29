@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -1127,17 +1127,22 @@ def submit_request(
         raise
 
 
-def _queue_status(repo: Path, job_id: str) -> list[dict[str, str]]:
+def _queue_statuses(repo: Path, job_ids: list[str]) -> list[dict[str, str]]:
+    if not job_ids:
+        return []
     result = _run(
-        ["squeue", "-r", "-j", job_id, "-h", "-o", "%i|%T|%r"],
+        ["squeue", "-r", "-j", ",".join(job_ids), "-h", "-o", "%i|%T|%r"],
         cwd=repo,
         check=False,
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
-        if "invalid job id" in detail.lower():
-            return []  # Completed/purged jobs produce this on some SLURM versions.
-        raise ExpctlError(f"squeue query failed for job {job_id}: {detail}")
+        if "invalid job id" not in detail.lower():
+            raise ExpctlError(
+                f"squeue query failed for jobs {','.join(job_ids)}: {detail}"
+            )
+        # Completed or purged jobs produce this on some SLURM versions. Keep
+        # any stdout rows in case a mixed batch also contained active jobs.
     rows: list[dict[str, str]] = []
     for line in result.stdout.splitlines():
         if not line.strip():
@@ -1147,6 +1152,10 @@ def _queue_status(repo: Path, job_id: str) -> list[dict[str, str]]:
             {"job": job.strip(), "state": state.strip(), "reason": reason.strip()}
         )
     return rows
+
+
+def _queue_status(repo: Path, job_id: str) -> list[dict[str, str]]:
+    return _queue_statuses(repo, [job_id])
 
 
 def status_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
@@ -1220,6 +1229,34 @@ def _scheduler_status(repo: Path, job_id: str) -> dict[str, Any]:
     return {"state": ",".join(states) if states else "UNKNOWN", "jobs": rows}
 
 
+def _scheduler_status_rows(repo: Path, job_ids: list[str]) -> list[dict[str, str]]:
+    if not job_ids:
+        return []
+    result = _run(
+        [
+            "sacct",
+            "-j",
+            ",".join(job_ids),
+            "--parsable2",
+            "--noheader",
+            "--format=JobIDRaw,State,ExitCode",
+        ],
+        cwd=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ExpctlError(f"sacct query failed for jobs {','.join(job_ids)}: {detail}")
+    rows: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split("|")
+        if len(fields) >= 3 and "." not in fields[0]:
+            rows.append(
+                {"job_id": fields[0], "state": fields[1], "exit_code": fields[2]}
+            )
+    return rows
+
+
 def _slurm_state_name(value: object) -> str | None:
     """Return the stable part of a state such as ``CANCELLED by 123``."""
     state = str(value).strip().upper()
@@ -1240,41 +1277,85 @@ def _summarize_slurm_states(states: Iterator[object]) -> str | None:
     return "MIXED"
 
 
-def _live_scheduler_status(repo: Path, job_id: str) -> str | None:
-    """Best-effort live status for list; unavailable SLURM stays offline-safe."""
+def _requested_job_id(raw_job_id: object, requested: set[str]) -> str | None:
+    raw = str(raw_job_id)
+    if raw in requested:
+        return raw
+    candidate = raw
+    while "_" in candidate:
+        candidate = candidate.rsplit("_", 1)[0]
+        if candidate in requested:
+            return candidate
+    return None
+
+
+def _live_scheduler_statuses(
+    repo: Path, job_ids: list[str]
+) -> tuple[dict[str, str], str | None]:
+    """Refresh many receipts with at most one squeue and one sacct query."""
+    requested = list(dict.fromkeys(job_ids))
+    requested_set = set(requested)
+    if not requested:
+        return {}, None
     if shutil.which("squeue") is None:
-        return None
+        return {}, "squeue not found; showing stored receipt states"
     try:
-        queue = _queue_status(repo, job_id)
-    except ExpctlError:
-        return None
-    if queue:
-        return _summarize_slurm_states(row.get("state") for row in queue)
+        queue = _queue_statuses(repo, requested)
+    except ExpctlError as exc:
+        return {}, f"{exc}; showing stored receipt states"
+
+    queue_by_job: dict[str, list[dict[str, str]]] = {}
+    for row in queue:
+        if owner := _requested_job_id(row.get("job"), requested_set):
+            queue_by_job.setdefault(owner, []).append(row)
+    statuses = {
+        job_id: status
+        for job_id, rows in queue_by_job.items()
+        if (status := _summarize_slurm_states(row.get("state") for row in rows))
+        is not None
+    }
+    finished = [job_id for job_id in requested if job_id not in statuses]
+    if not finished:
+        return statuses, None
 
     if shutil.which("sacct") is None:
-        return None
-    try:
-        accounting = _scheduler_status(repo, job_id)
-    except ExpctlError:
-        return None
-
-    jobs = accounting.get("jobs")
-    if isinstance(jobs, list):
-        parent_states = (
-            row.get("state")
-            for row in jobs
-            if isinstance(row, dict) and str(row.get("job_id")) == job_id
+        return statuses, (
+            f"sacct not found; showing stored receipt state for {len(finished)} job(s)"
         )
-        if parent_status := _summarize_slurm_states(parent_states):
-            return parent_status
-        task_states = (row.get("state") for row in jobs if isinstance(row, dict))
-        if task_status := _summarize_slurm_states(task_states):
-            return task_status
+    try:
+        accounting = _scheduler_status_rows(repo, finished)
+    except ExpctlError as exc:
+        return statuses, (
+            f"{exc}; showing stored receipt state for {len(finished)} job(s)"
+        )
 
-    state = accounting.get("state")
-    if not isinstance(state, str):
-        return None
-    return _summarize_slurm_states(iter(state.split(",")))
+    accounting_by_job: dict[str, list[dict[str, str]]] = {}
+    finished_set = set(finished)
+    for row in accounting:
+        if owner := _requested_job_id(row.get("job_id"), finished_set):
+            accounting_by_job.setdefault(owner, []).append(row)
+    for job_id, rows in accounting_by_job.items():
+        parent_status = _summarize_slurm_states(
+            row.get("state") for row in rows if row.get("job_id") == job_id
+        )
+        task_status = _summarize_slurm_states(row.get("state") for row in rows)
+        if status := parent_status or task_status:
+            statuses[job_id] = status
+
+    unresolved = [job_id for job_id in finished if job_id not in statuses]
+    warning = None
+    if unresolved:
+        warning = (
+            f"SLURM returned no state for {len(unresolved)} submitted job(s); "
+            "showing stored receipt states"
+        )
+    return statuses, warning
+
+
+def _live_scheduler_status(repo: Path, job_id: str) -> str | None:
+    """Backward-compatible single-job wrapper around the batched refresh."""
+    statuses, _ = _live_scheduler_statuses(repo, [job_id])
+    return statuses.get(job_id)
 
 
 def collect_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
@@ -1637,6 +1718,7 @@ def _list_color_enabled() -> bool:
 def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
     requests_dir = repo / config.root / "requests"
     rows: list[dict[str, str]] = []
+    submitted_rows: dict[str, list[dict[str, str]]] = {}
     for path in sorted(requests_dir.glob("*.toml"), key=lambda p: p.stem):
         experiment_id = path.stem
         try:
@@ -1653,10 +1735,25 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
                 )
                 job_id = receipt_data.get("job_id")
                 if status == "submitted" and isinstance(job_id, str) and job_id:
-                    status = _live_scheduler_status(repo, job_id) or status
+                    row = {
+                        "id": experiment_id,
+                        "status": status,
+                        "title": data["title"],
+                    }
+                    submitted_rows.setdefault(job_id, []).append(row)
+                    rows.append(row)
+                    continue
             rows.append({"id": experiment_id, "status": status, "title": data["title"]})
         except ExpctlError as exc:
             rows.append({"id": experiment_id, "status": "invalid", "title": str(exc)})
+
+    if submitted_rows:
+        live_statuses, warning = _live_scheduler_statuses(repo, list(submitted_rows))
+        for job_id, live_status in live_statuses.items():
+            for row in submitted_rows.get(job_id, []):
+                row["status"] = live_status
+        if warning:
+            print(f"warning: {warning}", file=sys.stderr)
     return rows
 
 

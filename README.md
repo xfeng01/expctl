@@ -29,7 +29,7 @@ Run all commands inside the target Git working tree.
 
 Complete command reference:
 
-```bash
+```text
 # Initialize expctl in the current repository.
 expctl init
 
@@ -64,10 +64,19 @@ expctl <command> --help
 explicit operator authorization.
 
 In a terminal, `list` renders an aligned table. Redirected output defaults to
-TSV. Confirmed submissions show live states such as `PENDING`, `RUNNING`,
-`COMPLETED`, or `FAILED`; mixed array-task states show `MIXED`. If SLURM is
-unavailable, `list` keeps the stored `submitted` state without modifying the
-receipt.
+TSV. For example:
+
+```text
+EXPERIMENT ID                 STATUS     TITLE
+----------------------------  ---------  ---------------------------
+20260829-decoder-cross-probe  RUNNING    Decoder block-RoPE probe
+20260829-decoder-metric       PENDING    Decoder-induced metric
+20260829-stagger-control      FAILED     Iso-cost stagger control
+```
+
+Mixed array-task states show `MIXED`. If SLURM is unavailable or returns no
+state, `list` warns once on stderr and keeps the affected rows as `submitted`.
+Receipts are never modified by a refresh.
 
 `submit`, `status`, and `collect` run on the cluster host. The other commands
 also work on Windows.
@@ -110,8 +119,8 @@ was safely recorded; reconcile it with SLURM manually.
 - `expctl` never runs `git add`, `git commit`, or `git push`.
 
 Start from `expctl/templates/request.toml`. The
-[full usage guide](docs/usage.zh.md) covers every request field, configuration
-option, and recovery procedure. For an AI runner, adapt
+[detailed guide (Chinese)](docs/usage.zh.md) covers every request field,
+configuration option, and recovery procedure. For an AI runner, adapt
 [`examples/skill/SKILL.md`](examples/skill/SKILL.md) with project-specific
 stopping conditions.
 
