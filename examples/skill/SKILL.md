@@ -23,8 +23,13 @@ weaken the repository's own cluster and branch rules here.
   output. An explicit request
   to consume cluster resources is required before the real
   `expctl submit <id>`; never substitute `git pull && sbatch`.
-- To check a submitted run, use `expctl status <id>`. Report the queue counts
-  factually; do not collect while `in_queue` is true.
+- To check a submitted run, use `expctl status <id>` or `--watch`; use
+  `expctl logs <id> --tail 100` for evidence and `--follow` only when ongoing
+  monitoring is requested. Report scheduler state factually; do not collect
+  while `in_queue` is true.
+- To cancel, show `expctl cancel <id> --dry-run` and require explicit operator
+  authorization before the real command. Record a concise `--reason`, wait
+  for a terminal state, and still collect the available evidence.
 - To collect, run `expctl collect <id>`, read every copied log rather than
   only `metrics.json`, and draft `expctl/results/<id>/report.md` with factual
   run status, failures, metrics, qualitative observations, and the request's
@@ -40,6 +45,8 @@ weaken the repository's own cluster and branch rules here.
   rerun of unchanged code is `expctl rerun <id> --reason "..."` (a new
   request ID); a corrected checkpoint or changed code is a new request
   written by the author.
+- Do not run `expctl clean <id>` unless the operator explicitly requests
+  worktree cleanup after collection; preview it with `--dry-run` first.
 - If a receipt says `preparing`, `submitting`, or `submission_unknown`, stop and
   ask the operator to reconcile it with SLURM. Do not delete it, rerun it, or
   infer that no job exists merely because no job ID was recorded.

@@ -31,6 +31,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unicodedata
 import uuid
@@ -46,7 +47,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -998,7 +999,7 @@ def doctor_repo(repo: Path) -> dict[str, Any]:
             scope="cluster",
         )
     )
-    for command in ("sbatch", "squeue", "sacct"):
+    for command in ("sbatch", "squeue", "sacct", "scancel"):
         command_path = shutil.which(command)
         checks.append(
             _doctor_entry(
@@ -1277,9 +1278,9 @@ def _worktree_submission_guard(repo: Path, worktree: Path) -> Iterator[None]:
 
 @contextlib.contextmanager
 def _result_collection_guard(repo: Path, experiment_id: str) -> Iterator[None]:
-    """Serialize result publication for one experiment in this repository."""
+    """Serialize receipt and result lifecycle writes for one experiment."""
     with _git_metadata_lock(
-        repo, f"expctl-collect-{experiment_id}.lock", "result collection"
+        repo, f"expctl-collect-{experiment_id}.lock", "result lifecycle update"
     ):
         yield
 
@@ -1539,24 +1540,35 @@ def _queue_status(repo: Path, job_id: str) -> list[dict[str, str]]:
 
 
 def status_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
-    load_request(repo, config, experiment_id, check_git=False)
+    request_path(repo, config, experiment_id)  # Validate before using the ID as a path.
     receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
     if not receipt_path.is_file():
         raise ExpctlError(f"not submitted yet: no receipt at {receipt_path}")
     receipt = _load_receipt(receipt_path)
     job_id = receipt.get("job_id")
+    checked_at = dt.datetime.now(dt.UTC).isoformat()
     if not isinstance(job_id, str) or not job_id:
-        return {
+        payload = {
             "experiment_id": experiment_id,
             "job_id": None,
             "receipt_status": receipt.get("status", "invalid"),
             "in_queue": False,
+            "checked_at": checked_at,
+            "source": "receipt",
             "detail": receipt.get(
                 "submission_error",
                 "submission has no confirmed job ID; inspect the receipt before retrying",
             ),
         }
-    queue = _queue_status(repo, job_id)
+        if isinstance(receipt.get("cancellation"), dict):
+            payload["cancellation"] = receipt["cancellation"]
+        return payload
+    queue_error: str | None = None
+    try:
+        queue = _queue_status(repo, job_id)
+    except ExpctlError as exc:
+        queue = []
+        queue_error = str(exc)
     counts: dict[str, int] = {}
     for row in queue:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
@@ -1567,10 +1579,557 @@ def status_request(repo: Path, config: Config, experiment_id: str) -> dict[str, 
         "in_queue": bool(queue),
         "queue_counts": counts,
         "queue": queue,
+        "checked_at": checked_at,
+        "source": "squeue" if queue else "sacct",
     }
+    if isinstance(receipt.get("cancellation"), dict):
+        payload["cancellation"] = receipt["cancellation"]
     if not queue:
-        payload["accounting"] = _scheduler_status(repo, job_id)
+        try:
+            accounting = _scheduler_status(repo, job_id)
+        except ExpctlError as exc:
+            accounting = {"state": "UNKNOWN", "detail": str(exc)}
+        payload["accounting"] = accounting
+        details: list[str] = []
+        if queue_error:
+            details.append(f"squeue unavailable ({queue_error}); used sacct")
+        if accounting.get("state") == "UNKNOWN" and accounting.get("detail"):
+            details.append(f"sacct: {accounting['detail']}")
+        if details:
+            payload["detail"] = "; ".join(details)
     return payload
+
+
+TERMINAL_SLURM_STATES = {
+    "BOOT_FAIL",
+    "CANCELLED",
+    "COMPLETED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "REVOKED",
+    "SPECIAL_EXIT",
+    "TIMEOUT",
+}
+
+
+def _status_state(result: dict[str, Any]) -> str:
+    receipt_status = str(result.get("receipt_status", "invalid"))
+    counts = result.get("queue_counts", {})
+    accounting = result.get("accounting", {})
+    if receipt_status == "collected":
+        return "COLLECTED"
+    if result.get("in_queue"):
+        return next(iter(counts)) if len(counts) == 1 else "MIXED"
+    if isinstance(accounting, dict) and accounting.get("state"):
+        return str(accounting["state"])
+    return receipt_status.upper()
+
+
+def _status_is_terminal(result: dict[str, Any]) -> bool:
+    if not result.get("job_id") or result.get("receipt_status") == "collected":
+        return True
+    if result.get("in_queue"):
+        return False
+    state = _status_state(result)
+    normalized = {
+        normalized
+        for part in state.split(",")
+        if (normalized := _slurm_state_name(part)) is not None
+    }
+    return bool(normalized) and normalized.issubset(TERMINAL_SLURM_STATES)
+
+
+def cancel_request(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    reason: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    request_path(repo, config, experiment_id)
+    if dry_run:
+        return _cancel_request_locked(
+            repo,
+            config,
+            experiment_id,
+            reason=reason,
+            dry_run=True,
+        )
+    with _result_collection_guard(repo, experiment_id):
+        return _cancel_request_locked(
+            repo,
+            config,
+            experiment_id,
+            reason=reason,
+            dry_run=dry_run,
+        )
+
+
+def _cancel_request_locked(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    reason: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Cancel one confirmed SLURM job and record who requested it."""
+    receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
+    if not receipt_path.is_file():
+        raise ExpctlError(f"not submitted yet: no receipt at {receipt_path}")
+    receipt = _load_receipt(receipt_path)
+    job_id = receipt.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise ExpctlError(
+            "cannot cancel a submission without a confirmed job ID; "
+            "reconcile it with SLURM manually"
+        )
+    if isinstance(receipt.get("cancellation"), dict):
+        cancellation = receipt["cancellation"]
+        raise ExpctlError(
+            f"cancellation was already requested for job {job_id} at "
+            f"{cancellation.get('requested_at', 'an unknown time')}"
+        )
+    if receipt.get("status") == "collected":
+        raise ExpctlError(f"job {job_id} has already been collected")
+    if reason is not None:
+        reason = reason.strip()
+        if not reason:
+            raise ExpctlError("cancellation reason must not be empty")
+
+    command = ["scancel", job_id]
+    result: dict[str, Any] = {
+        "experiment_id": experiment_id,
+        "job_id": job_id,
+        "command": command,
+        "dry_run": dry_run,
+        "reason": reason,
+    }
+    if dry_run:
+        return result
+
+    _run(command, cwd=repo)
+    cancellation = {
+        "requested_at": dt.datetime.now(dt.UTC).isoformat(),
+        "requested_by": getpass.getuser(),
+        "reason": reason,
+    }
+    receipt["status"] = "cancel_requested"
+    receipt["cancellation"] = cancellation
+    try:
+        _atomic_write_json(receipt_path, receipt)
+    except ExpctlError as exc:
+        raise ExpctlError(
+            f"SLURM accepted the cancellation for job {job_id}, but the receipt "
+            f"could not be updated at {receipt_path}: {exc}"
+        ) from exc
+    result.update(cancellation)
+    result["receipt_status"] = "cancel_requested"
+    return result
+
+
+def _receipt_worktree_context(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    worktree_root: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any], Path, Path]:
+    request, request_file = load_request(repo, config, experiment_id, check_git=False)
+    receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
+    if not receipt_path.is_file():
+        raise ExpctlError(f"submission receipt not found: {receipt_path}")
+    receipt = _load_receipt(receipt_path)
+    request_sha256 = receipt.get("request_sha256")
+    if isinstance(request_sha256, str) and request_sha256 != _request_hash(
+        request_file
+    ):
+        raise ExpctlError(
+            "request changed after submission; restore it before accessing the worktree"
+        )
+    worktree = _verified_receipt_worktree(
+        repo,
+        config,
+        request,
+        receipt,
+        worktree_root=worktree_root,
+    )
+    return request, receipt, receipt_path, worktree
+
+
+def _verified_receipt_worktree(
+    repo: Path,
+    config: Config,
+    request: dict[str, Any],
+    receipt: dict[str, Any],
+    *,
+    worktree_root: Path | None,
+) -> Path:
+    expected_worktree = _worktree_path(
+        repo, config, request, override_root=worktree_root
+    )
+    worktree_text = receipt.get("worktree")
+    if (
+        not isinstance(worktree_text, str)
+        or not worktree_text
+        or not Path(worktree_text).is_absolute()
+    ):
+        raise ExpctlError("submission receipt has no valid absolute worktree path")
+    recorded_worktree = Path(worktree_text).resolve()
+    if recorded_worktree != expected_worktree:
+        raise ExpctlError(
+            f"receipt worktree {recorded_worktree} does not match expected worktree "
+            f"{expected_worktree}; pass the same --worktree-root used for submit"
+        )
+    return expected_worktree
+
+
+def _log_sources(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    worktree_root: Path | None,
+) -> tuple[Path, str, list[Path], bool]:
+    request, request_file = load_request(repo, config, experiment_id, check_git=False)
+    receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
+    if not receipt_path.is_file():
+        raise ExpctlError(f"submission receipt not found: {receipt_path}")
+    receipt = _load_receipt(receipt_path)
+    request_sha256 = receipt.get("request_sha256")
+    if isinstance(request_sha256, str) and request_sha256 != _request_hash(
+        request_file
+    ):
+        raise ExpctlError(
+            "request changed after submission; restore it before reading logs"
+        )
+
+    collected_logs = receipt_path.parent / "logs"
+    if receipt.get("status") == "collected" and collected_logs.is_dir():
+        sources = sorted(
+            source for source in collected_logs.iterdir() if source.is_file()
+        )
+        return collected_logs, "*", sources, True
+
+    worktree = _verified_receipt_worktree(
+        repo,
+        config,
+        request,
+        receipt,
+        worktree_root=worktree_root,
+    )
+    if not worktree.is_dir():
+        raise ExpctlError(f"submission worktree is missing: {worktree}")
+    job_id = receipt.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise ExpctlError(
+            f"submission has no confirmed job ID (receipt status: "
+            f"{receipt.get('status', 'invalid')})"
+        )
+    pattern = request["outputs"]["log_glob"].format(job_id=job_id)
+    sources = sorted(source for source in worktree.glob(pattern) if source.is_file())
+    return worktree, pattern, sources, False
+
+
+def _tail_file(path: Path, lines: int) -> str:
+    if lines == 0:
+        return ""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            data = b""
+            while position > 0 and data.count(b"\n") <= lines:
+                block_size = min(64 * 1024, position)
+                position -= block_size
+                handle.seek(position)
+                data = handle.read(block_size) + data
+        text = b"".join(data.splitlines(keepends=True)[-lines:]).decode(
+            "utf-8", errors="replace"
+        )
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+    except OSError as exc:
+        raise ExpctlError(f"could not read log {path}: {exc}") from exc
+
+
+def logs_request(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    tail: int = 100,
+    worktree_root: Path | None = None,
+) -> dict[str, Any]:
+    log_root, pattern, sources, collected = _log_sources(
+        repo,
+        config,
+        experiment_id,
+        worktree_root=worktree_root,
+    )
+    if not sources:
+        raise ExpctlError(f"no log files match {log_root / pattern}")
+    return {
+        "experiment_id": experiment_id,
+        "location": str(log_root),
+        "pattern": pattern,
+        "tail": tail,
+        "collected": collected,
+        "logs": [
+            {
+                "path": source.relative_to(log_root).as_posix(),
+                "content": _tail_file(source, tail),
+            }
+            for source in sources
+        ],
+    }
+
+
+def _render_logs(result: dict[str, Any]) -> str:
+    logs = result["logs"]
+    multiple = len(logs) > 1
+    chunks: list[str] = []
+    for log in logs:
+        content = str(log["content"])
+        if multiple:
+            chunks.append(f"==> {log['path']} <==\n{content}")
+        else:
+            chunks.append(content)
+    return "\n".join(chunk.rstrip("\n") for chunk in chunks) + "\n"
+
+
+def _follow_logs(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    tail: int,
+    worktree_root: Path | None,
+    poll_interval: float = 1.0,
+) -> None:
+    """Print existing log tails and follow appended bytes until interrupted."""
+    offsets: dict[Path, int] = {}
+    announced_wait = False
+    last_source: Path | None = None
+    next_status_check = 0.0
+    while True:
+        log_root, pattern, sources, collected = _log_sources(
+            repo,
+            config,
+            experiment_id,
+            worktree_root=worktree_root,
+        )
+        if not sources and not announced_wait:
+            if collected:
+                raise ExpctlError(f"collected log directory is empty: {log_root}")
+            print(f"Waiting for logs matching {log_root / pattern}", file=sys.stderr)
+            announced_wait = True
+        if not sources and time.monotonic() >= next_status_check:
+            status = status_request(repo, config, experiment_id)
+            if _status_is_terminal(status):
+                raise ExpctlError(
+                    f"job reached {_status_state(status)} but no log files match "
+                    f"{log_root / pattern}"
+                )
+            next_status_check = time.monotonic() + max(5.0, poll_interval)
+        multiple = len(sources) > 1
+        for source in sources:
+            try:
+                size = source.stat().st_size
+            except OSError as exc:
+                raise ExpctlError(f"could not inspect log {source}: {exc}") from exc
+            if source not in offsets:
+                content = _tail_file(source, tail)
+                if multiple or len(offsets) > 0:
+                    print(f"==> {source.relative_to(log_root).as_posix()} <==")
+                if content:
+                    sys.stdout.write(_stdout_safe(content))
+                    if not content.endswith("\n"):
+                        sys.stdout.write("\n")
+                sys.stdout.flush()
+                offsets[source] = source.stat().st_size
+                last_source = source
+                continue
+            offset = offsets[source]
+            if size < offset:
+                offset = 0
+            if size == offset:
+                continue
+            try:
+                with source.open("rb") as handle:
+                    handle.seek(offset)
+                    chunk = handle.read()
+            except OSError as exc:
+                raise ExpctlError(f"could not follow log {source}: {exc}") from exc
+            if source != last_source and (multiple or len(offsets) > 1):
+                print(f"==> {source.relative_to(log_root).as_posix()} <==")
+            sys.stdout.write(_stdout_safe(chunk.decode("utf-8", errors="replace")))
+            sys.stdout.flush()
+            offsets[source] = size
+            last_source = source
+        if collected:
+            return
+        time.sleep(poll_interval)
+
+
+def _other_uncollected_worktree_claims(
+    repo: Path,
+    config: Config,
+    worktree: Path,
+    experiment_id: str,
+) -> list[str]:
+    claims: list[str] = []
+    receipts_root = repo / config.root / "results"
+    for other_path in receipts_root.glob("*/receipt.json"):
+        other_id = other_path.parent.name
+        if other_id == experiment_id:
+            continue
+        try:
+            other = _load_receipt(other_path)
+            other_worktree = other.get("worktree")
+            same_worktree = (
+                isinstance(other_worktree, str)
+                and Path(other_worktree).resolve() == worktree.resolve()
+            )
+        except (ExpctlError, OSError):
+            continue
+        if same_worktree and other.get("status") != "collected":
+            claims.append(other_id)
+    return sorted(claims)
+
+
+def _validate_clean_worktree(
+    repo: Path,
+    config: Config,
+    request: dict[str, Any],
+    worktree: Path,
+) -> None:
+    if not (worktree / ".git").exists():
+        raise ExpctlError(f"existing path is not a Git worktree: {worktree}")
+    if _git_common_dir(worktree) != _git_common_dir(repo):
+        raise ExpctlError(
+            f"existing worktree belongs to a different repository: {worktree}"
+        )
+    actual = _git_text(worktree, "rev-parse", "HEAD").strip()
+    expected = request["code"]["commit"]
+    if actual != expected:
+        raise ExpctlError(f"worktree {worktree} is at {actual}, expected {expected}")
+    _check_worktree_clean(worktree, config.shared_dirs)
+
+
+def clean_request(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    dry_run: bool = False,
+    worktree_root: Path | None = None,
+) -> dict[str, Any]:
+    request_path(repo, config, experiment_id)
+    if dry_run:
+        return _clean_request_locked(
+            repo,
+            config,
+            experiment_id,
+            dry_run=True,
+            worktree_root=worktree_root,
+        )
+    with _result_collection_guard(repo, experiment_id):
+        return _clean_request_locked(
+            repo,
+            config,
+            experiment_id,
+            dry_run=dry_run,
+            worktree_root=worktree_root,
+        )
+
+
+def _clean_request_locked(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    dry_run: bool = False,
+    worktree_root: Path | None = None,
+) -> dict[str, Any]:
+    """Remove a collected experiment's verified detached worktree."""
+    request, receipt, receipt_path, worktree = _receipt_worktree_context(
+        repo,
+        config,
+        experiment_id,
+        worktree_root=worktree_root,
+    )
+    if receipt.get("status") != "collected":
+        raise ExpctlError(
+            f"refusing to remove worktree before results are collected "
+            f"(receipt status: {receipt.get('status', 'invalid')})"
+        )
+    if isinstance(receipt.get("cleanup"), dict):
+        cleanup = receipt["cleanup"]
+        return {
+            "experiment_id": experiment_id,
+            "worktree": str(worktree),
+            "removed": False,
+            "worktree_exists": worktree.exists(),
+            "already_removed_at": cleanup.get("removed_at"),
+            "dry_run": dry_run,
+        }
+    claims = _other_uncollected_worktree_claims(repo, config, worktree, experiment_id)
+    if claims:
+        raise ExpctlError(
+            f"worktree {worktree} is still claimed by uncollected experiment(s): "
+            + ", ".join(claims)
+        )
+    worktree_exists = worktree.exists()
+    result: dict[str, Any] = {
+        "experiment_id": experiment_id,
+        "worktree": str(worktree),
+        "worktree_exists": worktree_exists,
+        "removed": False,
+        "dry_run": dry_run,
+    }
+    if not worktree_exists:
+        return result
+
+    _validate_clean_worktree(repo, config, request, worktree)
+    if dry_run:
+        return result
+
+    with _worktree_submission_guard(repo, worktree):
+        claims = _other_uncollected_worktree_claims(
+            repo, config, worktree, experiment_id
+        )
+        if claims:
+            raise ExpctlError(
+                f"worktree {worktree} is still claimed by uncollected "
+                f"experiment(s): {', '.join(claims)}"
+            )
+        if not worktree.exists():
+            result["worktree_exists"] = False
+            return result
+        _validate_clean_worktree(repo, config, request, worktree)
+        _run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo)
+
+    cleanup = {
+        "removed_at": dt.datetime.now(dt.UTC).isoformat(),
+        "removed_by": getpass.getuser(),
+        "worktree": str(worktree),
+    }
+    receipt["cleanup"] = cleanup
+    try:
+        _atomic_write_json(receipt_path, receipt)
+    except ExpctlError as exc:
+        raise ExpctlError(
+            f"worktree {worktree} was removed, but cleanup could not be recorded "
+            f"in {receipt_path}: {exc}"
+        ) from exc
+    result.update(cleanup)
+    result["removed"] = True
+    result["worktree_exists"] = False
+    return result
 
 
 def extract_metrics(text: str, names: list[str]) -> dict[str, float]:
@@ -1597,7 +2156,8 @@ def _scheduler_status(repo: Path, job_id: str) -> dict[str, Any]:
         check=False,
     )
     if result.returncode != 0:
-        return {"state": "UNKNOWN", "detail": result.stderr.strip()}
+        detail = result.stderr.strip() or result.stdout.strip()
+        return {"state": "UNKNOWN", "detail": detail}
     rows = []
     for line in result.stdout.splitlines():
         fields = line.split("|")
@@ -2150,14 +2710,8 @@ def _render_status_result(result: dict[str, Any], *, result_path: str) -> str:
     counts = result.get("queue_counts", {})
     accounting = result.get("accounting", {})
     queue_rows = result.get("queue", [])
-    if receipt_status == "collected":
-        state = "COLLECTED"
-    elif result.get("in_queue"):
-        state = next(iter(counts)) if len(counts) == 1 else "MIXED"
-    elif isinstance(accounting, dict) and accounting.get("state"):
-        state = str(accounting["state"])
-    else:
-        state = receipt_status.upper()
+    cancellation = result.get("cancellation", {})
+    state = _status_state(result)
 
     queue_summary = None
     if isinstance(counts, dict) and counts:
@@ -2191,6 +2745,7 @@ def _render_status_result(result: dict[str, Any], *, result_path: str) -> str:
         ("Job", result.get("job_id")),
         ("Receipt", receipt_status),
         ("Queue", queue_summary),
+        ("Source", result.get("source")),
         ("Reason", ", ".join(reasons) if reasons else None),
         (
             "Scheduler",
@@ -2199,18 +2754,70 @@ def _render_status_result(result: dict[str, Any], *, result_path: str) -> str:
             else None,
         ),
         ("Exit", ", ".join(exit_codes) if exit_codes else None),
+        (
+            "Cancelled",
+            " ".join(
+                filter(
+                    None,
+                    [
+                        str(cancellation.get("requested_at", "")),
+                        (
+                            f"by {cancellation['requested_by']}"
+                            if cancellation.get("requested_by")
+                            else ""
+                        ),
+                    ],
+                )
+            )
+            if isinstance(cancellation, dict)
+            else None,
+        ),
+        (
+            "Cancel reason",
+            cancellation.get("reason") if isinstance(cancellation, dict) else None,
+        ),
+        ("Checked", result.get("checked_at")),
         ("Detail", detail),
     ]
     if not result.get("job_id"):
         next_steps = [f"Inspect {result_path}/receipt.json before retrying."]
     elif receipt_status == "collected":
         next_steps = [f"Write the conclusion to {result_path}/report.md"]
-    elif result.get("in_queue"):
+    elif not _status_is_terminal(result):
         command = shlex.join(["expctl", "status", experiment_id])
         next_steps = [f"Wait for SLURM, then run: {command}"]
     else:
         next_steps = [shlex.join(["expctl", "collect", experiment_id])]
     return _render_summary("EXPERIMENT STATUS", fields, next_steps=next_steps)
+
+
+def _render_cancel_result(result: dict[str, Any]) -> str:
+    experiment_id = str(result["experiment_id"])
+    if result.get("dry_run"):
+        cancel_command = ["expctl", "cancel", experiment_id]
+        if result.get("reason"):
+            cancel_command.extend(["--reason", str(result["reason"])])
+        return _render_summary(
+            "CANCELLATION PREVIEW",
+            [
+                ("Experiment", experiment_id),
+                ("Job", result["job_id"]),
+                ("Reason", result.get("reason")),
+                ("Command", shlex.join(result["command"])),
+            ],
+            next_steps=[shlex.join(cancel_command)],
+        )
+    return _render_summary(
+        "CANCELLATION REQUESTED",
+        [
+            ("Experiment", experiment_id),
+            ("Job", result["job_id"]),
+            ("Reason", result.get("reason")),
+            ("Requested", result.get("requested_at")),
+            ("By", result.get("requested_by")),
+        ],
+        next_steps=[shlex.join(["expctl", "status", experiment_id, "--watch"])],
+    )
 
 
 def _render_collect_result(
@@ -2254,6 +2861,50 @@ def _render_rerun_result(result: dict[str, Any]) -> str:
     )
 
 
+def _render_clean_result(result: dict[str, Any]) -> str:
+    experiment_id = str(result["experiment_id"])
+    if result.get("already_removed_at"):
+        heading = "WORKTREE ALREADY CLEAN"
+        action = "already removed"
+        next_steps = None
+    elif result.get("dry_run"):
+        heading = "CLEANUP PREVIEW"
+        action = "would remove" if result.get("worktree_exists") else "already absent"
+        next_steps = (
+            [
+                shlex.join(
+                    [
+                        "expctl",
+                        "clean",
+                        experiment_id,
+                        "--worktree-root",
+                        str(Path(result["worktree"]).parent),
+                    ]
+                )
+            ]
+            if result.get("worktree_exists")
+            else None
+        )
+    elif result.get("removed"):
+        heading = "WORKTREE REMOVED"
+        action = "removed"
+        next_steps = ["Commit the updated receipt when you are ready."]
+    else:
+        heading = "WORKTREE ALREADY CLEAN"
+        action = "already removed"
+        next_steps = None
+    return _render_summary(
+        heading,
+        [
+            ("Experiment", experiment_id),
+            ("Worktree", result["worktree"]),
+            ("Action", action),
+            ("Removed", result.get("removed_at") or result.get("already_removed_at")),
+        ],
+        next_steps=next_steps,
+    )
+
+
 def _print_command_result(
     result: dict[str, Any], human_output: str, *, force_json: bool
 ) -> bool:
@@ -2273,6 +2924,7 @@ STATUS_COLORS = {
     "submitting": "\x1b[33m",
     "submission_unknown": "\x1b[31m",
     "submitted": "\x1b[34m",
+    "cancel_requested": "\x1b[35m",
     "collected": "\x1b[32m",
     "invalid": "\x1b[31m",
     "PENDING": "\x1b[33m",
@@ -2451,7 +3103,11 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
                     else "invalid"
                 )
                 job_id = receipt_data.get("job_id")
-                if status == "submitted" and isinstance(job_id, str) and job_id:
+                if (
+                    status in {"submitted", "cancel_requested"}
+                    and isinstance(job_id, str)
+                    and job_id
+                ):
                     row = {
                         "id": experiment_id,
                         "status": status,
@@ -2490,6 +3146,26 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a positive integer") from exc
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def _positive_seconds(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive number") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
     return parsed
 
 
@@ -2621,7 +3297,49 @@ def _parser() -> argparse.ArgumentParser:
     )
     status.add_argument("experiment_id", metavar="ID")
     status.add_argument(
+        "--watch",
+        nargs="?",
+        const=5.0,
+        type=_positive_seconds,
+        metavar="SECONDS",
+        help="refresh until the job reaches a terminal state (default: every 5s)",
+    )
+    status.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
+    )
+
+    cancel = subparsers.add_parser(
+        "cancel", help="cancel a submitted SLURM job and record the request"
+    )
+    cancel.add_argument("experiment_id", metavar="ID")
+    cancel.add_argument("--reason", metavar="TEXT", help="record why it was cancelled")
+    cancel.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the scancel command without cancelling the job",
+    )
+    cancel.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
+    )
+
+    logs = subparsers.add_parser("logs", help="show or follow scheduler log files")
+    logs.add_argument("experiment_id", metavar="ID")
+    logs.add_argument(
+        "--tail",
+        type=_nonnegative_int,
+        default=100,
+        metavar="N",
+        help="show the last N lines from each log (default: 100)",
+    )
+    logs.add_argument(
+        "--follow",
+        action="store_true",
+        help="continue printing data appended to matching logs",
+    )
+    logs.add_argument(
+        "--worktree-root",
+        type=Path,
+        help="parent directory used for the submitted experiment worktree",
     )
 
     collect = subparsers.add_parser("collect", help="copy logs and extract metrics")
@@ -2632,6 +3350,24 @@ def _parser() -> argparse.ArgumentParser:
         help="parent directory used for the submitted experiment worktree",
     )
     collect.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
+    )
+
+    clean = subparsers.add_parser(
+        "clean", help="remove a verified worktree after results are collected"
+    )
+    clean.add_argument("experiment_id", metavar="ID")
+    clean.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="verify and preview without removing the worktree",
+    )
+    clean.add_argument(
+        "--worktree-root",
+        type=Path,
+        help="parent directory used for the submitted experiment worktree",
+    )
+    clean.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
 
@@ -2655,6 +3391,33 @@ def _parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
     return parser
+
+
+def _watch_status_command(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    interval: float,
+    force_json: bool,
+) -> int:
+    human = sys.stdout.isatty() and not force_json
+    first = True
+    while True:
+        result = status_request(repo, config, experiment_id)
+        if human:
+            if not first and os.environ.get("TERM") != "dumb":
+                sys.stdout.write("\x1b[2J\x1b[H")
+            result_path = str(
+                result_dir(repo, config, experiment_id).relative_to(repo)
+            ).replace("\\", "/")
+            print(_stdout_safe(_render_status_result(result, result_path=result_path)))
+        else:
+            print(json.dumps(result, ensure_ascii=True, sort_keys=True), flush=True)
+        if _status_is_terminal(result):
+            return 0
+        first = False
+        time.sleep(interval)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2737,6 +3500,18 @@ def main(argv: list[str] | None = None) -> int:
                 force_json=args.json,
             )
         elif args.command == "status":
+            if args.watch is not None:
+                try:
+                    return _watch_status_command(
+                        repo,
+                        config,
+                        args.experiment_id,
+                        interval=args.watch,
+                        force_json=args.json,
+                    )
+                except KeyboardInterrupt:
+                    print("\nStatus watch stopped.", file=sys.stderr)
+                    return 130
             result = status_request(repo, config, args.experiment_id)
             result_path = str(
                 result_dir(repo, config, args.experiment_id).relative_to(repo)
@@ -2746,6 +3521,41 @@ def main(argv: list[str] | None = None) -> int:
                 _render_status_result(result, result_path=result_path),
                 force_json=args.json,
             )
+        elif args.command == "cancel":
+            result = cancel_request(
+                repo,
+                config,
+                args.experiment_id,
+                reason=args.reason,
+                dry_run=args.dry_run,
+            )
+            _print_command_result(
+                result,
+                _render_cancel_result(result),
+                force_json=args.json,
+            )
+        elif args.command == "logs":
+            if args.follow:
+                try:
+                    _follow_logs(
+                        repo,
+                        config,
+                        args.experiment_id,
+                        tail=args.tail,
+                        worktree_root=args.worktree_root,
+                    )
+                except KeyboardInterrupt:
+                    print("\nLog follow stopped.", file=sys.stderr)
+                    return 130
+            else:
+                result = logs_request(
+                    repo,
+                    config,
+                    args.experiment_id,
+                    tail=args.tail,
+                    worktree_root=args.worktree_root,
+                )
+                sys.stdout.write(_stdout_safe(_render_logs(result)))
         elif args.command == "collect":
             result = collect_request(
                 repo,
@@ -2763,6 +3573,19 @@ def main(argv: list[str] | None = None) -> int:
                     experiment_id=args.experiment_id,
                     result_path=result_path,
                 ),
+                force_json=args.json,
+            )
+        elif args.command == "clean":
+            result = clean_request(
+                repo,
+                config,
+                args.experiment_id,
+                dry_run=args.dry_run,
+                worktree_root=args.worktree_root,
+            )
+            _print_command_result(
+                result,
+                _render_clean_result(result),
                 force_json=args.json,
             )
         elif args.command == "rerun":

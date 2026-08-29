@@ -13,7 +13,8 @@ trail.
 ## Install
 
 Every machine needs Git and Python 3.11 or newer. The POSIX cluster host also
-needs `sbatch`, `squeue`, and `sacct`; node-budget checks use `scontrol`.
+needs `sbatch`, `squeue`, `sacct`, and `scancel`; node-budget checks use
+`scontrol`.
 
 ```bash
 uv tool install git+https://github.com/xfeng01/expctl
@@ -51,11 +52,20 @@ expctl validate <id>
 # Preview or submit a request. Omit --dry-run to call sbatch.
 expctl submit <id> [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
 
-# Show detailed squeue or sacct state for one submitted request.
-expctl status <id> [--json]
+# Show detailed state once, or refresh until the job finishes.
+expctl status <id> [--watch [SECONDS]] [--json]
+
+# Show the last 100 log lines, or keep following new output.
+expctl logs <id> [--tail N] [--follow] [--worktree-root DIR]
+
+# Preview or request an audited SLURM cancellation.
+expctl cancel <id> [--reason TEXT] [--dry-run] [--json]
 
 # Copy logs, extract metrics, and record the scheduler verdict.
 expctl collect <id> [--worktree-root DIR] [--json]
+
+# Preview or remove the verified worktree after collection.
+expctl clean <id> [--dry-run] [--worktree-root DIR] [--json]
 
 # Create a new request for the same pinned code.
 expctl rerun <id> [--as NEW_ID] [--reason TEXT] [--json]
@@ -92,12 +102,21 @@ Receipts are never modified by a refresh.
 contain comma-separated values, and may be repeated. Filtering uses refreshed
 SLURM states; repeated commit/script validation is cached within each listing.
 
-`new`, `submit`, `status`, `collect`, and `rerun` show concise summaries and a
-suggested next step in an interactive terminal. Redirected output stays JSON;
-use `--json` to force JSON in a terminal.
+`status` falls back to `sacct` when `squeue` is unavailable. With `--watch`, it
+stops at a terminal scheduler state; redirected or `--json` watch output is
+newline-delimited JSON.
 
-`submit`, `status`, and `collect` run on the cluster host. The other commands
-also work on Windows.
+`logs` reads the submitted worktree while a job is active and the collected
+result directory afterward. `clean` only removes a verified worktree after
+collection and refuses one still claimed by an uncollected rerun.
+
+Human-oriented lifecycle commands show concise summaries and a suggested next
+step in a terminal. Redirected output stays JSON unless the command emits raw
+logs; use `--json` to force JSON where supported.
+
+`submit`, `status`, `logs --follow`, `cancel`, `collect`, and `clean` run on the
+cluster host. The other commands also work on Windows; non-following `logs`
+works wherever its log path is available.
 
 ## Repository model
 
@@ -117,7 +136,7 @@ expctl/
 The lifecycle is:
 
 ```text
-requested -> preparing/submitting -> submitted -> collected -> reviewed
+requested -> preparing/submitting -> submitted -> [cancel_requested] -> collected -> reviewed
 ```
 
 `reviewed` is a human conclusion, not a receipt state.
@@ -135,6 +154,8 @@ was safely recorded; reconcile it with SLURM manually.
   resubmit; use `rerun` to create a new ID.
 - `collect` verifies the submitted worktree and publishes results once. If
   `submit` used `--worktree-root`, pass the same directory to `collect`.
+- `cancel` records the operator, time, and optional reason after `scancel`
+  accepts the request. `clean` never removes an uncollected worktree.
 - `expctl.toml` defines repository policy and should be committed.
 - `expctl` never runs `git add`, `git commit`, or `git push`.
 

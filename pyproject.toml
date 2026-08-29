@@ -1,6 +1,6 @@
 [project]
 name = "expctl"
-version = "0.6.0"
+version = "0.7.0"
 description = "Repository-backed asynchronous experiment handoff: pinned requests in, receipts and collected results out."
 readme = "README.md"
 license = "MIT"

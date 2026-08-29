@@ -18,7 +18,7 @@ expctl 不替代 SLURM、工作流引擎或实验跟踪平台。它只负责让�
 
 ## 一、安装
 
-所有机器都需要 Git 和 Python 3.11 或更高版本。负责提交作业的集群环境还需要可用的 `sbatch`、`squeue`、`sacct`；启用节点预算时还会使用 `scontrol`。
+所有机器都需要 Git 和 Python 3.11 或更高版本。负责运行作业的集群环境还需要可用的 `sbatch`、`squeue`、`sacct`、`scancel`；启用节点预算时还会使用 `scontrol`。
 
 推荐使用 `uv` 安装：
 
@@ -108,7 +108,7 @@ expctl submit <id>
 
 `list` 默认按 ID 从新到旧排列；可用 `--sort oldest` 反转。`--status running,failed` 按实时或回执状态筛选且不区分大小写，`--limit 20` 在筛选和排序后限制数量。相同 commit 和脚本的 Git 校验会在单次列表中复用。
 
-`new`、`submit`、`status`、`collect` 和 `rerun` 在交互终端中显示简洁摘要和建议的下一步；输出到管道或文件时保持 JSON。需要在终端中获取 JSON 时使用 `--json`。
+面向生命周期的命令在交互终端中显示简洁摘要和建议的下一步；输出到管道或文件时保持 JSON，原始日志除外。需要在终端中获取 JSON 时使用命令支持的 `--json`。
 
 `--dry-run` 会验证请求并输出固定提交、worktree 路径、`sbatch` 命令、声明的节点上限和从作业脚本推导出的节点上限。它不会创建 worktree、链接共享目录、检查运行时依赖或当前节点预算，也不会调用 `sbatch`。
 
@@ -127,9 +127,28 @@ expctl submit <id>
 
 ```bash
 expctl status <id>
+expctl status <id> --watch
 ```
 
-`in_queue: true` 表示 `squeue` 仍能查到该作业或其数组任务。作业离开队列后，expctl 改用 `sacct` 返回状态和退出码；`squeue` 查询失败会明确报错，`sacct` 查询失败或无记录时返回 `UNKNOWN`。
+`in_queue: true` 表示 `squeue` 仍能查到该作业或其数组任务。作业离开队列，或 `squeue` 暂时不可用时，expctl 改用 `sacct` 返回状态和退出码；两者都不可用时返回 `UNKNOWN` 并保留错误详情。`--watch [SECONDS]` 默认每 5 秒刷新，直到终态；管道或 `--json` 模式每次输出一行 JSON。
+
+运行中查看日志，或在收集后查看已归档日志：
+
+```bash
+expctl logs <id> --tail 100
+expctl logs <id> --follow
+```
+
+运行时从回执核验的 worktree 读取 `outputs.log_glob`，收集后则从结果目录读取。若提交时指定了 `--worktree-root`，运行中查看日志也须传入同一目录；`--follow` 以 Ctrl+C 结束。
+
+不再需要作业时先预览，再发出取消请求：
+
+```bash
+expctl cancel <id> --reason "superseded" --dry-run
+expctl cancel <id> --reason "superseded"
+```
+
+`cancel` 只接受带确认作业号且尚未收集的回执。`scancel` 成功后，回执记录操作者、时间和原因，并进入 `cancel_requested`；实时状态随后会显示 `CANCELLED`。取消不会替代 `collect`，失败日志仍应收集并审阅。
 
 确认作业结束且日志写入完成后收集结果：
 
@@ -146,6 +165,15 @@ expctl collect <id> [--worktree-root <dir>]
 - 将 `sacct` 结果写入回执，并把回执状态改为 `collected`。
 
 `collect` 不会等待作业，也不会覆盖已经收集或残留的日志和指标。同一请求的收集过程使用互斥锁串行化；作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或不同来源日志会使用同一目标文件名时都会报错。指标缺失不会阻止失败作业的证据收集，但会明确记录。完成后应审阅原始日志，按 `decision_rule` 写入 `<root>/results/<id>/report.md`，再提交并推送结果目录。
+
+结果收集后可清理 detached worktree：
+
+```bash
+expctl clean <id> --dry-run
+expctl clean <id>
+```
+
+`clean` 重新核对回执、固定提交、仓库归属和工作树内容，只允许 `collected` 回执，并拒绝仍被未收集 rerun 使用的 worktree。它只删除 worktree，不删除结果证据；共享目录的符号链接目标不会被删除。若提交时使用了自定义 worktree 根目录，这里也必须传入相同的 `--worktree-root`。
 
 ## 五、请求文件参考
 
@@ -214,8 +242,11 @@ root = ".."
 | `expctl submit <id> [--json]` | 准备 worktree、检查依赖和预算，并提交 SLURM 作业 |
 | `expctl submit <id> --dry-run` | 验证并预览提交，不创建资源或调用 SLURM |
 | `expctl submit <id> --worktree-root <dir>` | 本次提交使用指定的 worktree 父目录 |
-| `expctl status <id> [--json]` | 查询队列；不在队列时查询记账记录 |
+| `expctl status <id> [--watch [<seconds>]] [--json]` | 查询一次状态，或定时刷新直到终态；`squeue` 不可用时回退到 `sacct` |
+| `expctl logs <id> [--tail <n>] [--follow] [--worktree-root <dir>]` | 查看运行中或已收集的日志；默认显示末尾 100 行 |
+| `expctl cancel <id> [--reason <text>] [--dry-run] [--json]` | 预览或调用 `scancel`，并在回执中记录取消审计信息 |
 | `expctl collect <id> [--worktree-root <dir>] [--json]` | 复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致 |
+| `expctl clean <id> [--dry-run] [--worktree-root <dir>] [--json]` | 结果收集后验证并删除 detached worktree，不删除结果证据 |
 | `expctl rerun <id> [--as <new-id>] [--reason <text>] [--json]` | 把已提交的请求复制为新 ID（默认 `<id>-r2`、`-r3`……），写入 `rerun_of`，供再次提交；commit 和 worktree 不变 |
 
 `expctl list` 显示的标准状态：
@@ -226,6 +257,7 @@ preparing  已独占请求，正在执行提交前检查
 submitting 已开始调用 sbatch，尚未持久化确认的作业号
 submission_unknown  sbatch 结果不确定，必须人工对账且不能自动重试
 submitted  已生成回执
+cancel_requested  已调用 scancel，等待 SLURM 确认终态
 collected  已执行 collect
 invalid    请求验证失败，或回执不是有效的 JSON
 ```
@@ -239,6 +271,7 @@ invalid    请求验证失败，或回执不是有效的 JSON
 - **请求在提交作业后被修改**：恢复与回执中 `request_sha256` 完全一致的文件；否则 `collect` 会拒绝执行。
 - **提交结果不确定**：保留 `submission_unknown` 回执，根据其中的时间、命令和操作者信息查询 SLURM；确认是否存在作业前不得删除回执、执行 `rerun` 或再次提交。
 - **节点预算不足**：等待已有作业释放节点后重试。不要通过修改旧请求或静默重提绕过限制。
+- **作业不再需要**：先执行 `expctl cancel <id> --dry-run` 核对作业号，再正式取消；作业离开队列后仍应运行 `collect` 保存失败或取消证据。
 - **作业失败、超时或被抢占**：保留原回执和日志，在报告中记录失败原因。代码不需要改动时（抢占、节点故障、共享环境未就绪），运行方直接执行 `expctl rerun <id> --reason "preempted"`，提交生成的 `<id>-r2.toml`，再 `expctl submit <id>-r2`；commit 和 worktree 不变，位于固定提交上的已有 worktree 会被复用。需要改代码时由请求方修正、提交，并发布固定新提交的新请求。任何情况下都不要删除回执重提。
 - **日志未找到**：核对作业是否结束、`outputs.log_glob` 是否包含正确的 `{job_id}` 位置，以及日志是否写在固定 worktree 中。
 - **自动化或 AI 操作**：先执行并审阅 `--dry-run`，再明确授权正式提交。expctl 不会自动重试、重新提交、提交 Git 变更或判定实验结论。

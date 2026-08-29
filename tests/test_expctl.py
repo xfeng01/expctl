@@ -802,6 +802,95 @@ def test_status_before_submission_is_a_clear_error(tmp_path: Path) -> None:
         status_request(repo, config, EXAMPLE_ID)
 
 
+def test_status_falls_back_to_sacct_and_watch_stops_at_terminal_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    _fake_receipt(repo, EXAMPLE_ID)
+    monkeypatch.setattr(
+        core,
+        "_queue_status",
+        lambda *args: (_ for _ in ()).throw(ExpctlError("controller unavailable")),
+    )
+    monkeypatch.setattr(
+        core,
+        "_scheduler_status",
+        lambda *args: {
+            "state": "COMPLETED",
+            "jobs": [{"job_id": "123", "state": "COMPLETED", "exit_code": "0:0"}],
+        },
+    )
+
+    result = status_request(repo, config, EXAMPLE_ID)
+
+    assert result["source"] == "sacct"
+    assert result["accounting"]["state"] == "COMPLETED"
+    assert "used sacct" in result["detail"]
+    assert core._status_is_terminal(result) is True
+
+    running = {
+        **result,
+        "accounting": {"state": "RUNNING", "jobs": []},
+        "detail": None,
+    }
+    responses = iter([running, result])
+    monkeypatch.setattr(core, "find_repo_root", lambda: repo)
+    monkeypatch.setattr(core, "load_config", lambda found: config)
+    monkeypatch.setattr(core, "status_request", lambda *args: next(responses))
+    sleeps: list[float] = []
+    monkeypatch.setattr(core.time, "sleep", sleeps.append)
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: False)
+
+    assert core.main(["status", EXAMPLE_ID, "--watch", "0.25"]) == 0
+    snapshots = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [snapshot["accounting"]["state"] for snapshot in snapshots] == [
+        "RUNNING",
+        "COMPLETED",
+    ]
+    assert sleeps == [0.25]
+
+
+def test_cancel_records_an_audited_request_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    receipt_path = _fake_receipt(repo, EXAMPLE_ID)
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(core, "_run", fake_run)
+    monkeypatch.setattr(core.getpass, "getuser", lambda: "runner")
+    monkeypatch.setattr(
+        core,
+        "_result_collection_guard",
+        lambda *args: core.contextlib.nullcontext(),
+    )
+
+    preview = core.cancel_request(
+        repo, config, EXAMPLE_ID, reason="no longer needed", dry_run=True
+    )
+    assert preview["command"] == ["scancel", "123"]
+    assert calls == []
+
+    result = core.cancel_request(repo, config, EXAMPLE_ID, reason="no longer needed")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    assert calls == [["scancel", "123"]]
+    assert result["receipt_status"] == "cancel_requested"
+    assert receipt["status"] == "cancel_requested"
+    assert receipt["cancellation"]["requested_by"] == "runner"
+    assert receipt["cancellation"]["reason"] == "no longer needed"
+    with pytest.raises(ExpctlError, match="already requested"):
+        core.cancel_request(repo, config, EXAMPLE_ID)
+
+
 def _stub_submit_preflight(
     monkeypatch: pytest.MonkeyPatch, repo: Path, request: dict[str, object]
 ) -> None:
@@ -984,6 +1073,179 @@ def _disable_collection_lock(monkeypatch: pytest.MonkeyPatch) -> None:
         core,
         "_result_collection_guard",
         lambda *args: core.contextlib.nullcontext(),
+    )
+
+
+def test_logs_tail_reads_the_verified_submission_worktree(tmp_path: Path) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree_root, worktree = _collect_worktree(tmp_path)
+    log_dir = worktree / "logs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "example-123_0.out").write_text(
+        "first\nsecond\nthird\n", encoding="utf-8"
+    )
+    _collectable_receipt(repo, worktree)
+
+    result = core.logs_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        tail=2,
+        worktree_root=worktree_root,
+    )
+
+    assert result["pattern"] == "logs/example-123_*.out"
+    assert result["logs"] == [
+        {
+            "path": "logs/example-123_0.out",
+            "content": "second\nthird\n",
+        }
+    ]
+    assert core._render_logs(result) == "second\nthird\n"
+
+    collected_dir = repo / "expctl" / "results" / EXAMPLE_ID / "logs"
+    collected_dir.mkdir()
+    (collected_dir / "saved.out").write_text("saved\n", encoding="utf-8")
+    receipt_path = repo / "expctl" / "results" / EXAMPLE_ID / "receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["status"] = "collected"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    collected = core.logs_request(repo, config, EXAMPLE_ID, tail=10)
+    assert collected["collected"] is True
+    assert collected["logs"] == [{"path": "saved.out", "content": "saved\n"}]
+
+
+def test_parser_exposes_cancel_logs_clean_and_status_watch() -> None:
+    parser = core._parser()
+
+    cancel = parser.parse_args(
+        ["cancel", EXAMPLE_ID, "--reason", "obsolete", "--dry-run"]
+    )
+    logs = parser.parse_args(["logs", EXAMPLE_ID, "--tail", "25", "--follow"])
+    clean = parser.parse_args(["clean", EXAMPLE_ID, "--dry-run"])
+    status = parser.parse_args(["status", EXAMPLE_ID, "--watch"])
+
+    assert cancel.reason == "obsolete" and cancel.dry_run is True
+    assert logs.tail == 25 and logs.follow is True
+    assert clean.dry_run is True
+    assert status.watch == 5.0
+
+
+def test_follow_logs_stops_when_a_terminal_job_produced_no_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree_root, worktree = _collect_worktree(tmp_path)
+    worktree.mkdir(parents=True)
+    _collectable_receipt(repo, worktree)
+    monkeypatch.setattr(
+        core,
+        "status_request",
+        lambda *args: {
+            "experiment_id": EXAMPLE_ID,
+            "job_id": "123",
+            "receipt_status": "submitted",
+            "in_queue": False,
+            "accounting": {"state": "FAILED", "jobs": []},
+        },
+    )
+
+    with pytest.raises(ExpctlError, match="reached FAILED"):
+        core._follow_logs(
+            repo,
+            config,
+            EXAMPLE_ID,
+            tail=100,
+            worktree_root=worktree_root,
+            poll_interval=0.01,
+        )
+
+
+def test_clean_only_removes_a_collected_verified_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "tracked.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "tracked.py")
+    _git(
+        repo,
+        "-c",
+        "user.name=expctl tests",
+        "-c",
+        "user.email=expctl@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    )
+    commit = _git(repo, "rev-parse", "HEAD")
+    request_text = EXAMPLE_REQUEST.replace(ZERO_COMMIT, commit)
+    _example_repo(repo, request_text)
+    config = load_config(repo)
+    worktree_root = tmp_path / "worktrees"
+    worktree = worktree_root / "myproject-example"
+    _ensure_worktree(repo, worktree, commit)
+    receipt_path = _collectable_receipt(repo, worktree)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        core,
+        "_result_collection_guard",
+        lambda *args: core.contextlib.nullcontext(),
+    )
+
+    with pytest.raises(ExpctlError, match="before results are collected"):
+        core.clean_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
+
+    receipt["status"] = "collected"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    monkeypatch.setattr(
+        core,
+        "_worktree_submission_guard",
+        lambda *args: core.contextlib.nullcontext(),
+    )
+    other_receipt = repo / "expctl" / "results" / "20260102-rerun" / "receipt.json"
+    other_receipt.parent.mkdir()
+    other_receipt.write_text(
+        json.dumps({"status": "submitted", "worktree": str(worktree)}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ExpctlError, match="still claimed"):
+        core.clean_request(
+            repo,
+            config,
+            EXAMPLE_ID,
+            dry_run=True,
+            worktree_root=worktree_root,
+        )
+    other_receipt.unlink()
+
+    preview = core.clean_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=True,
+        worktree_root=worktree_root,
+    )
+    assert preview["worktree_exists"] is True
+    assert preview["removed"] is False
+    assert worktree.is_dir()
+
+    result = core.clean_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
+    saved = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    assert result["removed"] is True
+    assert not worktree.exists()
+    assert saved["cleanup"]["worktree"] == str(worktree.resolve())
+    assert (
+        core.clean_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)[
+            "removed"
+        ]
+        is False
     )
 
 

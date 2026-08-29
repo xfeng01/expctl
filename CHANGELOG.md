@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0 — 2026-08-29
+
+- Added audited `cancel`, live or collected `logs`, and guarded `clean`
+  commands. Cleanup requires collected results, verifies the detached
+  worktree, and blocks worktrees still claimed by an uncollected rerun.
+- `status --watch [SECONDS]` now refreshes until a terminal state. One-shot
+  status and watch both fall back from unavailable `squeue` queries to
+  `sacct`; redirected watch output is newline-delimited JSON.
+- Cancellation, collection, and cleanup serialize receipt lifecycle writes;
+  `doctor` now checks `scancel` with the other required SLURM commands.
+
 ## 0.6.0 — 2026-08-29
 
 - `expctl new` now refuses uncommitted changes that are absent from the pinned
