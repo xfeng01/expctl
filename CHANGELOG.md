@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2 — 2026-08-29
+
+- `expctl list` now refreshes confirmed `submitted` receipts from SLURM:
+  active jobs show their `squeue` state and finished jobs show their `sacct`
+  verdict. Mixed array-task states are reported as `MIXED`.
+- Listing remains portable and read-only. If `squeue` or `sacct` is absent or
+  unavailable, the stored `submitted` state is shown instead, and receipts are
+  never modified by a status refresh.
+
 ## 0.4.1 — 2026-08-28
 
 - `expctl list` now renders an aligned, width-aware table on interactive

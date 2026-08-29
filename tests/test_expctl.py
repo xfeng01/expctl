@@ -328,6 +328,82 @@ def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
     assert json.loads(capsys.readouterr().out) == rows
 
 
+def test_list_refreshes_submitted_receipts_without_mutating_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    receipt_dir = repo / "expctl" / "results" / EXAMPLE_ID
+    receipt_dir.mkdir(parents=True)
+    receipt = receipt_dir / "receipt.json"
+    original = {"job_id": "123", "status": "submitted"}
+    receipt.write_text(json.dumps(original), encoding="utf-8")
+    request = tomllib.loads(EXAMPLE_REQUEST)
+    request_path = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    monkeypatch.setattr(
+        core, "load_request", lambda *args, **kwargs: (request, request_path)
+    )
+    monkeypatch.setattr(core, "_live_scheduler_status", lambda *args: "RUNNING")
+
+    assert core.list_requests(repo, config) == [
+        {"id": EXAMPLE_ID, "status": "RUNNING", "title": "Example sweep"}
+    ]
+    assert json.loads(receipt.read_text(encoding="utf-8")) == original
+
+
+def test_live_list_status_summarizes_queue_and_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(core.shutil, "which", lambda command: f"/bin/{command}")
+    monkeypatch.setattr(
+        core,
+        "_queue_status",
+        lambda *args: [
+            {"job": "123_1", "state": "RUNNING", "reason": "None"},
+            {"job": "123_2", "state": "PENDING", "reason": "Resources"},
+        ],
+    )
+
+    assert core._live_scheduler_status(tmp_path, "123") == "MIXED"
+
+    monkeypatch.setattr(core, "_queue_status", lambda *args: [])
+    monkeypatch.setattr(
+        core,
+        "_scheduler_status",
+        lambda *args: {
+            "state": "COMPLETED,FAILED",
+            "jobs": [
+                {"job_id": "123", "state": "FAILED", "exit_code": "1:0"},
+                {"job_id": "123_1", "state": "COMPLETED", "exit_code": "0:0"},
+            ],
+        },
+    )
+
+    assert core._live_scheduler_status(tmp_path, "123") == "FAILED"
+
+
+def test_live_list_status_falls_back_when_slurm_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(core.shutil, "which", lambda command: None)
+    monkeypatch.setattr(
+        core,
+        "_queue_status",
+        lambda *args: pytest.fail("squeue should not be called when it is unavailable"),
+    )
+
+    assert core._live_scheduler_status(tmp_path, "123") is None
+    assert core._slurm_state_name("CANCELLED by 456") == "CANCELLED"
+
+    monkeypatch.setattr(core.shutil, "which", lambda command: f"/bin/{command}")
+    monkeypatch.setattr(
+        core,
+        "_queue_status",
+        lambda *args: (_ for _ in ()).throw(ExpctlError("controller unavailable")),
+    )
+    assert core._live_scheduler_status(tmp_path, "123") is None
+
+
 def test_invalid_id_is_rejected(tmp_path: Path) -> None:
     repo = _example_repo(tmp_path)
     config = load_config(repo)

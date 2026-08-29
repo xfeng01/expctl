@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -1220,6 +1220,63 @@ def _scheduler_status(repo: Path, job_id: str) -> dict[str, Any]:
     return {"state": ",".join(states) if states else "UNKNOWN", "jobs": rows}
 
 
+def _slurm_state_name(value: object) -> str | None:
+    """Return the stable part of a state such as ``CANCELLED by 123``."""
+    state = str(value).strip().upper()
+    if not state:
+        return None
+    state = state.split(maxsplit=1)[0].rstrip("+")
+    return None if state == "UNKNOWN" else state
+
+
+def _summarize_slurm_states(states: Iterator[object]) -> str | None:
+    normalized = {
+        state for value in states if (state := _slurm_state_name(value)) is not None
+    }
+    if not normalized:
+        return None
+    if len(normalized) == 1:
+        return normalized.pop()
+    return "MIXED"
+
+
+def _live_scheduler_status(repo: Path, job_id: str) -> str | None:
+    """Best-effort live status for list; unavailable SLURM stays offline-safe."""
+    if shutil.which("squeue") is None:
+        return None
+    try:
+        queue = _queue_status(repo, job_id)
+    except ExpctlError:
+        return None
+    if queue:
+        return _summarize_slurm_states(row.get("state") for row in queue)
+
+    if shutil.which("sacct") is None:
+        return None
+    try:
+        accounting = _scheduler_status(repo, job_id)
+    except ExpctlError:
+        return None
+
+    jobs = accounting.get("jobs")
+    if isinstance(jobs, list):
+        parent_states = (
+            row.get("state")
+            for row in jobs
+            if isinstance(row, dict) and str(row.get("job_id")) == job_id
+        )
+        if parent_status := _summarize_slurm_states(parent_states):
+            return parent_status
+        task_states = (row.get("state") for row in jobs if isinstance(row, dict))
+        if task_status := _summarize_slurm_states(task_states):
+            return task_status
+
+    state = accounting.get("state")
+    if not isinstance(state, str):
+        return None
+    return _summarize_slurm_states(iter(state.split(",")))
+
+
 def collect_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
     request, path = load_request(repo, config, experiment_id, check_git=False)
     destination = result_dir(repo, config, experiment_id)
@@ -1429,6 +1486,21 @@ STATUS_COLORS = {
     "submitted": "\x1b[34m",
     "collected": "\x1b[32m",
     "invalid": "\x1b[31m",
+    "PENDING": "\x1b[33m",
+    "CONFIGURING": "\x1b[33m",
+    "REQUEUED": "\x1b[33m",
+    "RUNNING": "\x1b[34m",
+    "COMPLETING": "\x1b[34m",
+    "SUSPENDED": "\x1b[35m",
+    "MIXED": "\x1b[35m",
+    "COMPLETED": "\x1b[32m",
+    "FAILED": "\x1b[31m",
+    "CANCELLED": "\x1b[31m",
+    "TIMEOUT": "\x1b[31m",
+    "OUT_OF_MEMORY": "\x1b[31m",
+    "NODE_FAIL": "\x1b[31m",
+    "BOOT_FAIL": "\x1b[31m",
+    "PREEMPTED": "\x1b[31m",
 }
 ANSI_RESET = "\x1b[0m"
 
@@ -1572,12 +1644,16 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
             receipt = result_dir(repo, config, experiment_id) / "receipt.json"
             status = "requested"
             if receipt.is_file():
-                stored_status = _load_receipt(receipt).get("status")
+                receipt_data = _load_receipt(receipt)
+                stored_status = receipt_data.get("status")
                 status = (
                     stored_status
                     if isinstance(stored_status, str) and stored_status
                     else "invalid"
                 )
+                job_id = receipt_data.get("job_id")
+                if status == "submitted" and isinstance(job_id, str) and job_id:
+                    status = _live_scheduler_status(repo, job_id) or status
             rows.append({"id": experiment_id, "status": status, "title": data["title"]})
         except ExpctlError as exc:
             rows.append({"id": experiment_id, "status": "invalid", "title": str(exc)})

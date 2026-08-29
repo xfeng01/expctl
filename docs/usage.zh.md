@@ -90,7 +90,7 @@ expctl submit <id> --dry-run
 expctl submit <id>
 ```
 
-`expctl list` 在交互终端中自动显示按终端宽度对齐的表格，中文按实际显示宽度计算，过长标题以 `…` 截断；状态在支持颜色的终端中会着色。输出到管道或文件时自动使用稳定的 TSV。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color`（以及标准 `NO_COLOR` 环境变量）关闭颜色。
+`expctl list` 在交互终端中自动显示按终端宽度对齐的表格，中文按实际显示宽度计算，过长标题以 `…` 截断；状态在支持颜色的终端中会着色。对于带有效作业号的 `submitted` 回执，它会先用 `squeue` 查询排队或运行状态，作业离开队列后再用 `sacct` 查询最终结果；数组任务同时存在多种状态时显示 `MIXED`。查询是只读的，不修改回执；若当前机器没有 SLURM 命令或查询不可用，状态安全回退为 `submitted`。输出到管道或文件时自动使用稳定的 TSV。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color`（以及标准 `NO_COLOR` 环境变量）关闭颜色。
 
 `--dry-run` 会验证请求并输出固定提交、worktree 路径、`sbatch` 命令、声明的节点上限和从作业脚本推导出的节点上限。它不会创建 worktree、链接共享目录、检查运行时依赖或当前节点预算，也不会调用 `sbatch`。
 
@@ -187,7 +187,7 @@ root = ".."
 | 命令 | 作用 |
 |---|---|
 | `expctl init` | 补齐默认配置和目录结构 |
-| `expctl list [--table\|--tsv\|--json] [--no-color]` | 列出请求及其仓库状态；终端默认表格，管道默认 TSV |
+| `expctl list [--table\|--tsv\|--json] [--no-color]` | 列出请求及其仓库状态；在集群上刷新已提交作业状态，终端默认表格，管道默认 TSV |
 | `expctl validate <id>` | 验证请求、固定提交和作业脚本策略 |
 | `expctl show <id>` | 将验证后的请求输出为 JSON |
 | `expctl submit <id>` | 准备 worktree、检查依赖和预算，并提交 SLURM 作业 |
@@ -208,6 +208,8 @@ submitted  已生成回执
 collected  已执行 collect
 invalid    请求验证失败，或回执不是有效的 JSON
 ```
+
+若 `submitted` 回执含有有效作业号且 SLURM 可查询，`list` 会临时用大写的调度状态替换显示值，例如 `PENDING`、`RUNNING`、`COMPLETING`、`COMPLETED`、`FAILED`、`CANCELLED`、`TIMEOUT` 或 `OUT_OF_MEMORY`。数组任务有多种状态时显示 `MIXED`；需要逐任务详情时使用 `expctl status <id>`。
 
 “已审阅”不是工具状态；结论由操作者写入 `report.md` 或项目自己的实验记录。
 

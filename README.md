@@ -47,7 +47,9 @@ Zero-install fallback: the whole tool is one stdlib-only file. Copy
 
 `submit`, `status`, and `collect` run on the cluster host (POSIX, SLURM tools
 on `PATH`). `init`, `list`, `validate`, and `show` work anywhere, including
-Windows. `expctl --version` prints the installed version.
+Windows. On a cluster, `list` enriches `submitted` receipts with live SLURM
+state; elsewhere it safely keeps the stored state. `expctl --version` prints
+the installed version.
 
 ## Quickstart
 
@@ -71,7 +73,7 @@ Runner side (on the cluster):
 
 ```bash
 git pull --ff-only
-expctl list                     # aligned table in a terminal; TSV when piped
+expctl list                     # table + live SLURM state; TSV when piped
 expctl show <id>                # read it before spending resources
 expctl submit <id> --dry-run    # preview commit, worktree, sbatch command
 expctl submit <id>              # detached worktree + budget check + sbatch
@@ -86,7 +88,7 @@ expctl rerun <id> --reason "preempted"   # same code again? new request <id>-r2
 | command | what it does |
 |---|---|
 | `init` | create `expctl.toml` and the `expctl/` skeleton |
-| `list` | all requests with their repository state. Interactive output is an aligned, terminal-width-aware table; pipes receive stable TSV. Use `--table`, `--tsv`, `--json`, or `--no-color` to override formatting |
+| `list` | all requests with their repository state. Confirmed submissions are refreshed via `squeue`, then `sacct`; unavailable SLURM tools safely leave them as `submitted`, and mixed array states show as `MIXED`. Interactive output is an aligned, terminal-width-aware table; pipes receive stable TSV. Use `--table`, `--tsv`, `--json`, or `--no-color` to override formatting |
 | `validate <id>` | schema check, plus: pinned commit exists and its job script contains every `required_script_lines` entry |
 | `show <id>` | print the validated request as JSON |
 | `submit <id>` | exclusively claim the request, create/verify a clean detached worktree from this repository at the pinned commit, verify the script's node envelope and `notes.requirements`, check the cross-job node budget via `squeue`, run `sbatch --parsable`, and atomically finalize the receipt. `--dry-run` previews; `--skip-node-check` needs explicit operator authorization |

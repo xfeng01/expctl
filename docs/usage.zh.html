@@ -293,7 +293,7 @@
 
 <div class="page">
   <header>
-    <p class="eyebrow">expctl · v0.4.1 · 异步实验交接</p>
+    <p class="eyebrow">expctl · v0.4.2 · 异步实验交接</p>
     <h1>expctl 中文使用指南</h1>
     <p class="lede">
       expctl 用 Git 仓库中的请求、回执和结果文件交接异步实验。实验设计者与集群操作者不必同时在线，也能确认运行了哪一版代码、使用了哪些参数，并追溯结果来源。
@@ -379,7 +379,7 @@ expctl list
 expctl show &lt;id&gt;
 expctl submit &lt;id&gt; --dry-run
 expctl submit &lt;id&gt;</code></pre>
-    <p><code>expctl list</code> 在交互终端中自动显示按终端宽度对齐的表格，中文按实际宽度计算，长标题以省略号截断；管道或文件输出保持稳定 TSV。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式，并用 <code>--no-color</code> 关闭颜色。</p>
+    <p><code>expctl list</code> 在交互终端中自动显示按终端宽度对齐的表格，中文按实际宽度计算，长标题以省略号截断；管道或文件输出保持稳定 TSV。对于带有效作业号的 <code>submitted</code> 回执，它会先用 <code>squeue</code> 查询排队或运行状态，离开队列后再用 <code>sacct</code> 查询最终结果；数组任务有多种状态时显示 <code>MIXED</code>。查询只读且不修改回执；SLURM 命令缺失或查询不可用时安全回退为 <code>submitted</code>。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式，并用 <code>--no-color</code> 关闭颜色。</p>
     <p><code>--dry-run</code> 会验证请求并输出固定提交、worktree 路径、<code>sbatch</code> 命令、声明节点上限和推导节点上限。它不会创建 worktree、链接共享目录、检查运行时依赖或当前节点预算，也不会调用 <code>sbatch</code>。</p>
     <p>正式提交时，expctl 会先独占 <code>preparing</code> 回执，再创建或验证属于当前仓库、位于固定提交且内容干净的 detached worktree，检查资源和节点预算，清除宿主 <code>SBATCH_*</code> 覆盖项，最后调用 <code>sbatch --parsable</code> 并原子完成回执。无法确认作业号时回执保留为 <code>submission_unknown</code>，必须人工对账，不能自动重试。</p>
     <div class="note"><p>若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 <code>receipt.json</code>。</p></div>
@@ -450,7 +450,7 @@ root = ".."</code></pre>
       <thead><tr><th>命令</th><th>作用</th></tr></thead>
       <tbody>
         <tr><td><code>expctl init</code></td><td>补齐默认配置和目录结构</td></tr>
-        <tr><td><code>expctl list [--table|--tsv|--json]</code></td><td>列出请求及其仓库状态；终端默认表格，管道默认 TSV</td></tr>
+        <tr><td><code>expctl list [--table|--tsv|--json] [--no-color]</code></td><td>列出请求及其仓库状态；在集群上刷新已提交作业状态，终端默认表格，管道默认 TSV</td></tr>
         <tr><td><code>expctl validate &lt;id&gt;</code></td><td>验证请求、固定提交和作业脚本策略</td></tr>
         <tr><td><code>expctl show &lt;id&gt;</code></td><td>将验证后的请求输出为 JSON</td></tr>
         <tr><td><code>expctl submit &lt;id&gt;</code></td><td>准备 worktree、检查依赖和预算，并提交 SLURM 作业</td></tr>
@@ -467,10 +467,11 @@ root = ".."</code></pre>
       <div>有效请求，无回执<br><span class="pill requested">requested</span></div>
       <div>正在准备或调用 sbatch<br><code>preparing / submitting</code></div>
       <div>提交结果必须人工对账<br><code>submission_unknown</code></div>
-      <div>已生成回执<br><span class="pill submitted">submitted</span></div>
+      <div>已生成回执；可查询时显示实时 SLURM 状态<br><span class="pill submitted">submitted → RUNNING / FAILED / …</span></div>
       <div>已执行 collect<br><span class="pill collected">collected</span></div>
       <div>请求验证失败或回执 JSON 无效<br><code>invalid</code></div>
     </div>
+    <p>实时状态还包括 <code>PENDING</code>、<code>COMPLETING</code>、<code>COMPLETED</code>、<code>CANCELLED</code>、<code>TIMEOUT</code> 和 <code>OUT_OF_MEMORY</code>。数组任务有多种状态时显示 <code>MIXED</code>；使用 <code>expctl status &lt;id&gt;</code> 查看逐任务详情。</p>
     <p>“已审阅”不是工具状态；结论由操作者写入 <code>report.md</code> 或项目自己的实验记录。</p>
 
     <h2 id="trouble"><span class="num">八</span>异常处理与自动化约定</h2>
