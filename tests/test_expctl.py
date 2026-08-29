@@ -1,16 +1,19 @@
 import json
+import subprocess
 import tomllib
 from pathlib import Path
 
 import pytest
 
-import expctl.core as core
+from expctl import core
 from expctl.core import (
     Config,
-    _ensure_runtime_links,
-    _receipt_summary,
     ExpctlError,
     __version__,
+    _ensure_runtime_links,
+    _ensure_worktree,
+    _receipt_summary,
+    _script_max_concurrent_nodes,
     build_sbatch_command,
     extract_metrics,
     init_repo,
@@ -18,10 +21,11 @@ from expctl.core import (
     load_request,
     rerun_request,
     status_request,
+    submit_request,
 )
 
-
 EXAMPLE_ID = "20260101-example"
+ZERO_COMMIT = "0" * 40
 EXAMPLE_CONFIG = """\
 version = 1
 
@@ -45,7 +49,7 @@ decision_rule = "Validation passes."
 
 [code]
 branch = "main"
-commit = "{'0' * 40}"
+commit = "{ZERO_COMMIT}"
 worktree = "myproject-example"
 
 [slurm]
@@ -131,6 +135,82 @@ def test_request_cannot_exceed_the_node_ceiling(tmp_path: Path) -> None:
         load_request(repo, config, EXAMPLE_ID, check_git=False)
 
 
+def test_plain_names_reject_dot_segments(tmp_path: Path) -> None:
+    text = EXAMPLE_REQUEST.replace('worktree = "myproject-example"', 'worktree = ".."')
+    repo = _example_repo(tmp_path, text)
+    config = load_config(repo)
+
+    with pytest.raises(ExpctlError, match="plain directory name"):
+        load_request(repo, config, EXAMPLE_ID, check_git=False)
+
+    (repo / "expctl.toml").write_text(
+        EXAMPLE_CONFIG.replace(
+            'shared_dirs = [".venv", "data", "runs", "logs"]',
+            'shared_dirs = [".."]',
+        ).replace('create_missing = ["runs", "logs"]', "create_missing = []"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ExpctlError, match="plain directory name"):
+        load_config(repo)
+
+
+def test_script_node_envelope_includes_array_throttle() -> None:
+    lines = ["#!/bin/bash", "#SBATCH --nodes=2", "#SBATCH --array=0-9%3"]
+
+    assert _script_max_concurrent_nodes(lines, "job.slurm") == 6
+    assert _script_max_concurrent_nodes(["#SBATCH -N 1-4"], "job.slurm") == 4
+    with pytest.raises(ExpctlError, match="explicit integer"):
+        _script_max_concurrent_nodes(["#!/bin/bash"], "job.slurm")
+    with pytest.raises(ExpctlError, match="numeric indexes"):
+        _script_max_concurrent_nodes(
+            ["#SBATCH --nodes=1", "#SBATCH --array=$TASKS"], "job.slurm"
+        )
+    with pytest.raises(ExpctlError, match="heterogeneous"):
+        _script_max_concurrent_nodes(
+            ["#SBATCH --nodes=1", "#SBATCH hetjob", "#SBATCH --nodes=2"],
+            "job.slurm",
+        )
+    assert (
+        _script_max_concurrent_nodes(
+            ["#SBATCH --nodes=2", "echo start", "#SBATCH --nodes=1"], "job.slurm"
+        )
+        == 2
+    )
+
+
+def test_required_scheduler_line_after_code_is_not_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    monkeypatch.setattr(
+        core,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        core,
+        "_git_text",
+        lambda *args: (
+            "#!/bin/bash\n#SBATCH --nodes=1\necho start\n#SBATCH -p example-partition\n"
+        ),
+    )
+
+    with pytest.raises(ExpctlError, match="missing the required line"):
+        load_request(repo, config, EXAMPLE_ID)
+
+
+def test_ambient_sbatch_options_are_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SBATCH_NODES", "99")
+    monkeypatch.setenv("EXPCTL_TEST_VALUE", "kept")
+
+    environment, removed = core._sbatch_environment()
+
+    assert removed == ["SBATCH_NODES"]
+    assert "SBATCH_NODES" not in environment
+    assert environment["EXPCTL_TEST_VALUE"] == "kept"
+
+
 def test_sbatch_command_is_argument_safe(tmp_path: Path) -> None:
     repo = _example_repo(tmp_path)
     config = load_config(repo)
@@ -140,6 +220,14 @@ def test_sbatch_command_is_argument_safe(tmp_path: Path) -> None:
         "sbatch",
         "--parsable",
         "--export=ALL,NUM_SAMPLES=256",
+        "scripts/example.slurm",
+    ]
+    assert build_sbatch_command(request, ("-p", "example-partition")) == [
+        "sbatch",
+        "--parsable",
+        "--export=ALL,NUM_SAMPLES=256",
+        "-p",
+        "example-partition",
         "scripts/example.slurm",
     ]
 
@@ -184,6 +272,129 @@ def test_status_before_submission_is_a_clear_error(tmp_path: Path) -> None:
         status_request(repo, config, EXAMPLE_ID)
 
 
+def _stub_submit_preflight(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, request: dict[str, object]
+) -> None:
+    request_file = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    monkeypatch.setattr(
+        core, "load_request", lambda *args, **kwargs: (request, request_file)
+    )
+    monkeypatch.setattr(
+        core,
+        "_git_text",
+        lambda *args: "#!/bin/bash\n#SBATCH --nodes=1\n",
+    )
+    monkeypatch.setattr(core, "_ensure_worktree", lambda *args, **kwargs: None)
+    monkeypatch.setattr(core, "_check_worktree_clean", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        core, "_worktree_submission_guard", lambda *args: core.contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        core, "_ensure_runtime_links", lambda *args, **kwargs: {"logs": "linked"}
+    )
+    monkeypatch.setattr(core, "_check_requirements", lambda *args, **kwargs: None)
+
+
+def test_submit_writes_confirmed_receipt_and_refuses_a_second_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    request = tomllib.loads(EXAMPLE_REQUEST)
+    _stub_submit_preflight(monkeypatch, repo, request)
+    monkeypatch.setattr(
+        core,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "123;cluster\n", ""),
+    )
+    worktree_root = tmp_path.parent / f"{tmp_path.name}-worktrees"
+
+    receipt = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=False,
+        skip_node_check=True,
+        worktree_root=worktree_root,
+    )
+
+    assert receipt["status"] == "submitted"
+    assert receipt["job_id"] == "123"
+    assert receipt["verified_max_concurrent_nodes"] == 1
+    with pytest.raises(ExpctlError, match="receipt already exists"):
+        submit_request(
+            repo,
+            config,
+            EXAMPLE_ID,
+            dry_run=False,
+            skip_node_check=True,
+            worktree_root=worktree_root,
+        )
+
+
+def test_preflight_failure_removes_pending_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    request = tomllib.loads(EXAMPLE_REQUEST)
+    _stub_submit_preflight(monkeypatch, repo, request)
+    monkeypatch.setattr(
+        core,
+        "_ensure_worktree",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ExpctlError("dirty")),
+    )
+
+    with pytest.raises(ExpctlError, match="dirty"):
+        submit_request(
+            repo,
+            config,
+            EXAMPLE_ID,
+            dry_run=False,
+            skip_node_check=True,
+            worktree_root=tmp_path.parent / f"{tmp_path.name}-worktrees",
+        )
+
+    assert not (repo / "expctl" / "results" / EXAMPLE_ID / "receipt.json").exists()
+
+
+def test_sbatch_failure_preserves_an_unknown_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    request = tomllib.loads(EXAMPLE_REQUEST)
+    _stub_submit_preflight(monkeypatch, repo, request)
+    monkeypatch.setattr(
+        core,
+        "_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ExpctlError("connection lost")),
+    )
+
+    with pytest.raises(ExpctlError, match="outcome is unknown"):
+        submit_request(
+            repo,
+            config,
+            EXAMPLE_ID,
+            dry_run=False,
+            skip_node_check=True,
+            worktree_root=tmp_path.parent / f"{tmp_path.name}-worktrees",
+        )
+
+    receipt = json.loads(
+        (repo / "expctl" / "results" / EXAMPLE_ID / "receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["status"] == "submission_unknown"
+    assert "connection lost" in receipt["submission_error"]
+    status = status_request(repo, config, EXAMPLE_ID)
+    assert status["job_id"] is None
+    assert status["receipt_status"] == "submission_unknown"
+    with pytest.raises(ExpctlError, match="no confirmed job ID"):
+        rerun_request(repo, config, EXAMPLE_ID, check_git=False)
+
+
 def _fake_receipt(repo: Path, experiment_id: str) -> Path:
     directory = repo / "expctl" / "results" / experiment_id
     directory.mkdir(parents=True)
@@ -200,6 +411,119 @@ def _fake_receipt(repo: Path, experiment_id: str) -> Path:
         encoding="utf-8",
     )
     return receipt
+
+
+def test_status_wraps_a_corrupt_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    receipt = _fake_receipt(repo, EXAMPLE_ID)
+    receipt.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ExpctlError, match="unreadable submission receipt"):
+        status_request(repo, config, EXAMPLE_ID)
+
+
+def _collectable_receipt(repo: Path, worktree: Path) -> Path:
+    request = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    directory = repo / "expctl" / "results" / EXAMPLE_ID
+    directory.mkdir(parents=True)
+    receipt = directory / "receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "job_id": "123",
+                "status": "submitted",
+                "request_sha256": core._request_hash(request),
+                "worktree": str(worktree),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return receipt
+
+
+def test_an_active_job_blocks_reuse_of_its_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree = tmp_path.parent / f"{tmp_path.name}-worktree"
+    receipt = _collectable_receipt(repo, worktree)
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["experiment_id"] = EXAMPLE_ID
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        core,
+        "_queue_status",
+        lambda *args: [{"job": "123", "state": "RUNNING", "reason": "None"}],
+    )
+
+    with pytest.raises(ExpctlError, match="still used"):
+        core._check_worktree_available(repo, config, worktree, "20260102-another")
+
+
+def test_collect_refuses_a_job_that_is_still_queued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree = tmp_path.parent / f"{tmp_path.name}-worktree"
+    worktree.mkdir()
+    _collectable_receipt(repo, worktree)
+    monkeypatch.setattr(
+        core,
+        "_queue_status",
+        lambda *args: [{"job": "123", "state": "RUNNING", "reason": "None"}],
+    )
+
+    with pytest.raises(ExpctlError, match="still in the queue"):
+        core.collect_request(repo, config, EXAMPLE_ID)
+
+
+def test_collect_rejects_colliding_log_basenames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_text = EXAMPLE_REQUEST.replace(
+        'log_glob = "logs/example-{job_id}_*.out"',
+        'log_glob = "logs/**/job-{job_id}.out"',
+    )
+    repo = _example_repo(tmp_path, request_text)
+    config = load_config(repo)
+    worktree = tmp_path.parent / f"{tmp_path.name}-worktree"
+    for subdir in ("first", "second"):
+        directory = worktree / "logs" / subdir
+        directory.mkdir(parents=True)
+        (directory / "job-123.out").write_text("gen_ppl: 2\n", encoding="utf-8")
+    _collectable_receipt(repo, worktree)
+    monkeypatch.setattr(core, "_queue_status", lambda *args: [])
+
+    with pytest.raises(ExpctlError, match="colliding basenames"):
+        core.collect_request(repo, config, EXAMPLE_ID)
+
+
+def test_collect_records_missing_metrics_from_the_copied_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree = tmp_path.parent / f"{tmp_path.name}-worktree"
+    logs = worktree / "logs"
+    logs.mkdir(parents=True)
+    (logs / "example-123_0.out").write_text("loss: 1.5\n", encoding="utf-8")
+    receipt_path = _collectable_receipt(repo, worktree)
+    monkeypatch.setattr(core, "_queue_status", lambda *args: [])
+    monkeypatch.setattr(
+        core, "_scheduler_status", lambda *args: {"state": "FAILED", "jobs": []}
+    )
+
+    collection = core.collect_request(repo, config, EXAMPLE_ID)
+
+    assert collection["missing_metrics"] == ["gen_ppl"]
+    assert collection["scheduler"]["state"] == "FAILED"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "collected"
 
 
 def test_rerun_needs_a_receipt(tmp_path: Path) -> None:
@@ -276,7 +600,7 @@ def test_rerun_keeps_crlf_and_honours_an_explicit_id(tmp_path: Path) -> None:
 
 
 def test_rerun_of_must_be_an_experiment_id(tmp_path: Path) -> None:
-    text = EXAMPLE_REQUEST.replace('title = ', 'rerun_of = "nope"\ntitle = ')
+    text = EXAMPLE_REQUEST.replace("title = ", 'rerun_of = "nope"\ntitle = ')
     repo = _example_repo(tmp_path, text)
     config = load_config(repo)
 
@@ -319,6 +643,48 @@ def _symlinks_allowed(tmp_path: Path) -> bool:
     return True
 
 
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+
+def test_reused_worktree_must_be_clean_and_from_the_same_repository(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "tracked.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "tracked.py")
+    _git(
+        repo,
+        "-c",
+        "user.name=expctl tests",
+        "-c",
+        "user.email=expctl@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    )
+    commit = _git(repo, "rev-parse", "HEAD")
+    worktree = tmp_path / "worktree"
+
+    _ensure_worktree(repo, worktree, commit, allowed_untracked=("logs",))
+    (worktree / "logs").mkdir()
+    (worktree / "logs" / "job.out").write_text("ok", encoding="utf-8")
+    _ensure_worktree(repo, worktree, commit, allowed_untracked=("logs",))
+
+    (worktree / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    with pytest.raises(ExpctlError, match="not clean"):
+        _ensure_worktree(repo, worktree, commit, allowed_untracked=("logs",))
+
+
 def test_output_dir_materialised_by_the_checkout_is_kept(tmp_path: Path) -> None:
     if not _symlinks_allowed(tmp_path):
         pytest.skip("symlinks not permitted here")
@@ -329,8 +695,11 @@ def test_output_dir_materialised_by_the_checkout_is_kept(tmp_path: Path) -> None
     (worktree / "logs").mkdir(parents=True)
     (worktree / "logs" / "old-job.out").write_text("tracked", encoding="utf-8")
     config = Config(
-        root="expctl", required_script_lines=(), max_total_nodes=0,
-        shared_dirs=("data", "logs", "runs"), create_missing=("runs", "logs"),
+        root="expctl",
+        required_script_lines=(),
+        max_total_nodes=0,
+        shared_dirs=("data", "logs", "runs"),
+        create_missing=("runs", "logs"),
         worktree_root="..",
     )
 

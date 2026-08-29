@@ -15,8 +15,10 @@ make the handoff itself safe and auditable.
 - `expctl/requests/<id>.toml` — an **immutable request**. It pins the
   exact Git commit, the SLURM entrypoint, the resource envelope, the expected
   logs, and the decision rule the result feeds.
-- `expctl/results/<id>/receipt.json` — written when the request is
-  submitted: job ID, who, when, from which worktree.
+- `expctl/results/<id>/receipt.json` — claimed before submission and finalized
+  with the job ID, who, when, and worktree. An interrupted handoff remains
+  visibly `preparing`, `submitting`, or `submission_unknown` and cannot be
+  submitted again by accident.
 - `expctl/results/<id>/` — collected logs and scraped metrics, pushed
   back for the author to read.
 - `expctl.toml` — per-repository policy: required scheduler flags, node
@@ -26,7 +28,7 @@ make the handoff itself safe and auditable.
 State is defined by which files exist:
 
 ```text
-request only -> submitted receipt -> collected result -> reviewed conclusion
+request only -> preparing/submitting receipt -> submitted -> collected -> reviewed
 ```
 
 Requests are never edited after submission; a rerun or changed configuration
@@ -84,20 +86,22 @@ expctl rerun <id> --reason "preempted"   # same code again? new request <id>-r2
 | command | what it does |
 |---|---|
 | `init` | create `expctl.toml` and the `expctl/` skeleton |
-| `list` | all requests with their state (`requested` / `submitted` / `collected` / `invalid`) |
+| `list` | all requests with their repository state, including in-progress or uncertain submission states |
 | `validate <id>` | schema check, plus: pinned commit exists and its job script contains every `required_script_lines` entry |
 | `show <id>` | print the validated request as JSON |
-| `submit <id>` | create/verify a detached worktree at the pinned commit, symlink shared runtime dirs, verify `notes.requirements`, check the cross-job node budget via `squeue`, run `sbatch --parsable`, write the receipt. `--dry-run` previews; `--skip-node-check` needs explicit operator authorization |
+| `submit <id>` | exclusively claim the request, create/verify a clean detached worktree from this repository at the pinned commit, verify the script's node envelope and `notes.requirements`, check the cross-job node budget via `squeue`, run `sbatch --parsable`, and atomically finalize the receipt. `--dry-run` previews; `--skip-node-check` needs explicit operator authorization |
 | `status <id>` | queue state per task (`squeue`), falling back to accounting (`sacct`) once the job left the queue |
-| `collect <id>` | copy logs matching `outputs.log_glob` into `results/<id>/logs/`, scrape `outputs.metrics` into `metrics.json`, record the scheduler verdict |
+| `collect <id>` | after the job leaves `squeue`, atomically copy non-colliding logs matching `outputs.log_glob`, scrape `outputs.metrics` into `metrics.json`, record missing metrics and the scheduler verdict |
 | `rerun <id>` | copy a submitted request to `<id>-r2` (or `--as NEW_ID`) with `rerun_of` pointing back and `--reason` recorded; same commit, same worktree. Commit the copy, then `submit` it |
 
 ## When a job fails
 
-A request is submitted exactly once: `submit` refuses while the receipt
-exists and reports how that submission ended (job ID, submitter, `sacct`
-verdict). Running the same code again is a new request, and the runner can
-make it without waiting for the author:
+A request gets at most one automatic submission attempt. `submit` claims the
+receipt exclusively before invoking `sbatch`; concurrent callers lose that
+claim. If `sbatch` does not return a confirmed job ID, the receipt becomes
+`submission_unknown` and remains locked for manual scheduler reconciliation.
+Never delete or retry such a receipt until an operator has established whether
+a job exists. A confirmed run of the same code is a new request:
 
 ```bash
 expctl rerun <id> --reason "preempted"          # writes requests/<id>-r2.toml
@@ -127,7 +131,7 @@ worktree = "myproject-short-name" # sibling directory the job runs in
 
 [slurm]
 script = "scripts/job.slurm"      # repo-relative
-max_concurrent_nodes = 1          # worst-case simultaneous nodes
+max_concurrent_nodes = 1          # audited upper bound, not a free-form estimate
 
 [slurm.env]                       # passed via sbatch --export
 NUM_SAMPLES = "256"               # quoted strings, no commas
@@ -141,6 +145,13 @@ metrics = ["gen_ppl"]             # scraped from `name: value` log lines
 requirements = ["runs/ckpt.pt"]   # must exist on the cluster before submit
 instructions = "free text for the runner"
 ```
+
+The pinned job script must declare an explicit numeric node allocation, for
+example `#SBATCH --nodes=1`. If it declares an array, expctl also parses its
+numeric range and `%N` throttle. The derived maximum (`nodes × concurrently
+runnable array tasks`) must not exceed `max_concurrent_nodes`. Ambient
+`SBATCH_*` environment options are removed before submission so they cannot
+override the audited script.
 
 Copies made by `expctl rerun` carry two extra top-level keys, `rerun_of`
 (the predecessor's ID) and optionally `rerun_reason`.
@@ -156,7 +167,8 @@ root = "expctl"
 
 [scheduler]
 # Verbatim lines that must appear in the job script at the pinned commit.
-# Enforce approved partitions, accounts, or QOS flags here.
+# Approved #SBATCH options are also passed on sbatch's command line so later
+# script directives cannot override partitions, accounts, or QOS policy.
 required_script_lines = ["#SBATCH -p my-partition"]
 # Cross-job node ceiling counted via squeue. 0 disables the check.
 max_total_nodes = 4
@@ -177,12 +189,18 @@ worktree. If the checkout itself already contains one of the `create_missing`
 (output) directories — tracked log files under `logs/`, say — it is kept and
 the job writes there; `collect` reads from the worktree either way. An *input*
 directory in that state is an error. The receipt lists the outcome per
-directory under `runtime_dirs`.
+directory under `runtime_dirs`. Reused worktrees must belong to the same Git
+repository, have the requested `HEAD`, and contain no tracked changes or
+untracked/ignored files outside these shared directories. A worktree cannot be
+reused while another recorded job is still queued or its submission outcome is
+unknown.
 
 Notes on the node budget: every pending array task counts as a reserved node,
 so the check is deliberately conservative — it can refuse a submission that a
 `%N` throttle would in fact keep within budget. Waiting for the queue to
-drain is the intended response.
+drain is the intended response. expctl serializes its own check-and-submit
+window inside one Git checkout; scheduler QOS/account limits remain the only
+hard ceiling across other clones and manually submitted jobs.
 
 ## Working with AI agents
 

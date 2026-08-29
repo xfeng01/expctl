@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0 — 2026-08-28
+
+- Submission now claims a `preparing` receipt exclusively before `sbatch`,
+  uses atomic JSON updates, and preserves `submission_unknown` when no job ID
+  can be confirmed. Concurrent callers can no longer submit the same request.
+- Existing worktrees must belong to the same repository, match the pinned
+  commit, and be clean outside configured runtime directories. Active or
+  uncertain runs block reuse of the same worktree.
+- Validation derives the worst-case node envelope from explicit numeric
+  `#SBATCH --nodes` and `--array` directives. Ambient `SBATCH_*` options are
+  removed, required scheduler options are reapplied on the `sbatch` command
+  line, and expctl serializes its local node-budget check/submit window.
+- `collect` refuses queued jobs and colliding log basenames, copies files and
+  updates state atomically, and records missing expected metrics.
+- Receipt parsing now reports user-facing errors instead of JSON tracebacks;
+  plain-name validation rejects `.` and `..`.
+
 ## 0.3.2 — 2026-08-28
 
 - `expctl rerun <id> [--as NEW_ID] [--reason TEXT]`: copy a submitted request

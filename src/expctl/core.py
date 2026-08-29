@@ -17,6 +17,7 @@ are never edited after submission; running one again is a new request
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import getpass
@@ -24,17 +25,26 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
+import uuid
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+try:  # submit only runs on POSIX, but the read-only commands support Windows.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX CI
+    fcntl = None  # type: ignore[assignment]
 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -47,7 +57,7 @@ ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9.][A-Za-z0-9._-]*$")
 RERUN_SUFFIX_RE = re.compile(r"-r\d+$")
 # The top-level `id = "..."` line of a request file, as `rerun` rewrites it.
-ID_LINE_RE = re.compile(r"""^id\s*=\s*(['"])[^'"]*\1\s*(#.*)?$""")
+ID_LINE_RE = re.compile(r"""^(\s*)id\s*=\s*(['"])[^'"]*\2\s*(#.*)?$""")
 # Matches "name: value", "name = value", and column-aligned "name   value"
 # lines, so both dedicated machine-readable blocks and plain metric dumps work.
 METRIC_LINE_RE = re.compile(
@@ -66,7 +76,8 @@ root = "expctl"
 
 [scheduler]
 # Verbatim lines that must appear in the job script at the pinned commit.
-# Use this to enforce approved partitions, accounts, or QOS flags.
+# #SBATCH options here are also passed on the command line so the script cannot
+# override approved partitions, accounts, or QOS flags later.
 required_script_lines = []
 # Cross-job node ceiling, counted via squeue across everything you have
 # queued or running. 0 disables the check.
@@ -97,6 +108,8 @@ worktree = "myproject-short-name"
 
 [slurm]
 script = "scripts/example.slurm"
+# Audited upper bound. The script must declare numeric #SBATCH --nodes;
+# numeric array ranges and their %N throttle are included in this bound.
 max_concurrent_nodes = 1
 
 [slurm.env]
@@ -131,6 +144,7 @@ def _run(
     *,
     cwd: Path,
     check: bool = True,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -138,8 +152,8 @@ def _run(
             cwd=cwd,
             check=False,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
+            env=env,
         )
     except FileNotFoundError as exc:
         raise ExpctlError(f"required command not found: {args[0]}") from exc
@@ -147,6 +161,104 @@ def _run(
         detail = result.stderr.strip() or result.stdout.strip()
         raise ExpctlError(f"command failed ({' '.join(args)}): {detail}")
     return result
+
+
+def _plain_name(value: str, field: str) -> str:
+    if value in {".", ".."} or not SAFE_NAME_RE.fullmatch(value):
+        raise ExpctlError(f"{field} must be a plain directory name: {value}")
+    return value
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace a text file atomically after flushing its complete contents."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise ExpctlError(f"could not atomically write {path}: {exc}") from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _atomic_copy2(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+    except OSError as exc:
+        raise ExpctlError(f"could not copy {source} to {target}: {exc}") from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _exclusive_write_text(path: Path, content: str) -> None:
+    """Create a file once; concurrent callers cannot overwrite the winner."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = False
+    try:
+        handle = path.open("x", encoding="utf-8", newline="")
+        created = True
+        with handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError as exc:
+        raise ExpctlError(f"file already exists: {path}") from exc
+    except OSError as exc:
+        if created:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise ExpctlError(f"could not create {path}: {exc}") from exc
+
+
+def _load_json_object(path: Path, context: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ExpctlError(f"unreadable {context} at {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ExpctlError(f"invalid {context} at {path}: expected a JSON object")
+    return payload
+
+
+def _load_receipt(path: Path) -> dict[str, Any]:
+    return _load_json_object(path, "submission receipt")
 
 
 def find_repo_root(start: Path | None = None) -> Path:
@@ -210,8 +322,7 @@ def load_config(repo: Path) -> Config:
         tables["runtime"], "create_missing", "runtime", DEFAULT_CREATE_MISSING
     )
     for name in shared:
-        if not SAFE_NAME_RE.fullmatch(name):
-            raise ExpctlError(f"runtime.shared_dirs entry is not a plain name: {name}")
+        _plain_name(name, "runtime.shared_dirs entry")
     for name in create_missing:
         if name not in shared:
             raise ExpctlError(
@@ -222,11 +333,14 @@ def load_config(repo: Path) -> Config:
     if not isinstance(root, str) or not root.strip():
         raise ExpctlError("worktree.root must be a non-empty string")
 
+    required_script_lines = _config_list(
+        tables["scheduler"], "required_script_lines", "scheduler", ()
+    )
+    _required_sbatch_options(required_script_lines)
+
     return Config(
         root=data_root,
-        required_script_lines=_config_list(
-            tables["scheduler"], "required_script_lines", "scheduler", ()
-        ),
+        required_script_lines=required_script_lines,
         max_total_nodes=max_total,
         shared_dirs=shared,
         create_missing=create_missing,
@@ -254,9 +368,7 @@ def init_repo(repo: Path) -> list[str]:
 
 def request_path(repo: Path, config: Config, experiment_id: str) -> Path:
     if not ID_RE.fullmatch(experiment_id):
-        raise ExpctlError(
-            "experiment ID must look like YYYYMMDD-lowercase-short-name"
-        )
+        raise ExpctlError("experiment ID must look like YYYYMMDD-lowercase-short-name")
     return repo / config.root / "requests" / f"{experiment_id}.toml"
 
 
@@ -288,6 +400,145 @@ def _relative_path(value: str, field: str) -> PurePosixPath:
 
 def _git_text(repo: Path, *args: str) -> str:
     return _run(["git", *args], cwd=repo).stdout
+
+
+def _slurm_preamble(script_lines: list[str]) -> list[str]:
+    preamble: list[str] = []
+    for line in script_lines:
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith("#"):
+            break
+        preamble.append(line)
+    return preamble
+
+
+def _sbatch_option(
+    script_lines: list[str], long_name: str, short_name: str
+) -> str | None:
+    """Return the last value for one option in pinned #SBATCH directives."""
+    value: str | None = None
+    for line in _slurm_preamble(script_lines):
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        if not stripped.startswith("#SBATCH"):
+            continue
+        try:
+            tokens = shlex.split(
+                stripped[len("#SBATCH") :].strip(), comments=True, posix=True
+            )
+        except ValueError as exc:
+            raise ExpctlError(f"invalid #SBATCH directive {line!r}: {exc}") from exc
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            inline: str | None = None
+            if token.startswith(f"{long_name}="):
+                inline = token.split("=", 1)[1]
+            elif token == long_name or token == short_name:
+                index += 1
+                if index >= len(tokens):
+                    raise ExpctlError(f"{token} in #SBATCH requires a value")
+                inline = tokens[index]
+            elif (
+                token.startswith(short_name)
+                and token != short_name
+                and not token.startswith("--")
+            ):
+                inline = token[len(short_name) :].removeprefix("=")
+            if inline is not None:
+                if not inline:
+                    raise ExpctlError(
+                        f"{long_name} in #SBATCH requires a non-empty value"
+                    )
+                value = inline
+            index += 1
+    return value
+
+
+def _array_task_count(specification: str) -> tuple[int, int]:
+    """Return (number of tasks, maximum simultaneously runnable tasks)."""
+    expression, separator, throttle_text = specification.rpartition("%")
+    if not separator:
+        expression, throttle_text = specification, ""
+    elif not throttle_text.isdigit() or int(throttle_text) < 1:
+        raise ExpctlError(f"invalid #SBATCH --array throttle: {specification}")
+
+    count = 0
+    for item in expression.split(","):
+        match = re.fullmatch(r"(\d+)(?:-(\d+)(?::(\d+))?)?", item)
+        if not match:
+            raise ExpctlError(
+                "#SBATCH --array must use numeric indexes/ranges so its node "
+                f"envelope can be verified: {specification}"
+            )
+        start = int(match.group(1))
+        if match.group(2) is None:
+            count += 1
+            continue
+        stop = int(match.group(2))
+        step = int(match.group(3) or "1")
+        if stop < start or step < 1:
+            raise ExpctlError(f"invalid #SBATCH --array range: {item}")
+        count += (stop - start) // step + 1
+    if count < 1:
+        raise ExpctlError("#SBATCH --array must contain at least one task")
+    throttle = int(throttle_text) if throttle_text else count
+    return count, min(count, throttle)
+
+
+def _script_max_concurrent_nodes(script_lines: list[str], script: str) -> int:
+    for line in _slurm_preamble(script_lines):
+        if re.match(r"^\s*#SBATCH\s+(?:hetjob|packjob)\b", line):
+            raise ExpctlError(
+                f"heterogeneous #SBATCH jobs are not supported in {script}; "
+                "use separate expctl requests so the node envelope is auditable"
+            )
+    nodes_text = _sbatch_option(script_lines, "--nodes", "-N")
+    if nodes_text is None:
+        raise ExpctlError(
+            f"{script} must declare an explicit integer #SBATCH --nodes value "
+            "so the node envelope can be verified"
+        )
+    match = re.fullmatch(r"(\d+)(?:-(\d+))?", nodes_text)
+    if not match:
+        raise ExpctlError(
+            f"unsupported #SBATCH --nodes value in {script}: {nodes_text}"
+        )
+    minimum = int(match.group(1))
+    maximum = int(match.group(2) or match.group(1))
+    if minimum < 1 or maximum < minimum:
+        raise ExpctlError(f"invalid #SBATCH --nodes value in {script}: {nodes_text}")
+
+    array_text = _sbatch_option(script_lines, "--array", "-a")
+    concurrent_tasks = 1
+    if array_text is not None:
+        _, concurrent_tasks = _array_task_count(array_text)
+    return maximum * concurrent_tasks
+
+
+def _required_sbatch_options(required_lines: tuple[str, ...]) -> list[str]:
+    """Turn required #SBATCH policy lines into command-line overrides."""
+    options: list[str] = []
+    for line in required_lines:
+        stripped = line.lstrip()
+        if not stripped.startswith("#SBATCH"):
+            continue
+        try:
+            tokens = shlex.split(
+                stripped[len("#SBATCH") :].strip(), comments=True, posix=True
+            )
+        except ValueError as exc:
+            raise ExpctlError(
+                f"invalid scheduler.required_script_lines entry {line!r}: {exc}"
+            ) from exc
+        if not tokens or not tokens[0].startswith("-"):
+            raise ExpctlError(
+                "scheduler.required_script_lines #SBATCH entries must contain "
+                f"scheduler options: {line}"
+            )
+        options.extend(tokens)
+    return options
 
 
 def load_request(
@@ -341,8 +592,7 @@ def validate_request(
     worktree = _text(code, "worktree", "code")
     if not COMMIT_RE.fullmatch(commit):
         raise ExpctlError("code.commit must be a full 40-character Git commit")
-    if not SAFE_NAME_RE.fullmatch(worktree):
-        raise ExpctlError("code.worktree must be a safe directory basename")
+    _plain_name(worktree, "code.worktree")
 
     slurm = _table(data, "slurm")
     script = _text(slurm, "script", "slurm")
@@ -375,8 +625,10 @@ def validate_request(
         raise ExpctlError("outputs.log_glob must contain {job_id}")
     _relative_path(log_glob.format(job_id="123"), "outputs.log_glob")
     metrics = outputs.get("metrics")
-    if not isinstance(metrics, list) or not metrics or not all(
-        isinstance(metric, str) and metric for metric in metrics
+    if (
+        not isinstance(metrics, list)
+        or not metrics
+        or not all(isinstance(metric, str) and metric for metric in metrics)
     ):
         raise ExpctlError("outputs.metrics must be a non-empty string array")
 
@@ -394,38 +646,122 @@ def validate_request(
     if check_git:
         _run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=repo)
         script_lines = _git_text(repo, "show", f"{commit}:{script}").splitlines()
+        active_script_lines = _slurm_preamble(script_lines)
         for required in config.required_script_lines:
-            if required not in script_lines:
+            if required not in active_script_lines:
                 raise ExpctlError(
                     f"{script} at {commit[:12]} is missing the required line: "
                     f"{required}"
                 )
+        verified_nodes = _script_max_concurrent_nodes(script_lines, script)
+        if verified_nodes > max_nodes:
+            raise ExpctlError(
+                f"{script} can use {verified_nodes} concurrent nodes, exceeding "
+                f"slurm.max_concurrent_nodes={max_nodes}"
+            )
 
 
 def _request_hash(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise ExpctlError(
+            f"could not read request for hashing at {path}: {exc}"
+        ) from exc
+    return hashlib.sha256(content).hexdigest()
 
 
-def _default_worktree(repo: Path, config: Config, request: dict[str, Any]) -> Path:
-    root = (repo / config.worktree_root).resolve()
-    return root / _table(request, "code")["worktree"]
+def _worktree_path(
+    repo: Path,
+    config: Config,
+    request: dict[str, Any],
+    override_root: Path | None = None,
+) -> Path:
+    root = (
+        override_root.resolve()
+        if override_root is not None
+        else (repo / config.worktree_root).resolve()
+    )
+    name = _plain_name(_table(request, "code")["worktree"], "code.worktree")
+    worktree = (root / name).resolve()
+    repo = repo.resolve()
+    if worktree == repo or worktree in repo.parents or repo in worktree.parents:
+        raise ExpctlError(
+            f"experiment worktree must not overlap the main repository: {worktree}"
+        )
+    if worktree.parent != root:
+        raise ExpctlError(
+            f"experiment worktree escapes its configured root: {worktree}"
+        )
+    return worktree
 
 
-def _ensure_worktree(repo: Path, worktree: Path, commit: str) -> None:
+def _git_common_dir(worktree: Path) -> Path:
+    value = _git_text(worktree, "rev-parse", "--git-common-dir").strip()
+    path = Path(value)
+    return (worktree / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+def _check_worktree_clean(worktree: Path, allowed_untracked: tuple[str, ...]) -> None:
+    result = _run(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=none",
+        ],
+        cwd=worktree,
+    )
+    unsafe: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        status, path = line[:2], line[3:]
+        if status in {"??", "!!"} and any(
+            path == name or path.startswith(f"{name}/") for name in allowed_untracked
+        ):
+            continue
+        unsafe.append(line)
+    if unsafe:
+        preview = "\n  - ".join(unsafe[:10])
+        suffix = "\n  - ..." if len(unsafe) > 10 else ""
+        raise ExpctlError(
+            f"experiment worktree is not clean: {worktree}\n  - {preview}{suffix}"
+        )
+
+
+def _ensure_worktree(
+    repo: Path,
+    worktree: Path,
+    commit: str,
+    *,
+    allowed_untracked: tuple[str, ...] = (),
+) -> None:
     if worktree.exists():
         if not (worktree / ".git").exists():
             raise ExpctlError(f"existing path is not a Git worktree: {worktree}")
+        top_level = Path(_git_text(worktree, "rev-parse", "--show-toplevel").strip())
+        if top_level.resolve() != worktree.resolve():
+            raise ExpctlError(f"existing path is not a worktree root: {worktree}")
+        if _git_common_dir(worktree) != _git_common_dir(repo):
+            raise ExpctlError(
+                f"existing worktree belongs to a different repository: {worktree}"
+            )
         actual = _git_text(worktree, "rev-parse", "HEAD").strip()
         if actual != commit:
             raise ExpctlError(
                 f"worktree {worktree} is at {actual}, expected {commit}; "
                 "choose a new request/worktree name"
             )
+        _check_worktree_clean(worktree, allowed_untracked)
         return
     _run(
         ["git", "worktree", "add", "--detach", str(worktree), commit],
         cwd=repo,
     )
+    _check_worktree_clean(worktree, allowed_untracked)
 
 
 def _ensure_runtime_links(repo: Path, config: Config, worktree: Path) -> dict[str, str]:
@@ -486,7 +822,7 @@ def _slurm_reservations(repo: Path) -> tuple[set[str], int]:
             user,
             "-h",
             "-t",
-            "PENDING,RUNNING,COMPLETING",
+            "PENDING,RUNNING,COMPLETING,CONFIGURING,SUSPENDED,RESIZING",
             "-o",
             "%T|%N|%D",
         ],
@@ -528,15 +864,104 @@ def _check_node_budget(repo: Path, config: Config, requested: int) -> dict[str, 
     }
 
 
-def build_sbatch_command(request: dict[str, Any]) -> list[str]:
+@contextlib.contextmanager
+def _git_metadata_lock(repo: Path, name: str, purpose: str) -> Iterator[None]:
+    if fcntl is None:
+        raise ExpctlError(
+            f"safe {purpose} locking requires POSIX fcntl; submit on the cluster host"
+        )
+    lock_text = _git_text(repo, "rev-parse", "--git-path", name).strip()
+    lock_path = Path(lock_text)
+    if not lock_path.is_absolute():
+        lock_path = repo / lock_path
+    lock_path = lock_path.resolve()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with lock_path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        raise ExpctlError(f"could not acquire {purpose} lock: {exc}") from exc
+
+
+@contextlib.contextmanager
+def _node_budget_guard(repo: Path) -> Iterator[None]:
+    """Serialize expctl's check-and-submit window within one Git checkout."""
+    with _git_metadata_lock(repo, "expctl-submit.lock", "node-budget submission"):
+        yield
+
+
+@contextlib.contextmanager
+def _worktree_submission_guard(repo: Path, worktree: Path) -> Iterator[None]:
+    digest = hashlib.sha256(str(worktree).encode("utf-8")).hexdigest()[:20]
+    with _git_metadata_lock(
+        repo, f"expctl-worktree-{digest}.lock", "worktree submission"
+    ):
+        yield
+
+
+def _check_worktree_available(
+    repo: Path,
+    config: Config,
+    worktree: Path,
+    experiment_id: str,
+) -> None:
+    """Refuse to share one worktree with another queued or uncertain run."""
+    receipts_root = repo / config.root / "results"
+    for other_path in receipts_root.glob("*/receipt.json"):
+        if other_path.parent.name == experiment_id:
+            continue
+        try:
+            other = _load_receipt(other_path)
+        except ExpctlError:
+            continue
+        other_worktree = other.get("worktree")
+        if not isinstance(other_worktree, str):
+            continue
+        try:
+            same_worktree = Path(other_worktree).resolve() == worktree.resolve()
+        except OSError:
+            same_worktree = False
+        if not same_worktree:
+            continue
+        other_id = other.get("experiment_id", other_path.parent.name)
+        job_id = other.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ExpctlError(
+                f"worktree {worktree} is claimed by {other_id} with an "
+                f"unconfirmed submission ({other.get('status', 'invalid')})"
+            )
+        queue = _queue_status(repo, job_id)
+        if queue:
+            raise ExpctlError(
+                f"worktree {worktree} is still used by {other_id} (job {job_id})"
+            )
+
+
+def build_sbatch_command(
+    request: dict[str, Any], policy_options: tuple[str, ...] = ()
+) -> list[str]:
     slurm = _table(request, "slurm")
     env = slurm.get("env", {})
     command = ["sbatch", "--parsable"]
     if env:
         exports = ",".join(f"{key}={value}" for key, value in sorted(env.items()))
         command.append(f"--export=ALL,{exports}")
+    command.extend(policy_options)
     command.append(slurm["script"])
     return command
+
+
+def _sbatch_environment() -> tuple[dict[str, str], list[str]]:
+    """Prevent ambient SBATCH_* options from overriding the pinned script."""
+    removed = sorted(key for key in os.environ if key.startswith("SBATCH_"))
+    environment = {
+        key: value for key, value in os.environ.items() if key not in removed
+    }
+    return environment, removed
 
 
 def submit_request(
@@ -548,7 +973,13 @@ def submit_request(
     skip_node_check: bool,
     worktree_root: Path | None,
 ) -> dict[str, Any]:
+    path = request_path(repo, config, experiment_id)
+    if not path.is_file():
+        raise ExpctlError(f"request not found: {path}")
+    request_hash = _request_hash(path)
     request, path = load_request(repo, config, experiment_id)
+    if _request_hash(path) != request_hash:
+        raise ExpctlError("request changed while it was being validated")
     receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
     if receipt_path.exists():
         raise ExpctlError(
@@ -558,55 +989,141 @@ def submit_request(
         )
 
     code = _table(request, "code")
-    worktree = (
-        worktree_root.resolve() / code["worktree"]
-        if worktree_root is not None
-        else _default_worktree(repo, config, request)
+    worktree = _worktree_path(repo, config, request, worktree_root)
+    policy_options = tuple(_required_sbatch_options(config.required_script_lines))
+    command = build_sbatch_command(request, policy_options)
+    sbatch_environment, cleared_sbatch_environment = _sbatch_environment()
+    script_lines = _git_text(
+        repo, "show", f"{code['commit']}:{request['slurm']['script']}"
+    ).splitlines()
+    verified_nodes = _script_max_concurrent_nodes(
+        script_lines, request["slurm"]["script"]
     )
-    command = build_sbatch_command(request)
     preview = {
         "experiment_id": experiment_id,
         "commit": code["commit"],
         "worktree": str(worktree),
         "command": command,
-        "max_concurrent_nodes": request["slurm"]["max_concurrent_nodes"],
+        "declared_max_concurrent_nodes": request["slurm"]["max_concurrent_nodes"],
+        "verified_max_concurrent_nodes": verified_nodes,
+        "cleared_sbatch_environment": cleared_sbatch_environment,
     }
     if dry_run:
         return preview
 
-    _ensure_worktree(repo, worktree, code["commit"])
-    runtime_dirs = _ensure_runtime_links(repo, config, worktree)
-    _check_requirements(worktree, request)
-    budget = None
-    if config.max_total_nodes and not skip_node_check:
-        budget = _check_node_budget(
-            repo, config, request["slurm"]["max_concurrent_nodes"]
-        )
-    result = _run(command, cwd=worktree)
-    job_id = result.stdout.strip().split(";", 1)[0]
-    if not job_id or not re.fullmatch(r"\d+(?:_\d+)?", job_id):
-        raise ExpctlError(f"could not parse sbatch job ID from: {result.stdout!r}")
-
-    receipt = {
+    attempt_id = uuid.uuid4().hex
+    pending: dict[str, Any] = {
         "schema_version": 1,
         "experiment_id": experiment_id,
-        "request_sha256": _request_hash(path),
+        "submission_attempt_id": attempt_id,
+        "request_sha256": request_hash,
         "branch_label": code["branch"],
         "commit": code["commit"],
         "worktree": str(worktree),
-        "job_id": job_id,
-        "submitted_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "started_at": dt.datetime.now(dt.UTC).isoformat(),
         "submitted_by": getpass.getuser(),
-        "status": "submitted",
-        "node_budget": budget,
-        "runtime_dirs": runtime_dirs,
+        "status": "preparing",
+        "declared_max_concurrent_nodes": request["slurm"]["max_concurrent_nodes"],
+        "verified_max_concurrent_nodes": verified_nodes,
+        "cleared_sbatch_environment": cleared_sbatch_environment,
         "sbatch_command": command,
     }
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_text(
-        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    return receipt
+    try:
+        _exclusive_write_text(
+            receipt_path, json.dumps(pending, indent=2, sort_keys=True) + "\n"
+        )
+    except ExpctlError:
+        if receipt_path.exists():
+            raise ExpctlError(
+                f"receipt already exists: {receipt_path} "
+                f"({_receipt_summary(repo, receipt_path)}). A request is submitted "
+                f"once; to run it again: expctl rerun {experiment_id}"
+            ) from None
+        raise
+
+    submission_started = False
+    try:
+        with _worktree_submission_guard(repo, worktree):
+            _check_worktree_available(repo, config, worktree, experiment_id)
+            _ensure_worktree(
+                repo,
+                worktree,
+                code["commit"],
+                allowed_untracked=config.shared_dirs,
+            )
+            runtime_dirs = _ensure_runtime_links(repo, config, worktree)
+            _check_requirements(worktree, request)
+
+            guard = (
+                _node_budget_guard(repo)
+                if config.max_total_nodes and not skip_node_check
+                else contextlib.nullcontext()
+            )
+            with guard:
+                budget = None
+                if config.max_total_nodes and not skip_node_check:
+                    budget = _check_node_budget(
+                        repo, config, request["slurm"]["max_concurrent_nodes"]
+                    )
+                if _request_hash(path) != request_hash:
+                    raise ExpctlError(
+                        "request changed while submission was being prepared"
+                    )
+                _check_worktree_clean(worktree, config.shared_dirs)
+
+                pending["status"] = "submitting"
+                pending["runtime_dirs"] = runtime_dirs
+                pending["node_budget"] = budget
+                pending["submitting_at"] = dt.datetime.now(dt.UTC).isoformat()
+                _atomic_write_json(receipt_path, pending)
+                submission_started = True
+                try:
+                    result = _run(command, cwd=worktree, env=sbatch_environment)
+                except ExpctlError as exc:
+                    pending["status"] = "submission_unknown"
+                    pending["submission_error"] = str(exc)
+                    _atomic_write_json(receipt_path, pending)
+                    raise ExpctlError(
+                        "sbatch did not return a confirmed job ID; submission outcome "
+                        f"is unknown and this request is locked. Inspect {receipt_path} "
+                        "and the scheduler before taking further action"
+                    ) from exc
+
+                job_id = result.stdout.strip().split(";", 1)[0]
+                if not job_id or not re.fullmatch(r"\d+(?:_\d+)?", job_id):
+                    pending["status"] = "submission_unknown"
+                    pending["submission_error"] = (
+                        f"could not parse sbatch job ID from: {result.stdout!r}"
+                    )
+                    _atomic_write_json(receipt_path, pending)
+                    raise ExpctlError(
+                        "sbatch returned an unrecognized response; submission outcome "
+                        f"is unknown and this request is locked. Inspect {receipt_path} "
+                        "and the scheduler before taking further action"
+                    )
+
+                receipt = dict(pending)
+                receipt["job_id"] = job_id
+                receipt["submitted_at"] = dt.datetime.now(dt.UTC).isoformat()
+                receipt["status"] = "submitted"
+                receipt.pop("submitting_at", None)
+                try:
+                    _atomic_write_json(receipt_path, receipt)
+                except ExpctlError as exc:
+                    raise ExpctlError(
+                        f"SLURM job {job_id} was submitted, but its receipt could not "
+                        f"be finalized at {receipt_path}; do not submit again: {exc}"
+                    ) from exc
+                return receipt
+    except BaseException:
+        if not submission_started:
+            try:
+                current = _load_receipt(receipt_path)
+                if current.get("submission_attempt_id") == attempt_id:
+                    receipt_path.unlink(missing_ok=True)
+            except (ExpctlError, OSError):
+                pass
+        raise
 
 
 def _queue_status(repo: Path, job_id: str) -> list[dict[str, str]]:
@@ -616,7 +1133,10 @@ def _queue_status(repo: Path, job_id: str) -> list[dict[str, str]]:
         check=False,
     )
     if result.returncode != 0:
-        return []
+        detail = result.stderr.strip() or result.stdout.strip()
+        if "invalid job id" in detail.lower():
+            return []  # Completed/purged jobs produce this on some SLURM versions.
+        raise ExpctlError(f"squeue query failed for job {job_id}: {detail}")
     rows: list[dict[str, str]] = []
     for line in result.stdout.splitlines():
         if not line.strip():
@@ -632,24 +1152,34 @@ def status_request(repo: Path, config: Config, experiment_id: str) -> dict[str, 
     load_request(repo, config, experiment_id, check_git=False)
     receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
     if not receipt_path.is_file():
-        raise ExpctlError(
-            f"not submitted yet: no receipt at {receipt_path}"
-        )
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    queue = _queue_status(repo, receipt["job_id"])
+        raise ExpctlError(f"not submitted yet: no receipt at {receipt_path}")
+    receipt = _load_receipt(receipt_path)
+    job_id = receipt.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        return {
+            "experiment_id": experiment_id,
+            "job_id": None,
+            "receipt_status": receipt.get("status", "invalid"),
+            "in_queue": False,
+            "detail": receipt.get(
+                "submission_error",
+                "submission has no confirmed job ID; inspect the receipt before retrying",
+            ),
+        }
+    queue = _queue_status(repo, job_id)
     counts: dict[str, int] = {}
     for row in queue:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
     payload: dict[str, Any] = {
         "experiment_id": experiment_id,
-        "job_id": receipt["job_id"],
+        "job_id": job_id,
         "receipt_status": receipt.get("status"),
         "in_queue": bool(queue),
         "queue_counts": counts,
         "queue": queue,
     }
     if not queue:
-        payload["accounting"] = _scheduler_status(repo, receipt["job_id"])
+        payload["accounting"] = _scheduler_status(repo, job_id)
     return payload
 
 
@@ -690,24 +1220,61 @@ def _scheduler_status(repo: Path, job_id: str) -> dict[str, Any]:
 
 
 def collect_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
-    request, path = load_request(repo, config, experiment_id)
+    request, path = load_request(repo, config, experiment_id, check_git=False)
     destination = result_dir(repo, config, experiment_id)
     receipt_path = destination / "receipt.json"
     if not receipt_path.is_file():
         raise ExpctlError(f"submission receipt not found: {receipt_path}")
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt = _load_receipt(receipt_path)
     if receipt.get("request_sha256") != _request_hash(path):
         raise ExpctlError(
             "request changed after submission; restore it before collecting results"
         )
 
-    worktree = Path(receipt["worktree"])
+    job_id = receipt.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise ExpctlError(
+            f"submission has no confirmed job ID (receipt status: "
+            f"{receipt.get('status', 'invalid')})"
+        )
+    queue = _queue_status(repo, job_id)
+    if queue:
+        states = ", ".join(
+            f"{state}={count}"
+            for state, count in sorted(
+                {
+                    state: sum(row["state"] == state for row in queue)
+                    for state in {row["state"] for row in queue}
+                }.items()
+            )
+        )
+        raise ExpctlError(
+            f"job {job_id} is still in the queue ({states}); collect after it leaves"
+        )
+
+    worktree_text = receipt.get("worktree")
+    if not isinstance(worktree_text, str) or not worktree_text:
+        raise ExpctlError("submission receipt has no valid worktree path")
+    worktree = Path(worktree_text)
     if not worktree.is_dir():
         raise ExpctlError(f"submission worktree is missing: {worktree}")
-    pattern = request["outputs"]["log_glob"].format(job_id=receipt["job_id"])
-    sources = sorted(worktree.glob(pattern))
+    pattern = request["outputs"]["log_glob"].format(job_id=job_id)
+    sources = sorted(source for source in worktree.glob(pattern) if source.is_file())
     if not sources:
-        raise ExpctlError(f"no logs match {worktree / pattern}")
+        raise ExpctlError(f"no log files match {worktree / pattern}")
+
+    names: dict[str, list[Path]] = {}
+    for source in sources:
+        names.setdefault(source.name.casefold(), []).append(source)
+    collisions = [matches for matches in names.values() if len(matches) > 1]
+    if collisions:
+        rendered = "; ".join(
+            ", ".join(str(path) for path in matches) for matches in collisions
+        )
+        raise ExpctlError(
+            "log files have colliding basenames and cannot be collected safely: "
+            f"{rendered}"
+        )
 
     logs_dir = destination / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -715,38 +1282,34 @@ def collect_request(repo: Path, config: Config, experiment_id: str) -> dict[str,
     metrics: dict[str, dict[str, float]] = {}
     copied: list[str] = []
     for source in sources:
-        if not source.is_file():
-            continue
         target = logs_dir / source.name
-        shutil.copy2(source, target)
+        _atomic_copy2(source, target)
         copied.append(str(target.relative_to(repo)).replace("\\", "/"))
         metrics[source.name] = extract_metrics(
-            source.read_text(encoding="utf-8", errors="replace"), metric_names
+            target.read_text(encoding="utf-8", errors="replace"), metric_names
         )
 
     metrics_path = destination / "metrics.json"
-    metrics_path.write_text(
-        json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    _atomic_write_json(metrics_path, metrics)
+    found_metrics = {metric for values in metrics.values() for metric in values}
     collection = {
-        "collected_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "collected_at": dt.datetime.now(dt.UTC).isoformat(),
         "logs": copied,
         "metrics_file": str(metrics_path.relative_to(repo)).replace("\\", "/"),
-        "scheduler": _scheduler_status(repo, receipt["job_id"]),
+        "missing_metrics": sorted(set(metric_names) - found_metrics),
+        "scheduler": _scheduler_status(repo, job_id),
     }
     receipt["status"] = "collected"
     receipt["collection"] = collection
-    receipt_path.write_text(
-        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    _atomic_write_json(receipt_path, receipt)
     return collection
 
 
 def _receipt_summary(repo: Path, receipt_path: Path) -> str:
     """One line about an existing receipt: who submitted what, and how it ended."""
     try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        receipt = _load_receipt(receipt_path)
+    except ExpctlError:
         return "unreadable receipt"
     parts: list[str] = []
     job_id = receipt.get("job_id")
@@ -801,12 +1364,18 @@ def rerun_request(
         raise ExpctlError(
             f"nothing to rerun: {experiment_id} has no receipt; submit it instead"
         )
+    receipt = _load_receipt(receipt_path)
+    if not isinstance(receipt.get("job_id"), str) or not receipt["job_id"]:
+        raise ExpctlError(
+            f"nothing to rerun safely: {experiment_id} has no confirmed job ID "
+            f"(receipt status: {receipt.get('status', 'invalid')})"
+        )
     if new_id is None:
         new_id = _next_rerun_id(repo, config, experiment_id)
     new_path = request_path(repo, config, new_id)
     if new_path.exists():
         raise ExpctlError(f"request already exists: {new_path}")
-    if reason is not None and any(c in reason for c in "\"\\\n\r"):
+    if reason is not None and any(c in reason for c in '"\\\n\r'):
         raise ExpctlError(
             "rerun reason cannot contain quotes, backslashes, or newlines"
         )
@@ -817,23 +1386,25 @@ def rerun_request(
         source = handle.read()
     for line in source.splitlines(keepends=True):
         body = line.rstrip("\r\n")
-        newline = line[len(body):]
+        newline = line[len(body) :]
         if body.lstrip().startswith("["):
             in_table = True
-        if not in_table and not replaced and ID_LINE_RE.match(body):
-            output.append(f'id = "{new_id}"{newline}')
-            output.append(f'rerun_of = "{experiment_id}"{newline}')
+        id_match = ID_LINE_RE.match(body)
+        if not in_table and not replaced and id_match:
+            indent = id_match.group(1)
+            output.append(f'{indent}id = "{new_id}"{newline}')
+            output.append(f'{indent}rerun_of = "{experiment_id}"{newline}')
             if reason is not None:
-                output.append(f'rerun_reason = "{reason}"{newline}')
+                output.append(f'{indent}rerun_reason = "{reason}"{newline}')
             replaced = True
             continue
-        if not in_table and re.match(r"^rerun_(of|reason)\s*=", body):
+        if not in_table and re.match(r"^\s*rerun_(of|reason)\s*=", body):
             continue
         output.append(line)
     if not replaced:
         raise ExpctlError(f"could not find the top-level id line in {path}")
 
-    new_path.write_text("".join(output), encoding="utf-8", newline="")
+    _exclusive_write_text(new_path, "".join(output))
     try:
         request, _ = load_request(repo, config, new_id, check_git=check_git)
     except ExpctlError:
@@ -858,13 +1429,9 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
             receipt = result_dir(repo, config, experiment_id) / "receipt.json"
             status = "requested"
             if receipt.is_file():
-                status = json.loads(receipt.read_text(encoding="utf-8")).get(
-                    "status", "submitted"
-                )
-            rows.append(
-                {"id": experiment_id, "status": status, "title": data["title"]}
-            )
-        except (ExpctlError, json.JSONDecodeError) as exc:
+                status = _load_receipt(receipt).get("status", "invalid")
+            rows.append({"id": experiment_id, "status": status, "title": data["title"]})
+        except ExpctlError as exc:
             rows.append({"id": experiment_id, "status": "invalid", "title": str(exc)})
     return rows
 
@@ -874,9 +1441,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="expctl",
         description="Manage repository-backed asynchronous experiment handoffs.",
     )
-    parser.add_argument(
-        "--version", action="version", version=f"expctl {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"expctl {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser(

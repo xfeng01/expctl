@@ -90,16 +90,18 @@ expctl submit <id> --dry-run
 expctl submit <id>
 ```
 
-`--dry-run` 会验证请求并输出固定提交、worktree 路径、`sbatch` 命令和声明的节点数。它不会创建 worktree、链接共享目录、检查运行时依赖或节点预算，也不会调用 `sbatch`。
+`--dry-run` 会验证请求并输出固定提交、worktree 路径、`sbatch` 命令、声明的节点上限和从作业脚本推导出的节点上限。它不会创建 worktree、链接共享目录、检查运行时依赖或当前节点预算，也不会调用 `sbatch`。
 
 正式提交时，expctl 依次执行：
 
-1. 创建或验证位于固定提交上的 detached worktree；
-2. 链接 `runtime.shared_dirs`，并检查 `notes.requirements`；
-3. 若启用节点预算，查询当前用户的 SLURM 作业并校验上限；
-4. 调用 `sbatch --parsable`，将作业号和请求哈希写入回执。
+1. 以独占方式创建 `preparing` 回执，阻止同一请求被并发提交；
+2. 创建或验证属于当前仓库、位于固定提交且内容干净的 detached worktree；
+3. 从固定脚本的 `#SBATCH --nodes`、`--array` 和 `%N` 节流值核验最坏并发节点数；
+4. 链接 `runtime.shared_dirs`，并检查 `notes.requirements`；
+5. 若启用节点预算，在本 Git checkout 内锁住“查询—提交”窗口并校验上限；
+6. 清除宿主环境中的 `SBATCH_*` 选项，调用 `sbatch --parsable`，再原子写入作业号和请求哈希。
 
-已有回执的请求不能再次提交：`submit` 会报出那次提交的作业号、提交人和 `sacct` 终态。需要再跑一次时用 `expctl rerun <id>`（见第八节），不要删除回执。若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 `receipt.json`。
+已有回执的请求不能再次提交。若 `sbatch` 没有返回可确认的作业号，回执会保留为 `submission_unknown`；此时必须先由操作者在调度器中对账，不能删除回执或自动重试。已确认作业需要再跑一次时使用 `expctl rerun <id>`（见第八节）。若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 `receipt.json`。
 
 查看状态：
 
@@ -107,7 +109,7 @@ expctl submit <id>
 expctl status <id>
 ```
 
-`in_queue: true` 表示 `squeue` 仍能查到该作业或其数组任务。作业离开队列后，expctl 改用 `sacct` 返回状态和退出码；查询失败或无记录时返回 `UNKNOWN`。
+`in_queue: true` 表示 `squeue` 仍能查到该作业或其数组任务。作业离开队列后，expctl 改用 `sacct` 返回状态和退出码；`squeue` 查询失败会明确报错，`sacct` 查询失败或无记录时返回 `UNKNOWN`。
 
 确认作业结束且日志写入完成后收集结果：
 
@@ -118,11 +120,11 @@ expctl collect <id>
 `collect` 会：
 
 - 校验请求文件的 SHA-256 是否与回执一致；
-- 将匹配 `outputs.log_glob` 的日志复制到 `<root>/results/<id>/logs/`；
-- 按日志文件提取指标并写入 `metrics.json`；
+- 先确认作业已经离开 `squeue`，再将匹配 `outputs.log_glob` 且文件名不冲突的日志原子复制到 `<root>/results/<id>/logs/`；
+- 从复制后的日志提取指标并写入 `metrics.json`，在回执中记录 `missing_metrics`；
 - 将 `sacct` 结果写入回执，并把回执状态改为 `collected`。
 
-`collect` 不会等待作业，也不会判断日志是否完整。没有匹配日志时会报错。完成后应审阅原始日志，按 `decision_rule` 写入 `<root>/results/<id>/report.md`，再提交并推送结果目录。
+`collect` 不会等待作业；作业仍在队列、没有匹配日志或不同来源日志会覆盖同一目标文件名时都会报错。指标缺失不会阻止失败作业的证据收集，但会明确记录。完成后应审阅原始日志，按 `decision_rule` 写入 `<root>/results/<id>/report.md`，再提交并推送结果目录。
 
 ## 五、请求文件参考
 
@@ -134,9 +136,9 @@ expctl collect <id>
 | `decision_rule` | 哪种结果会改变下一步决策 |
 | `code.commit` | 完整的 40 位 Git 提交哈希；这是实际运行的代码版本 |
 | `code.branch` | 仅供阅读的分支标签，不参与检出或校验 |
-| `code.worktree` | 实验 worktree 的目录名；一个请求应使用一个唯一名称 |
+| `code.worktree` | 实验 worktree 的普通目录名（不能是 `.` 或 `..`）；不得与主仓库重叠 |
 | `slurm.script` | 固定提交中的仓库相对路径，不得越出仓库 |
-| `slurm.max_concurrent_nodes` | 本请求最坏情况下的并发节点数，至少为 1，且不能超过非零的 `scheduler.max_total_nodes`；该值由请求者声明，工具不会从作业脚本推导 |
+| `slurm.max_concurrent_nodes` | 本请求允许的最坏并发节点数，至少为 1，且不能超过非零的 `scheduler.max_total_nodes`；固定脚本必须显式写出数字形式的 `#SBATCH --nodes`，数组范围和 `%N` 节流也必须可静态解析，推导值不得超过这里的声明 |
 | `slurm.env` | 传给 `sbatch --export` 的环境变量；名称须匹配 `[A-Za-z_][A-Za-z0-9_]*` 且不能是 `GROUPS`，值必须是字符串且不能包含逗号或换行 |
 | `outputs.log_glob` | 相对于实验 worktree 的 glob，不得越出 worktree，且必须包含 `{job_id}` |
 | `outputs.metrics` | 非空指标名数组；可提取的名称须匹配 `[A-Za-z_][A-Za-z0-9_.-]*`，对应值必须是独占一行的数字 |
@@ -146,6 +148,8 @@ expctl collect <id>
 | `rerun_reason` | 可选，顶层字段；`expctl rerun --reason` 记录的重跑原因 |
 
 支持 `name: 1.2`、`name = 1.2` 和 `name  1.2` 三种完整行。指标名必须完全匹配；单个日志中同名指标出现多次时保留最后一个值，未找到的指标不写入结果。`metrics.json` 按日志文件分组。
+
+复用 worktree 时，expctl 会验证它属于当前 Git 仓库、`HEAD` 等于固定提交，而且除 `runtime.shared_dirs` 外没有 tracked、untracked 或 ignored 变更。同一 worktree 若仍有已记录的排队/运行作业或结果不确定的提交，也不能再次使用。
 
 ## 六、配置参考
 
@@ -168,13 +172,13 @@ root = ".."
 ```
 
 - `paths.root`：请求、结果和模板的仓库相对目录。
-- `scheduler.required_script_lines`：必须在固定提交的作业脚本中完整、逐行匹配的文本。
+- `scheduler.required_script_lines`：必须出现在固定脚本可生效的头部区域；其中的 `#SBATCH` 选项还会作为 `sbatch` 命令行参数再次传入，防止后续脚本选项覆盖分区、账号或 QOS 策略。
 - `scheduler.max_total_nodes`：当前用户的跨作业节点上限；`0` 表示禁用检查。
 - `runtime.shared_dirs`：从主工作树链接到实验 worktree 的顶层目录名。源目录不存在时跳过。
 - `runtime.create_missing`：提交前可在主工作树中自动创建的共享目录，必须是 `shared_dirs` 的子集。
 - `worktree.root`：实验 worktree 的父目录；相对路径以仓库根目录为基准。
 
-节点预算按以下方式计算：`RUNNING` 和 `COMPLETING` 作业按实际节点名去重，`PENDING` 作业按 `squeue` 报告的节点数累加，再加上请求中的 `slurm.max_concurrent_nodes`。数组任务使用 `squeue -r` 展开，因此该检查有意偏保守。`--skip-node-check` 会跳过此检查，只应在操作者明确授权后使用。
+节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURING`、`SUSPENDED` 和 `RESIZING` 作业按实际节点名去重，`PENDING` 作业按 `squeue` 报告的节点数累加，再加上请求中的 `slurm.max_concurrent_nodes`。数组任务使用 `squeue -r` 展开，因此该检查有意偏保守。expctl 会在同一 Git checkout 内串行化预算查询和 `sbatch`，但不同 clone 或人工提交之间的硬上限仍应由 SLURM QOS/account 策略保证。`--skip-node-check` 会跳过此检查，只应在操作者明确授权后使用。
 
 ## 七、命令与状态
 
@@ -195,6 +199,9 @@ root = ".."
 
 ```text
 requested  只有有效的请求文件
+preparing  已独占请求，正在执行提交前检查
+submitting 已开始调用 sbatch，尚未持久化确认的作业号
+submission_unknown  sbatch 结果不确定，必须人工对账且不能自动重试
 submitted  已生成回执
 collected  已执行 collect
 invalid    请求验证失败，或回执不是有效的 JSON
@@ -205,6 +212,7 @@ invalid    请求验证失败，或回执不是有效的 JSON
 ## 八、异常处理与自动化约定
 
 - **请求在提交作业后被修改**：恢复与回执中 `request_sha256` 完全一致的文件；否则 `collect` 会拒绝执行。
+- **提交结果不确定**：保留 `submission_unknown` 回执，根据其中的时间、命令和操作者信息查询 SLURM；确认是否存在作业前不得删除回执、执行 `rerun` 或再次提交。
 - **节点预算不足**：等待已有作业释放节点后重试。不要通过修改旧请求或静默重提绕过限制。
 - **作业失败、超时或被抢占**：保留原回执和日志，在报告中记录失败原因。代码不需要改动时（抢占、节点故障、共享环境未就绪），运行方直接执行 `expctl rerun <id> --reason "preempted"`，提交生成的 `<id>-r2.toml`，再 `expctl submit <id>-r2`；commit 和 worktree 不变，位于固定提交上的已有 worktree 会被复用。需要改代码时由请求方修正、提交，并发布固定新提交的新请求。任何情况下都不要删除回执重提。
 - **日志未找到**：核对作业是否结束、`outputs.log_glob` 是否包含正确的 `{job_id}` 位置，以及日志是否写在固定 worktree 中。

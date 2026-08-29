@@ -19,7 +19,8 @@ weaken the repository's own cluster and branch rules here.
 - To inspect the queue, run `expctl list`, then `show` or `validate` the
   selected request. Report invalid or ambiguous requests instead of guessing.
 - To submit, first show the operator the pinned commit, job script, runtime
-  requirements, maximum node count, and `--dry-run` output. An explicit request
+  requirements, declared and verified maximum node counts, and `--dry-run`
+  output. An explicit request
   to consume cluster resources is required before the real
   `expctl submit <id>`; never substitute `git pull && sbatch`.
 - To check a submitted run, use `expctl status <id>`. Report the queue counts
@@ -39,6 +40,9 @@ weaken the repository's own cluster and branch rules here.
   rerun of unchanged code is `expctl rerun <id> --reason "..."` (a new
   request ID); a corrected checkpoint or changed code is a new request
   written by the author.
+- If a receipt says `preparing`, `submitting`, or `submission_unknown`, stop and
+  ask the operator to reconcile it with SLURM. Do not delete it, rerun it, or
+  infer that no job exists merely because no job ID was recorded.
 - Never add checkpoints, datasets, credentials, caches, or unreviewed
   sensitive output to Git.
 - Do not use `--skip-node-check` autonomously. If scheduler status is
