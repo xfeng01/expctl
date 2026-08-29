@@ -71,7 +71,7 @@ Runner side (on the cluster):
 
 ```bash
 git pull --ff-only
-expctl list                     # what is requested
+expctl list                     # aligned table in a terminal; TSV when piped
 expctl show <id>                # read it before spending resources
 expctl submit <id> --dry-run    # preview commit, worktree, sbatch command
 expctl submit <id>              # detached worktree + budget check + sbatch
@@ -86,7 +86,7 @@ expctl rerun <id> --reason "preempted"   # same code again? new request <id>-r2
 | command | what it does |
 |---|---|
 | `init` | create `expctl.toml` and the `expctl/` skeleton |
-| `list` | all requests with their repository state, including in-progress or uncertain submission states |
+| `list` | all requests with their repository state. Interactive output is an aligned, terminal-width-aware table; pipes receive stable TSV. Use `--table`, `--tsv`, `--json`, or `--no-color` to override formatting |
 | `validate <id>` | schema check, plus: pinned commit exists and its job script contains every `required_script_lines` entry |
 | `show <id>` | print the validated request as JSON |
 | `submit <id>` | exclusively claim the request, create/verify a clean detached worktree from this repository at the pinned commit, verify the script's node envelope and `notes.requirements`, check the cross-job node budget via `squeue`, run `sbatch --parsable`, and atomically finalize the receipt. `--dry-run` previews; `--skip-node-check` needs explicit operator authorization |

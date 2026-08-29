@@ -90,6 +90,8 @@ expctl submit <id> --dry-run
 expctl submit <id>
 ```
 
+`expctl list` 在交互终端中自动显示按终端宽度对齐的表格，中文按实际显示宽度计算，过长标题以 `…` 截断；状态在支持颜色的终端中会着色。输出到管道或文件时自动使用稳定的 TSV。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color`（以及标准 `NO_COLOR` 环境变量）关闭颜色。
+
 `--dry-run` 会验证请求并输出固定提交、worktree 路径、`sbatch` 命令、声明的节点上限和从作业脚本推导出的节点上限。它不会创建 worktree、链接共享目录、检查运行时依赖或当前节点预算，也不会调用 `sbatch`。
 
 正式提交时，expctl 依次执行：
@@ -185,7 +187,7 @@ root = ".."
 | 命令 | 作用 |
 |---|---|
 | `expctl init` | 补齐默认配置和目录结构 |
-| `expctl list` | 列出请求及其仓库状态 |
+| `expctl list [--table\|--tsv\|--json] [--no-color]` | 列出请求及其仓库状态；终端默认表格，管道默认 TSV |
 | `expctl validate <id>` | 验证请求、固定提交和作业脚本策略 |
 | `expctl show <id>` | 将验证后的请求输出为 JSON |
 | `expctl submit <id>` | 准备 worktree、检查依赖和预算，并提交 SLURM 作业 |

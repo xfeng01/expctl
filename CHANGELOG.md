@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 — 2026-08-28
+
+- `expctl list` now renders an aligned, width-aware table on interactive
+  terminals, including correct CJK column widths, safe truncation, and optional
+  status colors. Redirected output remains stable TSV.
+- Added `expctl list --table`, `--tsv`, `--json`, and `--no-color`.
+- List cells are restricted to one safe terminal line, and output degrades
+  cleanly when the terminal encoding cannot represent Unicode table rules.
+
 ## 0.4.0 — 2026-08-28
 
 - Submission now claims a `preparing` receipt exclusively before `sbatch`,

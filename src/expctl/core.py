@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import unicodedata
 import uuid
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -44,7 +45,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -1419,6 +1420,148 @@ def rerun_request(
     }
 
 
+LIST_HEADERS = ("EXPERIMENT ID", "STATUS", "TITLE")
+STATUS_COLORS = {
+    "requested": "\x1b[36m",
+    "preparing": "\x1b[33m",
+    "submitting": "\x1b[33m",
+    "submission_unknown": "\x1b[31m",
+    "submitted": "\x1b[34m",
+    "collected": "\x1b[32m",
+    "invalid": "\x1b[31m",
+}
+ANSI_RESET = "\x1b[0m"
+
+
+def _safe_list_cell(value: object) -> str:
+    """Keep one request field on one terminal line without control sequences."""
+    output: list[str] = []
+    for character in str(value):
+        if character in "\t\r\n":
+            output.append(" ")
+        elif unicodedata.category(character).startswith("C"):
+            output.append("?")
+        else:
+            output.append(character)
+    return "".join(output)
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for character in value:
+        if unicodedata.combining(character) or unicodedata.category(character) in {
+            "Mn",
+            "Me",
+        }:
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+    return width
+
+
+def _stdout_safe(value: str) -> str:
+    encoding = sys.stdout.encoding or "utf-8"
+    try:
+        value.encode(encoding)
+        return value
+    except LookupError:
+        return value
+    except UnicodeEncodeError:
+        return value.encode(encoding, errors="replace").decode(encoding)
+
+
+def _list_rule_character() -> str:
+    return "─" if _stdout_safe("─") == "─" else "-"
+
+
+def _fit_list_cell(value: str, width: int) -> str:
+    if width < 1:
+        return ""
+    if _display_width(value) <= width:
+        return value + " " * (width - _display_width(value))
+    if width == 1:
+        return "…"
+    output: list[str] = []
+    used = 0
+    for character in value:
+        character_width = _display_width(character)
+        if used + character_width > width - 1:
+            break
+        output.append(character)
+        used += character_width
+    return "".join(output) + "…" + " " * (width - used - 1)
+
+
+def _list_table_widths(
+    rows: list[dict[str, str]], terminal_width: int
+) -> tuple[int, int, int]:
+    terminal_width = max(12, terminal_width)
+    id_natural = max(
+        _display_width(LIST_HEADERS[0]),
+        *(_display_width(row["id"]) for row in rows),
+    )
+    status_natural = max(
+        _display_width(LIST_HEADERS[1]),
+        *(_display_width(row["status"]) for row in rows),
+    )
+    title_natural = max(
+        _display_width(LIST_HEADERS[2]),
+        *(_display_width(row["title"]) for row in rows),
+    )
+    gap_width = 4
+    minimum_title = max(1, min(8, terminal_width // 4))
+    fixed_space = max(2, terminal_width - gap_width - minimum_title)
+    status_width = min(
+        status_natural, max(1, min(terminal_width // 4, fixed_space - 1))
+    )
+    id_width = min(id_natural, max(1, fixed_space - status_width))
+    title_width = max(
+        1, min(title_natural, terminal_width - gap_width - id_width - status_width)
+    )
+    return id_width, status_width, title_width
+
+
+def _render_list_table(
+    rows: list[dict[str, str]], *, terminal_width: int, color: bool
+) -> str:
+    if not rows:
+        return "No experiment requests."
+    safe_rows = [
+        {key: _safe_list_cell(row[key]) for key in ("id", "status", "title")}
+        for row in rows
+    ]
+    widths = _list_table_widths(safe_rows, terminal_width)
+    header = "  ".join(
+        _fit_list_cell(value, width)
+        for value, width in zip(LIST_HEADERS, widths, strict=True)
+    ).rstrip()
+    rule = _list_rule_character()
+    separator = "  ".join(rule * width for width in widths).rstrip()
+    lines = [header, separator]
+    for row in safe_rows:
+        identifier = _fit_list_cell(row["id"], widths[0])
+        status = _fit_list_cell(row["status"], widths[1])
+        title = _fit_list_cell(row["title"], widths[2]).rstrip()
+        if color and row["status"] in STATUS_COLORS:
+            status = f"{STATUS_COLORS[row['status']]}{status}{ANSI_RESET}"
+        lines.append(f"{identifier}  {status}  {title}".rstrip())
+    return "\n".join(lines)
+
+
+def _render_list_tsv(rows: list[dict[str, str]]) -> str:
+    return "\n".join(
+        "\t".join(_safe_list_cell(row[key]) for key in ("id", "status", "title"))
+        for row in rows
+    )
+
+
+def _list_color_enabled() -> bool:
+    return (
+        sys.stdout.isatty()
+        and "NO_COLOR" not in os.environ
+        and os.environ.get("TERM") != "dumb"
+    )
+
+
 def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
     requests_dir = repo / config.root / "requests"
     rows: list[dict[str, str]] = []
@@ -1429,7 +1572,12 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
             receipt = result_dir(repo, config, experiment_id) / "receipt.json"
             status = "requested"
             if receipt.is_file():
-                status = _load_receipt(receipt).get("status", "invalid")
+                stored_status = _load_receipt(receipt).get("status")
+                status = (
+                    stored_status
+                    if isinstance(stored_status, str) and stored_status
+                    else "invalid"
+                )
             rows.append({"id": experiment_id, "status": status, "title": data["title"]})
         except ExpctlError as exc:
             rows.append({"id": experiment_id, "status": "invalid", "title": str(exc)})
@@ -1448,7 +1596,35 @@ def _parser() -> argparse.ArgumentParser:
         "init", help=f"create {CONFIG_NAME} and the {DEFAULT_ROOT}/ skeleton"
     )
 
-    subparsers.add_parser("list", help="list requests and their repository state")
+    listing = subparsers.add_parser(
+        "list", help="list requests and their repository state"
+    )
+    list_formats = listing.add_mutually_exclusive_group()
+    list_formats.add_argument(
+        "--table",
+        dest="list_format",
+        action="store_const",
+        const="table",
+        help="force an aligned table even when output is redirected",
+    )
+    list_formats.add_argument(
+        "--tsv",
+        dest="list_format",
+        action="store_const",
+        const="tsv",
+        help="force stable tab-separated output",
+    )
+    list_formats.add_argument(
+        "--json",
+        dest="list_format",
+        action="store_const",
+        const="json",
+        help="emit a JSON array",
+    )
+    listing.set_defaults(list_format="auto")
+    listing.add_argument(
+        "--no-color", action="store_true", help="disable status colors in table output"
+    )
 
     validate = subparsers.add_parser("validate", help="validate one request")
     validate.add_argument("experiment_id")
@@ -1511,10 +1687,21 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(repo)
         if args.command == "list":
             rows = list_requests(repo, config)
-            if not rows:
-                print("No experiment requests.")
-            for row in rows:
-                print(f"{row['id']}\t{row['status']}\t{row['title']}")
+            output_format = args.list_format
+            if output_format == "auto":
+                output_format = "table" if sys.stdout.isatty() else "tsv"
+            if output_format == "json":
+                output = json.dumps(rows, indent=2, ensure_ascii=True, sort_keys=True)
+            elif output_format == "table":
+                output = _render_list_table(
+                    rows,
+                    terminal_width=shutil.get_terminal_size(fallback=(120, 24)).columns,
+                    color=_list_color_enabled() and not args.no_color,
+                )
+            else:
+                output = _render_list_tsv(rows)
+            if output:
+                print(_stdout_safe(output))
         elif args.command == "validate":
             load_request(repo, config, args.experiment_id)
             print(f"valid: {args.experiment_id}")

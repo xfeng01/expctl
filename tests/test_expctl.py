@@ -256,6 +256,78 @@ def test_extract_metrics_reads_column_aligned_lines() -> None:
     }
 
 
+def test_list_table_aligns_cjk_and_truncates_to_terminal_width() -> None:
+    rows = [
+        {
+            "id": "20260828-decoder-cross-repo",
+            "status": "requested",
+            "title": "跨仓库解码器实验：这个标题需要被安全截断",
+        },
+        {
+            "id": "20260828-decoder-metric",
+            "status": "submission_unknown",
+            "title": "line one\nline two\x1b[31m",
+        },
+    ]
+
+    table = core._render_list_table(rows, terminal_width=80, color=False)
+    lines = table.splitlines()
+
+    assert lines[0].startswith("EXPERIMENT ID")
+    assert len(lines) == 4
+    assert all(core._display_width(line) <= 80 for line in lines)
+    assert "…" in table
+    assert "line one line two?[31m" in table
+    assert core._display_width("实验A") == 5
+    narrow = core._render_list_table(rows, terminal_width=30, color=False)
+    assert all(core._display_width(line) <= 30 for line in narrow.splitlines())
+
+
+def test_list_table_colors_status_only_when_requested() -> None:
+    rows = [{"id": EXAMPLE_ID, "status": "collected", "title": "done"}]
+
+    plain = core._render_list_table(rows, terminal_width=80, color=False)
+    colored = core._render_list_table(rows, terminal_width=80, color=True)
+
+    assert "\x1b[" not in plain
+    assert "\x1b[32m" in colored
+    assert colored.endswith("done")
+
+
+def test_list_tsv_is_single_line_per_request_and_parser_exposes_formats() -> None:
+    rows = [{"id": EXAMPLE_ID, "status": "requested", "title": "a\tb\nc"}]
+
+    assert core._render_list_tsv(rows) == f"{EXAMPLE_ID}\trequested\ta b c"
+    assert core._parser().parse_args(["list", "--table"]).list_format == "table"
+    assert core._parser().parse_args(["list", "--tsv"]).list_format == "tsv"
+    assert core._parser().parse_args(["list", "--json"]).list_format == "json"
+
+
+def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rows = [{"id": EXAMPLE_ID, "status": "requested", "title": "中文标题"}]
+    config = Config(
+        root="expctl",
+        required_script_lines=(),
+        max_total_nodes=0,
+        shared_dirs=(),
+        create_missing=(),
+        worktree_root="..",
+    )
+    monkeypatch.setattr(core, "find_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(core, "load_config", lambda repo: config)
+    monkeypatch.setattr(core, "list_requests", lambda repo, loaded: rows)
+
+    assert core.main(["list"]) == 0
+    assert capsys.readouterr().out == f"{EXAMPLE_ID}\trequested\t中文标题\n"
+
+    assert core.main(["list", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == rows
+
+
 def test_invalid_id_is_rejected(tmp_path: Path) -> None:
     repo = _example_repo(tmp_path)
     config = load_config(repo)
