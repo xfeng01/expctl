@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.1 — 2026-08-29
+
+- Worktree reuse and cleanup now fail safely when any receipt cannot be read
+  or lacks a resolvable absolute worktree, instead of ignoring potentially
+  active ownership evidence.
+- `logs --follow` now tracks a stable file identity and byte cursor from one
+  open-file snapshot, preventing concurrent appends from being skipped or
+  emitted twice and safely restarting when truncation is observed.
+- Request validation now enforces the documented `outputs.metrics` name
+  grammar used by metric extraction.
+
 ## 0.7.0 — 2026-08-29
 
 - Added audited `cancel`, live or collected `logs`, and guarded `clean`

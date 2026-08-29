@@ -267,6 +267,17 @@ def test_log_glob_rejects_unknown_placeholders_cleanly(tmp_path: Path) -> None:
         load_request(repo, config, EXAMPLE_ID, check_git=False)
 
 
+def test_metric_names_must_match_the_extractor_grammar(tmp_path: Path) -> None:
+    request = EXAMPLE_REQUEST.replace(
+        'metrics = ["gen_ppl"]', 'metrics = ["loss total"]'
+    )
+    repo = _example_repo(tmp_path, request)
+    config = load_config(repo)
+
+    with pytest.raises(ExpctlError, match="outputs.metrics entries must match"):
+        load_request(repo, config, EXAMPLE_ID, check_git=False)
+
+
 def test_script_node_envelope_includes_array_throttle() -> None:
     lines = ["#!/bin/bash", "#SBATCH --nodes=2", "#SBATCH --array=0-9%3"]
 
@@ -1133,6 +1144,50 @@ def test_parser_exposes_cancel_logs_clean_and_status_watch() -> None:
     assert status.watch == 5.0
 
 
+def test_log_cursor_never_skips_appends_and_detects_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "job.out"
+    initial = b"first\nsecond\n"
+    path.write_bytes(initial)
+
+    content, cursor, reset = core._read_log_update(path, None, tail=1)
+    assert content == "second\n"
+    assert reset is True
+    assert cursor[2] == len(initial)
+
+    real_fstat = core.os.fstat
+    appended = False
+
+    def fstat_then_append(file_descriptor: int) -> object:
+        nonlocal appended
+        stat = real_fstat(file_descriptor)
+        if not appended:
+            with path.open("ab") as handle:
+                handle.write(b"third\n")
+            appended = True
+        return stat
+
+    monkeypatch.setattr(core.os, "fstat", fstat_then_append)
+    content, unchanged_cursor, reset = core._read_log_update(path, cursor, tail=1)
+    assert content == ""
+    assert unchanged_cursor == cursor
+    assert reset is False
+    assert cursor[2] < path.stat().st_size
+
+    monkeypatch.setattr(core.os, "fstat", real_fstat)
+    content, cursor, reset = core._read_log_update(path, cursor, tail=1)
+    assert content == "third\n"
+    assert reset is False
+    assert cursor[2] == path.stat().st_size
+
+    path.write_bytes(b"new\n")
+    content, cursor, reset = core._read_log_update(path, cursor, tail=1)
+    assert content == "new\n"
+    assert reset is True
+    assert cursor[2] == path.stat().st_size
+
+
 def test_follow_logs_stops_when_a_terminal_job_produced_no_logs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1267,6 +1322,30 @@ def test_an_active_job_blocks_reuse_of_its_worktree(
 
     with pytest.raises(ExpctlError, match="still used"):
         core._check_worktree_available(repo, config, worktree, "20260102-another")
+
+
+def test_unreadable_receipts_conservatively_block_worktree_operations(
+    tmp_path: Path,
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree = tmp_path.parent / f"{tmp_path.name}-worktree"
+    corrupt = repo / "expctl" / "results" / "20260102-corrupt" / "receipt.json"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ExpctlError, match="receipt is unreadable"):
+        core._check_worktree_available(repo, config, worktree, "20260103-another")
+    with pytest.raises(ExpctlError, match="receipt is unreadable"):
+        core._other_uncollected_worktree_claims(repo, config, worktree, EXAMPLE_ID)
+
+    corrupt.write_text(
+        json.dumps({"status": "submitted", "job_id": "999"}), encoding="utf-8"
+    )
+    with pytest.raises(ExpctlError, match="no valid absolute worktree"):
+        core._check_worktree_available(repo, config, worktree, "20260103-another")
+    with pytest.raises(ExpctlError, match="no valid absolute worktree"):
+        core._other_uncollected_worktree_claims(repo, config, worktree, EXAMPLE_ID)
 
 
 def test_collect_refuses_a_job_that_is_still_queued(

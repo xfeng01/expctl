@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -57,6 +57,7 @@ DEFAULT_CREATE_MISSING = ("runs", "logs")
 ID_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]*$")
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+METRIC_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9.][A-Za-z0-9._-]*$")
 RERUN_SUFFIX_RE = re.compile(r"-r\d+$")
 # The top-level `id = "..."` line of a request file, as `rerun` rewrites it.
@@ -695,6 +696,14 @@ def validate_request(
         or not all(isinstance(metric, str) and metric for metric in metrics)
     ):
         raise ExpctlError("outputs.metrics must be a non-empty string array")
+    invalid_metrics = [
+        metric for metric in metrics if METRIC_NAME_RE.fullmatch(metric) is None
+    ]
+    if invalid_metrics:
+        raise ExpctlError(
+            "outputs.metrics entries must match [A-Za-z_][A-Za-z0-9_.-]*: "
+            + ", ".join(invalid_metrics)
+        )
 
     notes = data.get("notes", {})
     if not isinstance(notes, dict):
@@ -1285,6 +1294,24 @@ def _result_collection_guard(repo: Path, experiment_id: str) -> Iterator[None]:
         yield
 
 
+def _receipt_claim_worktree(
+    receipt: dict[str, Any], receipt_path: Path, *, operation: str
+) -> Path:
+    value = receipt.get("worktree")
+    if not isinstance(value, str) or not value or not Path(value).is_absolute():
+        raise ExpctlError(
+            f"cannot safely {operation} while receipt has no valid absolute "
+            f"worktree: {receipt_path}"
+        )
+    try:
+        return Path(value).resolve()
+    except OSError as exc:
+        raise ExpctlError(
+            f"cannot safely {operation} while receipt worktree cannot be "
+            f"resolved: {receipt_path}: {exc}"
+        ) from exc
+
+
 def _check_worktree_available(
     repo: Path,
     config: Config,
@@ -1298,15 +1325,17 @@ def _check_worktree_available(
             continue
         try:
             other = _load_receipt(other_path)
-        except ExpctlError:
-            continue
-        other_worktree = other.get("worktree")
-        if not isinstance(other_worktree, str):
-            continue
-        try:
-            same_worktree = Path(other_worktree).resolve() == worktree.resolve()
-        except OSError:
-            same_worktree = False
+        except ExpctlError as exc:
+            raise ExpctlError(
+                f"cannot safely determine worktree availability while receipt "
+                f"is unreadable: {other_path}: {exc}"
+            ) from exc
+        other_worktree = _receipt_claim_worktree(
+            other,
+            other_path,
+            operation="determine worktree availability",
+        )
+        same_worktree = other_worktree == worktree.resolve()
         if not same_worktree:
             continue
         other_id = other.get("experiment_id", other_path.parent.name)
@@ -1835,25 +1864,62 @@ def _log_sources(
     return worktree, pattern, sources, False
 
 
-def _tail_file(path: Path, lines: int) -> str:
-    if lines == 0:
-        return ""
+LogCursor = tuple[int, int, int]
+
+
+def _decode_log_bytes(data: bytes) -> str:
+    return (
+        data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    )
+
+
+def _read_log_update(
+    path: Path,
+    cursor: LogCursor | None,
+    *,
+    tail: int,
+) -> tuple[str, LogCursor, bool]:
+    """Read one stable log snapshot and return text, cursor, and reset status."""
     try:
         with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            position = handle.tell()
-            data = b""
-            while position > 0 and data.count(b"\n") <= lines:
-                block_size = min(64 * 1024, position)
-                position -= block_size
-                handle.seek(position)
-                data = handle.read(block_size) + data
-        text = b"".join(data.splitlines(keepends=True)[-lines:]).decode(
-            "utf-8", errors="replace"
-        )
-        return text.replace("\r\n", "\n").replace("\r", "\n")
+            stat = os.fstat(handle.fileno())
+            identity = (stat.st_dev, stat.st_ino)
+            end = stat.st_size
+            reset = cursor is None or cursor[:2] != identity
+            if reset:
+                if tail == 0:
+                    data = b""
+                else:
+                    position = end
+                    data = b""
+                    while position > 0 and data.count(b"\n") <= tail:
+                        block_size = min(64 * 1024, position)
+                        position -= block_size
+                        handle.seek(position)
+                        data = handle.read(block_size) + data
+                    data = b"".join(data.splitlines(keepends=True)[-tail:])
+                return _decode_log_bytes(data), (*identity, end), True
+
+            offset = cursor[2]
+            truncated = end < offset
+            if truncated:
+                offset = 0
+            handle.seek(offset)
+            # Read only the bytes covered by fstat. Data appended concurrently
+            # remains beyond the returned cursor for the next poll.
+            data = handle.read(end - offset)
+            return (
+                _decode_log_bytes(data),
+                (*identity, offset + len(data)),
+                truncated,
+            )
     except OSError as exc:
         raise ExpctlError(f"could not read log {path}: {exc}") from exc
+
+
+def _tail_file(path: Path, lines: int) -> str:
+    content, _, _ = _read_log_update(path, None, tail=lines)
+    return content
 
 
 def logs_request(
@@ -1911,7 +1977,7 @@ def _follow_logs(
     poll_interval: float = 1.0,
 ) -> None:
     """Print existing log tails and follow appended bytes until interrupted."""
-    offsets: dict[Path, int] = {}
+    cursors: dict[Path, LogCursor] = {}
     announced_wait = False
     last_source: Path | None = None
     next_status_check = 0.0
@@ -1937,38 +2003,23 @@ def _follow_logs(
             next_status_check = time.monotonic() + max(5.0, poll_interval)
         multiple = len(sources) > 1
         for source in sources:
-            try:
-                size = source.stat().st_size
-            except OSError as exc:
-                raise ExpctlError(f"could not inspect log {source}: {exc}") from exc
-            if source not in offsets:
-                content = _tail_file(source, tail)
-                if multiple or len(offsets) > 0:
-                    print(f"==> {source.relative_to(log_root).as_posix()} <==")
-                if content:
-                    sys.stdout.write(_stdout_safe(content))
-                    if not content.endswith("\n"):
-                        sys.stdout.write("\n")
-                sys.stdout.flush()
-                offsets[source] = source.stat().st_size
-                last_source = source
+            previous = cursors.get(source)
+            content, cursor, reset = _read_log_update(source, previous, tail=tail)
+            cursors[source] = cursor
+            if not content:
                 continue
-            offset = offsets[source]
-            if size < offset:
-                offset = 0
-            if size == offset:
-                continue
-            try:
-                with source.open("rb") as handle:
-                    handle.seek(offset)
-                    chunk = handle.read()
-            except OSError as exc:
-                raise ExpctlError(f"could not follow log {source}: {exc}") from exc
-            if source != last_source and (multiple or len(offsets) > 1):
+            first_read = previous is None
+            show_header = (
+                (first_read and (multiple or len(cursors) > 1))
+                or (not first_read and reset)
+                or (source != last_source and (multiple or len(cursors) > 1))
+            )
+            if show_header:
                 print(f"==> {source.relative_to(log_root).as_posix()} <==")
-            sys.stdout.write(_stdout_safe(chunk.decode("utf-8", errors="replace")))
+            sys.stdout.write(_stdout_safe(content))
+            if first_read and not content.endswith("\n"):
+                sys.stdout.write("\n")
             sys.stdout.flush()
-            offsets[source] = size
             last_source = source
         if collected:
             return
@@ -1989,13 +2040,17 @@ def _other_uncollected_worktree_claims(
             continue
         try:
             other = _load_receipt(other_path)
-            other_worktree = other.get("worktree")
-            same_worktree = (
-                isinstance(other_worktree, str)
-                and Path(other_worktree).resolve() == worktree.resolve()
-            )
-        except (ExpctlError, OSError):
-            continue
+        except ExpctlError as exc:
+            raise ExpctlError(
+                f"cannot safely clean worktree while receipt is unreadable: "
+                f"{other_path}: {exc}"
+            ) from exc
+        other_worktree = _receipt_claim_worktree(
+            other,
+            other_path,
+            operation="clean worktree",
+        )
+        same_worktree = other_worktree == worktree.resolve()
         if same_worktree and other.get("status") != "collected":
             claims.append(other_id)
     return sorted(claims)

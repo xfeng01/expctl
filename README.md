@@ -152,6 +152,9 @@ was safely recorded; reconcile it with SLURM manually.
   ID atomically.
 - Each request gets at most one submission attempt. Never delete a receipt to
   resubmit; use `rerun` to create a new ID.
+- An unreadable or structurally invalid receipt blocks worktree reuse and
+  cleanup until its ownership evidence is restored; expctl never assumes a
+  corrupt receipt is unrelated.
 - `collect` verifies the submitted worktree and publishes results once. If
   `submit` used `--worktree-root`, pass the same directory to `collect`.
 - `cancel` records the operator, time, and optional reason after `scancel`

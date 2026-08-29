@@ -293,7 +293,7 @@
 
 <div class="page">
   <header>
-    <p class="eyebrow">expctl · v0.7.0 · 异步实验交接</p>
+    <p class="eyebrow">expctl · v0.7.1 · 异步实验交接</p>
     <h1>expctl 中文使用指南</h1>
     <p class="lede">
       expctl 用 Git 仓库中的请求、回执和结果文件交接异步实验。实验设计者与集群操作者不必同时在线，也能确认运行了哪一版代码、使用了哪些参数，并追溯结果来源。
@@ -501,6 +501,7 @@ root = ".."</code></pre>
     <h2 id="trouble"><span class="num">八</span>异常处理与自动化约定</h2>
     <ul>
       <li><strong>请求在提交作业后被修改</strong>：恢复与回执中 <code>request_sha256</code> 完全一致的文件；否则 <code>collect</code> 会拒绝执行。</li>
+      <li><strong>回执损坏、不可读或缺少有效 worktree</strong>：从 Git 或可靠备份恢复并与 SLURM 对账；恢复前，expctl 会保守阻止 worktree 复用和清理。</li>
       <li><strong>提交结果不确定</strong>：保留 <code>submission_unknown</code> 回执并查询 SLURM；确认是否存在作业前不得删除回执、重跑或再次提交。</li>
       <li><strong>节点预算不足</strong>：等待已有作业释放节点后重试。不要通过修改旧请求或静默重提绕过限制。</li>
       <li><strong>作业不再需要</strong>：先用 <code>expctl cancel &lt;id&gt; --dry-run</code> 核对作业号，再正式取消；作业离开队列后仍应收集证据。</li>
