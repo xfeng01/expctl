@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.0 — 2026-08-29
+
+- Added `expctl report <id>`: scaffolds `results/<id>/report.md` from the
+  request, receipt, and `metrics.json` (facts, question, decision rule, a
+  per-log metrics table, missing metrics, and empty Observations/Conclusion
+  sections). `list` and `status` show a collected request whose report exists
+  as `reviewed`; `collect` and `status` now point at `report` as the next step.
+- `validate` rejects requests that still carry starter-template placeholder
+  values, and on a terminal prints a summary of what was pinned (commit,
+  script, verified nodes, env, log glob, metrics, requirements).
+- Friendlier Git failures: a commit missing from the clone says which ref to
+  fetch, a script missing at the pinned commit says to commit and push it, and
+  running outside a repository says so instead of echoing `git rev-parse`.
+- `doctor` exits 0 when the repository checks pass; the SLURM checks are
+  informational unless `--cluster` is given, so authors' machines and CI no
+  longer fail for lacking `sbatch`.
+
 ## 0.7.1 — 2026-08-29
 
 - Worktree reuse and cleanup now fail safely when any receipt cannot be read

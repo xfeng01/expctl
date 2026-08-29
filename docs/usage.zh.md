@@ -67,7 +67,7 @@ expctl/
 expctl doctor
 ```
 
-`doctor` 分别报告仓库是否可用、当前机器是否具备 POSIX 锁和 SLURM 命令。任一必需检查失败时退出码为 `1`；使用 `--json` 可供脚本读取。
+`doctor` 分别报告仓库是否可用、当前机器是否具备 POSIX 锁和 SLURM 命令。仓库检查失败时退出码为 `1`；SLURM 检查默认只作提示（请求方的机器本来就没有 SLURM），在集群上加 `--cluster` 才把它们计入退出码。使用 `--json` 可供脚本读取。
 
 将 `expctl.toml`、请求、模板和结果元数据纳入版本控制。不要提交数据集、模型权重、缓存或密钥。expctl 只读写文件，不会自动执行 `git add`、`git commit` 或 `git push`。
 
@@ -90,7 +90,7 @@ expctl doctor
 
 4. 将请求文件提交并推送到 Git 仓库。
 
-`validate` 会检查请求格式、固定提交是否存在，以及该提交中的作业脚本是否包含所有 `scheduler.required_script_lines`。回执生成前可以修正并重新发布请求；回执生成后必须保持文件字节不变。
+`validate` 会检查请求格式、固定提交是否存在，以及该提交中的作业脚本是否包含所有 `scheduler.required_script_lines`；模板占位符（标题、问题、判定规则、脚本、日志 glob、指标、依赖）没有改掉时会直接拒绝。提交不在本地、脚本不在固定提交里，都会给出对应的修复提示（fetch 分支 / 先提交推送脚本）。在终端中运行时还会打印一屏摘要：commit、脚本、核验的节点数、环境变量、日志 glob、指标和依赖，方便确认 pin 对了。回执生成前可以修正并重新发布请求；回执生成后必须保持文件字节不变。
 
 ## 四、提交、查看和收集
 
@@ -164,7 +164,15 @@ expctl collect <id> [--worktree-root <dir>]
 - 从复制后的日志提取指标并写入 `metrics.json`，在回执中记录 `missing_metrics`；
 - 将 `sacct` 结果写入回执，并把回执状态改为 `collected`。
 
-`collect` 不会等待作业，也不会覆盖已经收集或残留的日志和指标。同一请求的收集过程使用互斥锁串行化；作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或不同来源日志会使用同一目标文件名时都会报错。指标缺失不会阻止失败作业的证据收集，但会明确记录。完成后应审阅原始日志，按 `decision_rule` 写入 `<root>/results/<id>/report.md`，再提交并推送结果目录。
+`collect` 不会等待作业，也不会覆盖已经收集或残留的日志和指标。同一请求的收集过程使用互斥锁串行化；作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或不同来源日志会使用同一目标文件名时都会报错。指标缺失不会阻止失败作业的证据收集，但会明确记录。
+
+收集之后生成报告骨架并写结论：
+
+```bash
+expctl report <id>
+```
+
+`report` 从请求、回执和 `metrics.json` 生成 `<root>/results/<id>/report.md`：标题、commit、作业号与提交人、`sacct` 终态、日志清单、原文的 `question` 和 `decision_rule`、按日志分列的指标表和缺失指标，末尾留出 `Observations` 和 `Conclusion` 两段由人填写。文件已存在时拒绝覆盖。`report.md` 存在后，`list` 和 `status` 把该请求显示为 `reviewed`。审阅原始日志、按 `decision_rule` 填好结论后，提交并推送结果目录。
 
 结果收集后可清理 detached worktree：
 
@@ -234,7 +242,7 @@ root = ".."
 | 命令 | 作用 |
 |---|---|
 | `expctl init` | 补齐配置和 `paths.root` 指定的目录结构 |
-| `expctl doctor [--json]` | 检查仓库结构、worktree 位置、POSIX 锁和 SLURM 命令 |
+| `expctl doctor [--cluster] [--json]` | 检查仓库结构、worktree 位置、POSIX 锁和 SLURM 命令；`--cluster` 时 SLURM 检查计入退出码 |
 | `expctl new <id> [--allow-dirty] [--json]` | 从模板创建请求并填写 Git 元数据；默认拒绝未提交改动 |
 | `expctl list [--table\|--tsv\|--json] [--status <states>] [--sort newest\|oldest] [--limit <n>] [--no-color]` | 列出请求及实时状态；默认从新到旧，终端表格，管道 TSV |
 | `expctl validate <id>` | 验证请求、固定提交和作业脚本策略 |
@@ -247,6 +255,7 @@ root = ".."
 | `expctl cancel <id> [--reason <text>] [--dry-run] [--json]` | 预览或调用 `scancel`，并在回执中记录取消审计信息 |
 | `expctl collect <id> [--worktree-root <dir>] [--json]` | 复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致 |
 | `expctl clean <id> [--dry-run] [--worktree-root <dir>] [--json]` | 结果收集后验证并删除 detached worktree，不删除结果证据 |
+| `expctl report <id> [--json]` | 从请求、回执和指标生成 `results/<id>/report.md` 骨架；已存在时拒绝覆盖 |
 | `expctl rerun <id> [--as <new-id>] [--reason <text>] [--json]` | 把已提交的请求复制为新 ID（默认 `<id>-r2`、`-r3`……），写入 `rerun_of`，供再次提交；commit 和 worktree 不变 |
 
 `expctl list` 显示的标准状态：
@@ -259,12 +268,13 @@ submission_unknown  sbatch 结果不确定，必须人工对账且不能自动�
 submitted  已生成回执
 cancel_requested  已调用 scancel，等待 SLURM 确认终态
 collected  已执行 collect
-invalid    请求验证失败，或回执不是有效的 JSON
+reviewed   已收集且 results/<id>/report.md 存在
+invalid    请求验证失败、仍含模板占位符，或回执不是有效的 JSON
 ```
 
 若 `submitted` 回执含有有效作业号且 SLURM 可查询，`list` 会临时用大写的调度状态替换显示值，例如 `PENDING`、`RUNNING`、`COMPLETING`、`COMPLETED`、`FAILED`、`CANCELLED`、`TIMEOUT` 或 `OUT_OF_MEMORY`。数组任务有多种状态时显示 `MIXED`；需要逐任务详情时使用 `expctl status <id>`。
 
-“已审阅”不是工具状态；结论由操作者写入 `report.md` 或项目自己的实验记录。
+`reviewed` 只看 `report.md` 是否存在，回执不会为它写入任何字段；结论本身仍由操作者写在 `report.md` 或项目自己的实验记录里。
 
 ## 八、异常处理与自动化约定
 

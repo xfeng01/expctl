@@ -293,7 +293,7 @@
 
 <div class="page">
   <header>
-    <p class="eyebrow">expctl · v0.7.1 · 异步实验交接</p>
+    <p class="eyebrow">expctl · v0.8.0 · 异步实验交接</p>
     <h1>expctl 中文使用指南</h1>
     <p class="lede">
       expctl 用 Git 仓库中的请求、回执和结果文件交接异步实验。实验设计者与集群操作者不必同时在线，也能确认运行了哪一版代码、使用了哪些参数，并追溯结果来源。
@@ -359,7 +359,7 @@ expctl/
 └── templates/request.toml  <span class="c"># 请求模板</span></code></pre>
     <p>随后编辑 <code>expctl.toml</code>，至少确认允许的 SLURM 参数、节点上限、共享运行时目录和 worktree 位置（见“配置参考”）。</p>
     <p>若修改 <code>paths.root</code>，再次运行 <code>expctl init</code> 会在新位置补齐目录，但不会移动或删除旧目录。将配置、请求、模板和结果元数据纳入版本控制；不要提交数据集、模型权重、缓存或密钥。</p>
-    <p>可运行 <code>expctl doctor</code> 检查仓库结构、目录权限、POSIX 锁和 SLURM 命令。命令分别报告仓库与集群是否可用；任一必需检查失败时退出码为 <code>1</code>，<code>--json</code> 可供脚本读取。</p>
+    <p>可运行 <code>expctl doctor</code> 检查仓库结构、目录权限、POSIX 锁和 SLURM 命令。仓库检查失败时退出码为 <code>1</code>；SLURM 检查默认只作提示，在集群上使用 <code>expctl doctor --cluster</code> 才将其计入退出码。<code>--json</code> 可供脚本读取。</p>
     <div class="note"><p>expctl 只读写文件，不会自动执行 <code>git add</code>、<code>git commit</code> 或 <code>git push</code>。</p></div>
 
     <h2 id="author"><span class="num">三</span>创建并发布实验请求</h2>
@@ -372,7 +372,7 @@ expctl/
       <li>将请求文件提交并推送到 Git 仓库。</li>
     </ol>
     <p>若工作树存在未提交改动，<code>new</code> 默认拒绝创建，因为这些内容不属于固定的 <code>HEAD</code>。应先提交或暂存；只有明确接受风险时才使用 <code>--allow-dirty</code>。</p>
-    <p><code>validate</code> 会检查请求格式、固定提交、作业脚本策略，以及显式 <code>#SBATCH --nodes</code> 和数组节流推导出的最坏节点数。回执生成前可以修正并重新发布请求；回执生成后必须保持文件字节不变。</p>
+    <p><code>validate</code> 会检查请求格式、固定提交、作业脚本策略，以及显式 <code>#SBATCH --nodes</code> 和数组节流推导出的最坏节点数。模板中的标题、问题、判定规则、脚本、日志 glob、指标和依赖仍为占位值时会直接拒绝；Git 提交或脚本缺失时会给出对应的 fetch、提交和推送提示。交互终端还会显示本次固定的 commit、脚本、节点数、环境变量、日志、指标和依赖摘要。回执生成前可以修正并重新发布请求；回执生成后必须保持文件字节不变。</p>
 
     <h2 id="runner"><span class="num">四</span>提交、查看和收集</h2>
     <p>在集群上的项目仓库里：</p>
@@ -403,7 +403,11 @@ expctl cancel &lt;id&gt; --reason "superseded"</code></pre>
     <h3>收集结果</h3>
 <pre data-lang="bash"><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;]</code></pre>
     <p><code>collect</code> 会先确认作业已离开 <code>squeue</code>，校验请求哈希，并根据请求重新计算 worktree 与回执核对。若 <code>submit</code> 使用了 <code>--worktree-root</code>，这里必须传入相同目录。匹配日志会先暂存，再发布到结果目录，并从暂存文件提取指标到 <code>metrics.json</code>，记录 <code>missing_metrics</code> 和 <code>sacct</code> 结果。</p>
-    <p><code>collect</code> 不会等待作业，也不会覆盖已经收集或残留的结果；同一请求的收集过程使用互斥锁串行化。作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或目标文件名冲突时都会报错。完成后应审阅原始日志，按 <code>decision_rule</code> 写入 <code>report.md</code>，再提交并推送结果目录。</p>
+    <p><code>collect</code> 不会等待作业，也不会覆盖已经收集或残留的结果；同一请求的收集过程使用互斥锁串行化。作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或目标文件名冲突时都会报错。</p>
+
+    <h3>生成并填写报告</h3>
+<pre data-lang="bash"><code>expctl report &lt;id&gt;</code></pre>
+    <p><code>report</code> 根据请求、回执和 <code>metrics.json</code> 创建 <code>results/&lt;id&gt;/report.md</code>：包含运行事实、原始问题和判定规则、按日志分列的指标表与缺失指标，并留出 Observations 和 Conclusion 供人工填写。已有报告不会被覆盖。报告存在后，<code>list</code> 和 <code>status</code> 显示 <code>reviewed</code>；审阅原始日志并填好结论后，再提交并推送结果目录。</p>
 
     <h3>清理 worktree</h3>
 <pre data-lang="bash"><code>expctl clean &lt;id&gt; --dry-run
@@ -467,7 +471,7 @@ root = ".."</code></pre>
       <thead><tr><th>命令</th><th>作用</th></tr></thead>
       <tbody>
         <tr><td><code>expctl init</code></td><td>补齐配置和 <code>paths.root</code> 指定的目录结构</td></tr>
-        <tr><td><code>expctl doctor [--json]</code></td><td>检查仓库结构、worktree 位置、POSIX 锁和 SLURM 命令</td></tr>
+        <tr><td><code>expctl doctor [--cluster] [--json]</code></td><td>检查仓库结构、worktree 位置、POSIX 锁和 SLURM 命令；<code>--cluster</code> 时 SLURM 检查计入退出码</td></tr>
         <tr><td><code>expctl new &lt;id&gt; [--allow-dirty] [--json]</code></td><td>从模板创建请求并填写 Git 元数据；默认拒绝未提交改动</td></tr>
         <tr><td><code>expctl list [--table|--tsv|--json] [--status &lt;states&gt;] [--sort newest|oldest] [--limit &lt;n&gt;] [--no-color]</code></td><td>列出请求及实时状态；默认从新到旧，终端表格，管道 TSV</td></tr>
         <tr><td><code>expctl validate &lt;id&gt;</code></td><td>验证请求、固定提交和作业脚本策略</td></tr>
@@ -480,6 +484,7 @@ root = ".."</code></pre>
         <tr><td><code>expctl cancel &lt;id&gt; [--reason TEXT] [--dry-run] [--json]</code></td><td>预览或调用 <code>scancel</code>，并记录取消审计信息</td></tr>
         <tr><td><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;] [--json]</code></td><td>复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致</td></tr>
         <tr><td><code>expctl clean &lt;id&gt; [--dry-run] [--worktree-root DIR] [--json]</code></td><td>收集后验证并删除 detached worktree，不删除结果证据</td></tr>
+        <tr><td><code>expctl report &lt;id&gt; [--json]</code></td><td>从请求、回执和指标生成 <code>results/&lt;id&gt;/report.md</code> 骨架；已存在时拒绝覆盖</td></tr>
         <tr><td><code>expctl rerun &lt;id&gt; [--as &lt;new-id&gt;] [--reason &lt;text&gt;] [--json]</code></td><td>把已提交请求复制为新 ID，保留 commit 和 worktree，供再次提交</td></tr>
       </tbody>
     </table>
@@ -493,10 +498,11 @@ root = ".."</code></pre>
       <div>已生成回执；可查询时显示实时 SLURM 状态<br><span class="pill submitted">submitted → RUNNING / FAILED / …</span></div>
       <div>已调用 scancel，等待调度器确认<br><code>cancel_requested</code></div>
       <div>已执行 collect<br><span class="pill collected">collected</span></div>
-      <div>请求验证失败或回执 JSON 无效<br><code>invalid</code></div>
+      <div>已收集且报告存在<br><span class="pill collected">reviewed</span></div>
+      <div>请求验证失败、仍含模板占位符或回执 JSON 无效<br><code>invalid</code></div>
     </div>
     <p>实时状态还包括 <code>PENDING</code>、<code>COMPLETING</code>、<code>COMPLETED</code>、<code>CANCELLED</code>、<code>TIMEOUT</code> 和 <code>OUT_OF_MEMORY</code>。数组任务有多种状态时显示 <code>MIXED</code>；使用 <code>expctl status &lt;id&gt;</code> 查看逐任务详情。</p>
-    <p>“已审阅”不是工具状态；结论由操作者写入 <code>report.md</code> 或项目自己的实验记录。</p>
+    <p><code>reviewed</code> 只表示 <code>report.md</code> 已存在，不会写入回执字段；结论仍由操作者填写。</p>
 
     <h2 id="trouble"><span class="num">八</span>异常处理与自动化约定</h2>
     <ul>

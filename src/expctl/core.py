@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -127,6 +127,18 @@ metrics = ["metric_name"]
 requirements = ["runs/example/ckpt.pt"]
 instructions = "Any non-obvious recovery or rerun instructions."
 """
+_BUILTIN_TEMPLATE = tomllib.loads(STARTER_TEMPLATE)
+# Fields whose starter-template defaults must be replaced before a request is
+# usable; `validate` rejects a request that still carries any of them.
+PLACEHOLDER_FIELDS: tuple[tuple[str, ...], ...] = (
+    ("title",),
+    ("question",),
+    ("decision_rule",),
+    ("slurm", "script"),
+    ("outputs", "log_glob"),
+    ("outputs", "metrics"),
+    ("notes", "requirements"),
+)
 
 
 class ExpctlError(RuntimeError):
@@ -290,8 +302,29 @@ def _load_receipt(path: Path) -> dict[str, Any]:
 
 def find_repo_root(start: Path | None = None) -> Path:
     here = (start or Path.cwd()).resolve()
-    result = _run(["git", "rev-parse", "--show-toplevel"], cwd=here)
+    result = _run(["git", "rev-parse", "--show-toplevel"], cwd=here, check=False)
+    if result.returncode != 0:
+        raise ExpctlError(f"not inside a Git repository: {here}")
     return Path(result.stdout.strip()).resolve()
+
+
+def _lookup(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    value: Any = data
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _template_placeholders(data: dict[str, Any]) -> list[str]:
+    """Names of fields still equal to their starter-template placeholder."""
+    return [
+        ".".join(keys)
+        for keys in PLACEHOLDER_FIELDS
+        if _lookup(data, keys) is not None
+        and _lookup(data, keys) == _lookup(_BUILTIN_TEMPLATE, keys)
+    ]
 
 
 def _config_list(
@@ -591,6 +624,7 @@ def load_request(
     experiment_id: str,
     *,
     check_git: bool = True,
+    check_placeholders: bool = True,
 ) -> tuple[dict[str, Any], Path]:
     path = request_path(repo, config, experiment_id)
     if not path.is_file():
@@ -600,7 +634,14 @@ def load_request(
             data = tomllib.load(handle)
     except tomllib.TOMLDecodeError as exc:
         raise ExpctlError(f"invalid TOML in {path}: {exc}") from exc
-    validate_request(data, path=path, repo=repo, config=config, check_git=check_git)
+    validate_request(
+        data,
+        path=path,
+        repo=repo,
+        config=config,
+        check_git=check_git,
+        check_placeholders=check_placeholders,
+    )
     return data, path
 
 
@@ -611,6 +652,7 @@ def validate_request(
     repo: Path,
     config: Config,
     check_git: bool = True,
+    check_placeholders: bool = True,
 ) -> None:
     if data.get("version") != 1:
         raise ExpctlError("request.version must be 1")
@@ -716,6 +758,15 @@ def validate_request(
     for item in requirements:
         _relative_path(item, "notes.requirements")
 
+    if check_placeholders:
+        placeholders = _template_placeholders(data)
+        if placeholders:
+            raise ExpctlError(
+                "request still has template placeholder values in "
+                + ", ".join(placeholders)
+                + f"; edit {path.name} before validating"
+            )
+
     if check_git:
         _validate_request_git(repo, config, data)
 
@@ -727,28 +778,49 @@ def _validate_request_git(
     *,
     commit_cache: dict[str, str | None] | None = None,
     script_cache: dict[tuple[str, str], tuple[int | None, str | None]] | None = None,
-) -> None:
-    """Validate pinned Git content, optionally reusing results across requests."""
+) -> int:
+    """Validate pinned Git content, optionally reusing results across requests.
+
+    Returns the worst-case concurrent node count derived from the script.
+    """
     commit = request["code"]["commit"]
+    branch = request["code"]["branch"]
     script = request["slurm"]["script"]
     max_nodes = request["slurm"]["max_concurrent_nodes"]
     commit_cache = {} if commit_cache is None else commit_cache
     script_cache = {} if script_cache is None else script_cache
 
     if commit not in commit_cache:
-        try:
-            _run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=repo)
-        except ExpctlError as exc:
-            commit_cache[commit] = str(exc)
-        else:
-            commit_cache[commit] = None
+        probe = _run(
+            ["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=repo, check=False
+        )
+        commit_cache[commit] = (
+            None
+            if probe.returncode == 0
+            else (
+                f"commit {commit[:12]} is not in this clone; fetch the ref that "
+                f"contains it (git fetch origin {branch}) and retry"
+            )
+        )
     if error := commit_cache[commit]:
         raise ExpctlError(error)
 
     cache_key = (commit, script)
     if cache_key not in script_cache:
         try:
-            script_lines = _git_text(repo, "show", f"{commit}:{script}").splitlines()
+            shown = _run(["git", "show", f"{commit}:{script}"], cwd=repo, check=False)
+            if shown.returncode != 0:
+                detail = shown.stderr.strip() or shown.stdout.strip()
+                if "does not exist" in detail or "exists on disk" in detail:
+                    raise ExpctlError(
+                        f"slurm.script {script} does not exist at commit "
+                        f"{commit[:12]}; commit and push the script, then pin "
+                        "that commit"
+                    )
+                raise ExpctlError(
+                    f"command failed (git show {commit}:{script}): {detail}"
+                )
+            script_lines = shown.stdout.splitlines()
             active_script_lines = _slurm_preamble(script_lines)
             for required in config.required_script_lines:
                 if required not in active_script_lines:
@@ -770,6 +842,7 @@ def _validate_request_git(
             f"{script} can use {verified_nodes} concurrent nodes, exceeding "
             f"slurm.max_concurrent_nodes={max_nodes}"
         )
+    return verified_nodes
 
 
 def _request_hash(path: Path) -> str:
@@ -896,7 +969,9 @@ def new_request(
     )
     _exclusive_write_text(destination, content)
     try:
-        load_request(repo, config, experiment_id, check_git=False)
+        load_request(
+            repo, config, experiment_id, check_git=False, check_placeholders=False
+        )
     except ExpctlError:
         destination.unlink(missing_ok=True)
         raise
@@ -1613,6 +1688,9 @@ def status_request(repo: Path, config: Config, experiment_id: str) -> dict[str, 
     }
     if isinstance(receipt.get("cancellation"), dict):
         payload["cancellation"] = receipt["cancellation"]
+    report = report_path(repo, config, experiment_id)
+    if report.is_file():
+        payload["report"] = str(report.relative_to(repo)).replace("\\", "/")
     if not queue:
         try:
             accounting = _scheduler_status(repo, job_id)
@@ -1649,7 +1727,7 @@ def _status_state(result: dict[str, Any]) -> str:
     counts = result.get("queue_counts", {})
     accounting = result.get("accounting", {})
     if receipt_status == "collected":
-        return "COLLECTED"
+        return "REVIEWED" if result.get("report") else "COLLECTED"
     if result.get("in_queue"):
         return next(iter(counts)) if len(counts) == 1 else "MIXED"
     if isinstance(accounting, dict) and accounting.get("state"):
@@ -2532,6 +2610,166 @@ def collect_request(
             shutil.rmtree(staging, ignore_errors=True)
 
 
+def report_path(repo: Path, config: Config, experiment_id: str) -> Path:
+    return result_dir(repo, config, experiment_id) / "report.md"
+
+
+def _format_metric(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "n/a"
+    return format(value, "g") if isinstance(value, float) else str(value)
+
+
+def _render_report(
+    request: dict[str, Any],
+    receipt: dict[str, Any],
+    metrics: dict[str, dict[str, Any]],
+    *,
+    request_file: str,
+) -> str:
+    code = request["code"]
+    collection = receipt.get("collection")
+    collection = collection if isinstance(collection, dict) else {}
+    scheduler = collection.get("scheduler")
+    scheduler = scheduler if isinstance(scheduler, dict) else {}
+    exit_codes = sorted(
+        {
+            str(row["exit_code"])
+            for row in scheduler.get("jobs", [])
+            if isinstance(row, dict) and row.get("exit_code")
+        }
+    )
+    verdict = str(scheduler.get("state") or "UNKNOWN")
+    if exit_codes:
+        verdict += f" (exit {', '.join(exit_codes)})"
+    request_line = f"`{request_file}`"
+    if request.get("rerun_of"):
+        request_line += f" (rerun of `{request['rerun_of']}`"
+        if request.get("rerun_reason"):
+            request_line += f": {request['rerun_reason']}"
+        request_line += ")"
+    submitted = " ".join(
+        filter(
+            None,
+            [
+                str(receipt.get("job_id") or "unknown"),
+                (
+                    f"submitted {receipt['submitted_at']}"
+                    if receipt.get("submitted_at")
+                    else ""
+                ),
+                f"by {receipt['submitted_by']}" if receipt.get("submitted_by") else "",
+            ],
+        )
+    )
+    logs = [str(log) for log in collection.get("logs", []) if log]
+    facts = [
+        ("Request", request_line),
+        ("Commit", f"`{code['commit']}` ({code['branch']})"),
+        ("Job", submitted),
+        ("Scheduler", verdict),
+        ("Collected", collection.get("collected_at")),
+        ("Logs", ", ".join(f"`{log}`" for log in logs) or "none"),
+    ]
+    lines = [f"# {request['title']}", ""]
+    lines.extend(f"- {label}: {value}" for label, value in facts if value)
+    lines.extend(
+        [
+            "",
+            "## Question",
+            "",
+            str(request["question"]),
+            "",
+            "## Decision rule",
+            "",
+            str(request["decision_rule"]),
+            "",
+            "## Metrics",
+            "",
+        ]
+    )
+    log_names = sorted(metrics)
+    if log_names:
+        columns = " | ".join(f"`{name}`" for name in log_names)
+        lines.append(f"| metric | {columns} |")
+        lines.append("|---|" + "---|" * len(log_names))
+        for metric in request["outputs"]["metrics"]:
+            cells = [
+                _format_metric((metrics[name] or {}).get(metric)) for name in log_names
+            ]
+            lines.append(f"| {metric} | " + " | ".join(cells) + " |")
+    else:
+        lines.append("No metrics were extracted.")
+    missing = [str(name) for name in collection.get("missing_metrics", []) or []]
+    if missing:
+        rendered = ", ".join(f"`{name}`" for name in missing)
+        lines.extend(["", f"Missing from every log: {rendered}"])
+    lines.extend(
+        [
+            "",
+            "## Observations",
+            "",
+            (
+                "<!-- What the logs show beyond the numbers: failures, warnings, "
+                "qualitative samples. -->"
+            ),
+            "",
+            "## Conclusion",
+            "",
+            "<!-- Apply the decision rule. What is the next decision? -->",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def report_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
+    """Scaffold results/<id>/report.md from the request, receipt, and metrics."""
+    request, path = load_request(repo, config, experiment_id, check_git=False)
+    destination = result_dir(repo, config, experiment_id)
+    receipt_path = destination / "receipt.json"
+    if not receipt_path.is_file():
+        raise ExpctlError(f"not submitted yet: no receipt at {receipt_path}")
+    receipt = _load_receipt(receipt_path)
+    if receipt.get("status") != "collected":
+        raise ExpctlError(
+            f"results for {experiment_id} are not collected yet (receipt status: "
+            f"{receipt.get('status', 'invalid')}); run expctl collect "
+            f"{experiment_id} first"
+        )
+    target = report_path(repo, config, experiment_id)
+    if target.exists():
+        raise ExpctlError(f"report already exists: {target}; edit it in place")
+    metrics_path = destination / "metrics.json"
+    metrics: dict[str, dict[str, Any]] = {}
+    if metrics_path.is_file():
+        loaded = _load_json_object(metrics_path, "metrics file")
+        metrics = {
+            str(name): values
+            for name, values in loaded.items()
+            if isinstance(values, dict)
+        }
+    content = _render_report(
+        request,
+        receipt,
+        metrics,
+        request_file=str(path.relative_to(repo)).replace("\\", "/"),
+    )
+    _exclusive_write_text(target, content)
+    collection = receipt.get("collection")
+    collection = collection if isinstance(collection, dict) else {}
+    scheduler = collection.get("scheduler")
+    found = sorted({metric for values in metrics.values() for metric in values})
+    return {
+        "experiment_id": experiment_id,
+        "path": str(target.relative_to(repo)).replace("\\", "/"),
+        "result_path": str(destination.relative_to(repo)).replace("\\", "/"),
+        "metrics": found,
+        "missing_metrics": list(collection.get("missing_metrics", []) or []),
+        "scheduler": scheduler.get("state") if isinstance(scheduler, dict) else None,
+    }
+
+
 def _receipt_summary(repo: Path, receipt_path: Path) -> str:
     """One line about an existing receipt: who submitted what, and how it ended."""
     try:
@@ -2688,18 +2926,51 @@ def _render_new_result(result: dict[str, Any]) -> str:
     )
 
 
-def _render_doctor_result(result: dict[str, Any]) -> str:
+def _render_validate_summary(
+    experiment_id: str, request: dict[str, Any], *, verified_nodes: int
+) -> str:
+    code, slurm, outputs = request["code"], request["slurm"], request["outputs"]
+    metrics = list(outputs["metrics"])
+    requirements = list(request.get("notes", {}).get("requirements", []))
+    env = slurm.get("env", {})
+    shown_metrics = ", ".join(metrics[:6]) + (", ..." if len(metrics) > 6 else "")
+    return _render_summary(
+        f"valid: {experiment_id}",
+        [
+            ("Commit", f"{code['commit'][:12]} ({code['branch']})"),
+            ("Script", slurm["script"]),
+            (
+                "Nodes",
+                f"{verified_nodes} verified / {slurm['max_concurrent_nodes']} declared",
+            ),
+            ("Env", ", ".join(f"{k}={v}" for k, v in sorted(env.items())) or None),
+            ("Logs", outputs["log_glob"]),
+            ("Metrics", f"{len(metrics)}: {shown_metrics}"),
+            ("Requires", ", ".join(requirements) or None),
+            ("Rerun of", request.get("rerun_of")),
+        ],
+    )
+
+
+def _render_doctor_result(
+    result: dict[str, Any], *, require_cluster: bool = False
+) -> str:
     checks = result["checks"]
     name_width = max(len(str(check["name"])) for check in checks)
+    cluster_note = ""
+    if not result["cluster_ready"] and not require_cluster:
+        cluster_note = " (informational here; --cluster makes it required)"
     lines = [
         "EXPCTL DOCTOR",
         f"Repository ready: {'yes' if result['repository_ready'] else 'no'}",
-        f"Cluster ready:    {'yes' if result['cluster_ready'] else 'no'}",
+        f"Cluster ready:    {'yes' if result['cluster_ready'] else 'no'}{cluster_note}",
         "",
     ]
     for check in checks:
         if check["ok"]:
             status = "OK"
+        elif check["scope"] == "cluster" and not require_cluster:
+            status = "INFO"
         elif check["required"]:
             status = "FAIL"
         else:
@@ -2710,12 +2981,23 @@ def _render_doctor_result(result: dict[str, Any]) -> str:
         )
     if not result["repository_ready"]:
         lines.extend(["", "Next:", "  Fix the failed repository checks above."])
-    elif not result["cluster_ready"]:
+    elif not result["cluster_ready"] and require_cluster:
         lines.extend(
             [
                 "",
                 "Next:",
                 "  Run expctl on a POSIX cluster host with the missing SLURM tools.",
+            ]
+        )
+    elif not result["cluster_ready"]:
+        lines.extend(
+            [
+                "",
+                "Next:",
+                (
+                    "  Repository is ready for authoring. On the cluster host, run: "
+                    "expctl doctor --cluster"
+                ),
             ]
         )
     return "\n".join(lines)
@@ -2836,8 +3118,10 @@ def _render_status_result(result: dict[str, Any], *, result_path: str) -> str:
     ]
     if not result.get("job_id"):
         next_steps = [f"Inspect {result_path}/receipt.json before retrying."]
+    elif receipt_status == "collected" and result.get("report"):
+        next_steps = [f"Review {result['report']}"]
     elif receipt_status == "collected":
-        next_steps = [f"Write the conclusion to {result_path}/report.md"]
+        next_steps = [shlex.join(["expctl", "report", experiment_id])]
     elif not _status_is_terminal(result):
         command = shlex.join(["expctl", "status", experiment_id])
         next_steps = [f"Wait for SLURM, then run: {command}"]
@@ -2892,7 +3176,31 @@ def _render_collect_result(
             ("Metrics", result.get("metrics_file")),
             ("Missing", ", ".join(missing) if missing else "none"),
         ],
-        next_steps=[f"Write the conclusion to {result_path}/report.md"],
+        next_steps=[
+            shlex.join(["expctl", "report", experiment_id])
+            + f"  # scaffold {result_path}/report.md"
+        ],
+    )
+
+
+def _render_report_result(result: dict[str, Any]) -> str:
+    experiment_id = str(result["experiment_id"])
+    path = str(result["path"])
+    found = result.get("metrics", [])
+    missing = result.get("missing_metrics", [])
+    return _render_summary(
+        "REPORT CREATED",
+        [
+            ("Experiment", experiment_id),
+            ("Path", path),
+            ("Scheduler", result.get("scheduler")),
+            ("Metrics", ", ".join(found) if found else "none extracted"),
+            ("Missing", ", ".join(missing) if missing else None),
+        ],
+        next_steps=[
+            f"Fill in Observations and Conclusion in {path}",
+            shlex.join(["git", "add", str(result["result_path"])]) + " && git commit",
+        ],
     )
 
 
@@ -2981,6 +3289,7 @@ STATUS_COLORS = {
     "submitted": "\x1b[34m",
     "cancel_requested": "\x1b[35m",
     "collected": "\x1b[32m",
+    "reviewed": "\x1b[32m",
     "invalid": "\x1b[31m",
     "PENDING": "\x1b[33m",
     "CONFIGURING": "\x1b[33m",
@@ -3171,6 +3480,11 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
                     submitted_rows.setdefault(job_id, []).append(row)
                     rows.append(row)
                     continue
+                if (
+                    status == "collected"
+                    and report_path(repo, config, experiment_id).is_file()
+                ):
+                    status = "reviewed"
             rows.append({"id": experiment_id, "status": status, "title": data["title"]})
         except ExpctlError as exc:
             rows.append({"id": experiment_id, "status": "invalid", "title": str(exc)})
@@ -3252,6 +3566,11 @@ def _parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser(
         "doctor", help="check repository configuration and cluster dependencies"
+    )
+    doctor.add_argument(
+        "--cluster",
+        action="store_true",
+        help="also require the SLURM checks (exit 1 unless this is a cluster host)",
     )
     doctor.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
@@ -3426,6 +3745,15 @@ def _parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
 
+    report = subparsers.add_parser(
+        "report",
+        help="scaffold results/<id>/report.md from the request, receipt, and metrics",
+    )
+    report.add_argument("experiment_id", metavar="ID")
+    report.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
+    )
+
     rerun = subparsers.add_parser(
         "rerun",
         help="copy a submitted request to a new ID so it can be submitted again",
@@ -3491,9 +3819,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             result = doctor_repo(repo)
             _print_command_result(
-                result, _render_doctor_result(result), force_json=args.json
+                result,
+                _render_doctor_result(result, require_cluster=args.cluster),
+                force_json=args.json,
             )
-            return 0 if result["cluster_ready"] else 1
+            ready = result["repository_ready"] and (
+                result["cluster_ready"] or not args.cluster
+            )
+            return 0 if ready else 1
         config = load_config(repo)
         if args.command == "new":
             result = new_request(
@@ -3530,8 +3863,18 @@ def main(argv: list[str] | None = None) -> int:
             if output:
                 print(_stdout_safe(output))
         elif args.command == "validate":
-            load_request(repo, config, args.experiment_id)
-            print(f"valid: {args.experiment_id}")
+            request, _ = load_request(repo, config, args.experiment_id, check_git=False)
+            verified_nodes = _validate_request_git(repo, config, request)
+            if sys.stdout.isatty():
+                print(
+                    _stdout_safe(
+                        _render_validate_summary(
+                            args.experiment_id, request, verified_nodes=verified_nodes
+                        )
+                    )
+                )
+            else:
+                print(f"valid: {args.experiment_id}")
         elif args.command == "show":
             request, _ = load_request(repo, config, args.experiment_id)
             print(json.dumps(request, indent=2, sort_keys=True))
@@ -3642,6 +3985,11 @@ def main(argv: list[str] | None = None) -> int:
                 result,
                 _render_clean_result(result),
                 force_json=args.json,
+            )
+        elif args.command == "report":
+            result = report_request(repo, config, args.experiment_id)
+            _print_command_result(
+                result, _render_report_result(result), force_json=args.json
             )
         elif args.command == "rerun":
             result = rerun_request(

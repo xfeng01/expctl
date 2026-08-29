@@ -30,10 +30,12 @@ weaken the repository's own cluster and branch rules here.
 - To cancel, show `expctl cancel <id> --dry-run` and require explicit operator
   authorization before the real command. Record a concise `--reason`, wait
   for a terminal state, and still collect the available evidence.
-- To collect, run `expctl collect <id>`, read every copied log rather than
-  only `metrics.json`, and draft `expctl/results/<id>/report.md` with factual
-  run status, failures, metrics, qualitative observations, and the request's
-  decision rule. Keep inference clearly separate from recorded output.
+- To collect, run `expctl collect <id>`, then `expctl report <id>` to scaffold
+  `expctl/results/<id>/report.md` from the request, receipt, and metrics.
+  Read every copied log rather than only `metrics.json`, and fill in the
+  Observations and Conclusion sections with factual run status, failures,
+  qualitative observations, and the request's decision rule. Keep inference
+  clearly separate from recorded output.
 
 ## Safety and stopping conditions
 

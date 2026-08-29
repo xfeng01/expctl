@@ -53,7 +53,7 @@ commit = "{ZERO_COMMIT}"
 worktree = "myproject-example"
 
 [slurm]
-script = "scripts/example.slurm"
+script = "scripts/sweep.slurm"
 max_concurrent_nodes = 4
 
 [slurm.env]
@@ -176,7 +176,9 @@ def test_new_request_fills_git_identity_and_never_overwrites(
     experiment_id = "20260102-new-sweep"
 
     result = core.new_request(repo, config, experiment_id)
-    request, path = load_request(repo, config, experiment_id, check_git=False)
+    request, path = load_request(
+        repo, config, experiment_id, check_git=False, check_placeholders=False
+    )
 
     assert result["path"] == f"expctl/requests/{experiment_id}.toml"
     assert result["branch"] == "feature/better-ux"
@@ -221,7 +223,9 @@ def test_new_request_uses_real_git_metadata(tmp_path: Path) -> None:
     assert result["branch"] == _git(repo, "branch", "--show-current")
     assert result["worktree"] == "my-project-real-git"
     assert any("train.py" in change for change in result["uncommitted_changes"])
-    request, _ = load_request(repo, config, experiment_id, check_git=False)
+    request, _ = load_request(
+        repo, config, experiment_id, check_git=False, check_placeholders=False
+    )
     assert request["code"]["commit"] == result["commit"]
 
 
@@ -344,7 +348,7 @@ def test_sbatch_command_is_argument_safe(tmp_path: Path) -> None:
         "sbatch",
         "--parsable",
         "--export=ALL,NUM_SAMPLES=256",
-        "scripts/example.slurm",
+        "scripts/sweep.slurm",
     ]
     assert build_sbatch_command(request, ("-p", "example-partition")) == [
         "sbatch",
@@ -352,7 +356,7 @@ def test_sbatch_command_is_argument_safe(tmp_path: Path) -> None:
         "--export=ALL,NUM_SAMPLES=256",
         "-p",
         "example-partition",
-        "scripts/example.slurm",
+        "scripts/sweep.slurm",
     ]
 
 
@@ -482,17 +486,16 @@ def test_list_caches_git_validation_for_shared_commits_and_scripts(
     calls = {"commit": 0, "script": 0}
 
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        assert args[1] == "cat-file"
-        calls["commit"] += 1
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    def fake_git_text(repo: Path, *args: str) -> str:
-        assert args[0] == "show"
+        if args[1] == "cat-file":
+            calls["commit"] += 1
+            return subprocess.CompletedProcess(args, 0, "", "")
+        assert args[1] == "show"
         calls["script"] += 1
-        return "#SBATCH -p example-partition\n#SBATCH --nodes=1\n"
+        return subprocess.CompletedProcess(
+            args, 0, "#SBATCH -p example-partition\n#SBATCH --nodes=1\n", ""
+        )
 
     monkeypatch.setattr(core, "_run", fake_run)
-    monkeypatch.setattr(core, "_git_text", fake_git_text)
 
     rows = core.list_requests(repo, config)
 
@@ -543,8 +546,17 @@ def test_doctor_json_returns_nonzero_when_cluster_is_not_ready(
     monkeypatch.setattr(core, "find_repo_root", lambda: tmp_path)
     monkeypatch.setattr(core, "doctor_repo", lambda repo: result)
 
-    assert core.main(["doctor", "--json"]) == 1
+    # An author's machine has no SLURM: repository readiness alone is success.
+    assert core.main(["doctor", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == result
+    assert core.main(["doctor", "--cluster", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out) == result
+    rendered = core._render_doctor_result(result)
+    assert "informational here" in rendered and "doctor --cluster" in rendered
+    assert "INFO" in rendered and "FAIL" not in rendered
+    strict = core._render_doctor_result(result, require_cluster=True)
+    assert "informational" not in strict and "cluster host" in strict
+    assert "FAIL" in strict and "INFO" not in strict
 
 
 def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
@@ -629,7 +641,7 @@ def test_human_result_renderers_include_lifecycle_next_steps() -> None:
         "experiment_id": EXAMPLE_ID,
         "commit": ZERO_COMMIT,
         "worktree": "/worktrees/example",
-        "command": ["sbatch", "scripts/example.slurm"],
+        "command": ["sbatch", "scripts/sweep.slurm"],
         "declared_max_concurrent_nodes": 4,
         "verified_max_concurrent_nodes": 2,
     }
@@ -661,7 +673,8 @@ def test_human_result_renderers_include_lifecycle_next_steps() -> None:
 
     assert "SUBMISSION PREVIEW" in submit_text
     assert f"expctl submit {EXAMPLE_ID}" in submit_text
-    assert "RESULTS COLLECTED" in collect_text and "report.md" in collect_text
+    assert "RESULTS COLLECTED" in collect_text
+    assert f"expctl report {EXAMPLE_ID}" in collect_text
     assert "RERUN REQUEST CREATED" in rerun_text
     assert f"expctl submit {EXAMPLE_ID}-r2" in rerun_text
 
@@ -1606,6 +1619,200 @@ def test_receipt_summary_names_job_submitter_and_verdict(
 
     receipt.write_text("{not json", encoding="utf-8")
     assert _receipt_summary(tmp_path, receipt) == "unreadable receipt"
+
+
+def test_validate_rejects_template_placeholders(tmp_path: Path) -> None:
+    filled = core._render_new_request(
+        core.STARTER_TEMPLATE,
+        experiment_id=EXAMPLE_ID,
+        branch="main",
+        commit=ZERO_COMMIT,
+        worktree="myproject-example",
+    )
+    repo = _example_repo(tmp_path, filled)
+    config = load_config(repo)
+
+    with pytest.raises(ExpctlError, match="placeholder") as excinfo:
+        load_request(repo, config, EXAMPLE_ID, check_git=False)
+    message = str(excinfo.value)
+    for field in ("title", "question", "decision_rule", "outputs.metrics"):
+        assert field in message
+    load_request(repo, config, EXAMPLE_ID, check_git=False, check_placeholders=False)
+
+    # A request that merely shares one plausible value with the template but
+    # has real content elsewhere is fine.
+    real = filled.replace("Short experiment title", "LR sweep")
+    real = real.replace(
+        "What uncertainty does this experiment resolve?", "Is 1e-4 too high?"
+    )
+    real = real.replace("What result changes the next decision?", "Loss below 2.0.")
+    real = real.replace('"logs/example-{job_id}.out"', '"logs/lr-{job_id}.out"')
+    real = real.replace('["metric_name"]', '["loss"]')
+    real = real.replace('["runs/example/ckpt.pt"]', "[]")
+    real = real.replace('"scripts/example.slurm"', '"scripts/lr.slurm"')
+    request_file = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    request_file.write_text(real, encoding="utf-8")
+    load_request(repo, config, EXAMPLE_ID, check_git=False)
+
+
+def test_git_validation_explains_missing_commits_and_scripts(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "expctl.toml").write_text(EXAMPLE_CONFIG, encoding="utf-8")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "sweep.slurm").write_text(
+        "#!/bin/bash\n#SBATCH -p example-partition\n#SBATCH --nodes=1\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(
+        repo,
+        "-c",
+        "user.name=expctl tests",
+        "-c",
+        "user.email=expctl@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    )
+    commit = _git(repo, "rev-parse", "HEAD")
+    requests = repo / "expctl" / "requests"
+    requests.mkdir(parents=True)
+    config = load_config(repo)
+
+    (requests / f"{EXAMPLE_ID}.toml").write_text(EXAMPLE_REQUEST, encoding="utf-8")
+    with pytest.raises(ExpctlError, match="not in this clone.*git fetch origin main"):
+        load_request(repo, config, EXAMPLE_ID)
+
+    pinned = EXAMPLE_REQUEST.replace(ZERO_COMMIT, commit)
+    (requests / f"{EXAMPLE_ID}.toml").write_text(pinned, encoding="utf-8")
+    request, _ = load_request(repo, config, EXAMPLE_ID)
+    assert core._validate_request_git(repo, config, request) == 1
+
+    missing = pinned.replace("scripts/sweep.slurm", "scripts/missing.slurm")
+    (requests / f"{EXAMPLE_ID}.toml").write_text(missing, encoding="utf-8")
+    with pytest.raises(ExpctlError, match="does not exist at commit .*commit and push"):
+        load_request(repo, config, EXAMPLE_ID)
+
+    with pytest.raises(ExpctlError, match="not inside a Git repository"):
+        core.find_repo_root(tmp_path)
+
+
+def test_validate_cli_prints_a_summary_on_a_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _example_repo(tmp_path)
+    monkeypatch.setattr(core, "find_repo_root", lambda: repo)
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: 2)
+
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: False)
+    assert core.main(["validate", EXAMPLE_ID]) == 0
+    assert capsys.readouterr().out == f"valid: {EXAMPLE_ID}\n"
+
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: True)
+    assert core.main(["validate", EXAMPLE_ID]) == 0
+    human = capsys.readouterr().out
+    assert human.startswith(f"valid: {EXAMPLE_ID}\n")
+    assert "2 verified / 4 declared" in human
+    assert "scripts/sweep.slurm" in human and "NUM_SAMPLES=256" in human
+    assert "Metrics:" in human and "gen_ppl" in human
+
+
+def _collected_receipt(repo: Path, experiment_id: str) -> Path:
+    directory = repo / "expctl" / "results" / experiment_id
+    directory.mkdir(parents=True)
+    receipt = directory / "receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "job_id": "123",
+                "status": "collected",
+                "submitted_at": "2026-08-28T00:26:08+00:00",
+                "submitted_by": "peng",
+                "collection": {
+                    "collected_at": "2026-08-28T09:00:00+00:00",
+                    "logs": [f"expctl/results/{experiment_id}/logs/job-123.out"],
+                    "missing_metrics": ["gen_ppl_full"],
+                    "scheduler": {
+                        "state": "COMPLETED",
+                        "jobs": [
+                            {"job_id": "123", "state": "COMPLETED", "exit_code": "0:0"}
+                        ],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (directory / "metrics.json").write_text(
+        json.dumps({"job-123.out": {"gen_ppl": 24.65}}), encoding="utf-8"
+    )
+    return receipt
+
+
+def test_report_scaffolds_from_collected_results_and_marks_reviewed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_text = EXAMPLE_REQUEST.replace(
+        'metrics = ["gen_ppl"]', 'metrics = ["gen_ppl", "gen_ppl_full"]'
+    )
+    repo = _example_repo(tmp_path, request_text)
+    config = load_config(repo)
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: 1)
+
+    with pytest.raises(ExpctlError, match="not submitted yet"):
+        core.report_request(repo, config, EXAMPLE_ID)
+    _fake_receipt(repo, EXAMPLE_ID)
+    with pytest.raises(ExpctlError, match="not collected yet.*expctl collect"):
+        core.report_request(repo, config, EXAMPLE_ID)
+    (repo / "expctl" / "results" / EXAMPLE_ID / "receipt.json").unlink()
+    (repo / "expctl" / "results" / EXAMPLE_ID).rmdir()
+    _collected_receipt(repo, EXAMPLE_ID)
+    assert core.list_requests(repo, config)[0]["status"] == "collected"
+
+    result = core.report_request(repo, config, EXAMPLE_ID)
+
+    report = repo / "expctl" / "results" / EXAMPLE_ID / "report.md"
+    assert result["path"] == f"expctl/results/{EXAMPLE_ID}/report.md"
+    assert result["metrics"] == ["gen_ppl"]
+    assert result["missing_metrics"] == ["gen_ppl_full"]
+    text = report.read_text(encoding="utf-8")
+    assert text.startswith("# Example sweep\n")
+    assert f"- Request: `expctl/requests/{EXAMPLE_ID}.toml`" in text
+    assert "- Job: 123 submitted 2026-08-28T00:26:08+00:00 by peng" in text
+    assert "- Scheduler: COMPLETED (exit 0:0)" in text
+    assert "## Question\n\nDoes the framework parse a well-formed request?" in text
+    assert "## Decision rule\n\nValidation passes." in text
+    assert "| metric | `job-123.out` |" in text
+    assert "| gen_ppl | 24.65 |" in text
+    assert "| gen_ppl_full | n/a |" in text
+    assert "Missing from every log: `gen_ppl_full`" in text
+    assert "## Observations" in text and "## Conclusion" in text
+    rendered = core._render_report_result(result)
+    assert "REPORT CREATED" in rendered and "git add" in rendered
+
+    with pytest.raises(ExpctlError, match="already exists"):
+        core.report_request(repo, config, EXAMPLE_ID)
+    assert report.read_text(encoding="utf-8") == text
+    assert core.list_requests(repo, config)[0]["status"] == "reviewed"
+    status = {
+        "experiment_id": EXAMPLE_ID,
+        "job_id": "123",
+        "receipt_status": "collected",
+        "report": result["path"],
+    }
+    assert core._status_state(status) == "REVIEWED"
+    assert f"Review {result['path']}" in core._render_status_result(
+        status, result_path=f"expctl/results/{EXAMPLE_ID}"
+    )
+    del status["report"]
+    assert f"expctl report {EXAMPLE_ID}" in core._render_status_result(
+        status, result_path=f"expctl/results/{EXAMPLE_ID}"
+    )
 
 
 def test_version_matches_pyproject() -> None:

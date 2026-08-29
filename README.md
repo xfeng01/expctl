@@ -34,8 +34,8 @@ Complete command reference:
 # Initialize expctl in the current repository.
 expctl init
 
-# Check repository configuration and cluster dependencies.
-expctl doctor [--json]
+# Check repository configuration; --cluster also requires the SLURM tools.
+expctl doctor [--cluster] [--json]
 
 # Create a request from the repository template and fill in Git metadata.
 expctl new <id> [--allow-dirty] [--json]
@@ -46,7 +46,8 @@ expctl list [--table | --tsv | --json] [--status STATUS[,STATUS...]] [--sort new
 # Print one validated request as JSON.
 expctl show <id>
 
-# Validate the request, pinned commit, script, and resource policy.
+# Validate the request, pinned commit, script, and resource policy; a terminal
+# also gets a one-screen summary of what was pinned.
 expctl validate <id>
 
 # Preview or submit a request. Omit --dry-run to call sbatch.
@@ -67,6 +68,9 @@ expctl collect <id> [--worktree-root DIR] [--json]
 # Preview or remove the verified worktree after collection.
 expctl clean <id> [--dry-run] [--worktree-root DIR] [--json]
 
+# Scaffold results/<id>/report.md from the request, receipt, and metrics.
+expctl report <id> [--json]
+
 # Create a new request for the same pinned code.
 expctl rerun <id> [--as NEW_ID] [--reason TEXT] [--json]
 
@@ -80,8 +84,11 @@ expctl <command> --help
 explicit operator authorization.
 
 `new` refuses a dirty working tree because uncommitted changes are not part of
-the pinned `HEAD`; `--allow-dirty` is an explicit override. `doctor` reports
-repository and cluster readiness and exits nonzero unless both are ready.
+the pinned `HEAD`; `--allow-dirty` is an explicit override. `validate` rejects
+a request that still carries starter-template placeholder values (title,
+question, decision rule, script, log glob, metrics, requirements). `doctor`
+exits nonzero when a repository check fails; on the cluster host add
+`--cluster` so the SLURM checks count too.
 
 In a terminal, `list` renders an aligned table. Redirected output defaults to
 TSV. For example:
@@ -139,8 +146,9 @@ The lifecycle is:
 requested -> preparing/submitting -> submitted -> [cancel_requested] -> collected -> reviewed
 ```
 
-`reviewed` is a human conclusion, not a receipt state.
-`submission_unknown` means `sbatch` may have accepted the job but no job ID
+`reviewed` means `results/<id>/report.md` exists: `expctl report` scaffolds it
+from the request, receipt, and metrics, and `list`/`status` show the state,
+but no receipt field is written for it. `submission_unknown` means `sbatch` may have accepted the job but no job ID
 was safely recorded; reconcile it with SLURM manually.
 
 ## Safety rules
