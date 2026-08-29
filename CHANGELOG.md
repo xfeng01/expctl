@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 — 2026-08-29
+
+- Added `expctl new <id>` to create a request from the repository template and
+  fill in its ID, current commit, branch label, and generated worktree name.
+- `new`, `submit`, `status`, `collect`, and `rerun` now show concise summaries
+  and next-step hints on terminals. Redirected output remains JSON, and
+  `--json` forces machine-readable output interactively.
+- `init` now honors an existing `paths.root`, and unsupported
+  `outputs.log_glob` placeholders produce a validation error instead of a
+  Python traceback.
+
 ## 0.4.4 — 2026-08-29
 
 - `collect` now serializes result publication, stages logs and metrics, and

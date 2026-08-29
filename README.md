@@ -33,6 +33,9 @@ Complete command reference:
 # Initialize expctl in the current repository.
 expctl init
 
+# Create a request from the repository template and fill in Git metadata.
+expctl new <id> [--json]
+
 # List experiment requests. Choose at most one output format.
 expctl list [--table | --tsv | --json] [--no-color]
 
@@ -43,16 +46,16 @@ expctl show <id>
 expctl validate <id>
 
 # Preview or submit a request. Omit --dry-run to call sbatch.
-expctl submit <id> [--dry-run] [--worktree-root DIR] [--skip-node-check]
+expctl submit <id> [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
 
 # Show detailed squeue or sacct state for one submitted request.
-expctl status <id>
+expctl status <id> [--json]
 
 # Copy logs, extract metrics, and record the scheduler verdict.
-expctl collect <id> [--worktree-root DIR]
+expctl collect <id> [--worktree-root DIR] [--json]
 
 # Create a new request for the same pinned code.
-expctl rerun <id> [--as NEW_ID] [--reason TEXT]
+expctl rerun <id> [--as NEW_ID] [--reason TEXT] [--json]
 
 # Show version or help.
 expctl --version
@@ -77,6 +80,10 @@ EXPERIMENT ID                 STATUS     TITLE
 Mixed array-task states show `MIXED`. If SLURM is unavailable or returns no
 state, `list` warns once on stderr and keeps the affected rows as `submitted`.
 Receipts are never modified by a refresh.
+
+`new`, `submit`, `status`, `collect`, and `rerun` show concise summaries and a
+suggested next step in an interactive terminal. Redirected output stays JSON;
+use `--json` to force JSON in a terminal.
 
 `submit`, `status`, and `collect` run on the cluster host. The other commands
 also work on Windows.
@@ -120,7 +127,8 @@ was safely recorded; reconcile it with SLURM manually.
 - `expctl.toml` defines repository policy and should be committed.
 - `expctl` never runs `git add`, `git commit`, or `git push`.
 
-Start from `expctl/templates/request.toml`. The
+Use `expctl new <id>` to start from `expctl/templates/request.toml` with the
+current commit, branch, ID, and worktree name filled in. The
 [detailed guide (Chinese)](docs/usage.zh.md) covers every request field,
 configuration option, and recovery procedure. For an AI runner, adapt
 [`examples/skill/SKILL.md`](examples/skill/SKILL.md) with project-specific

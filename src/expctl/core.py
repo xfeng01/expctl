@@ -27,6 +27,7 @@ import os
 import re
 import shlex
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -45,7 +46,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.4.4"
+__version__ = "0.5.0"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -374,9 +375,11 @@ def load_config(repo: Path) -> Config:
 
 
 def init_repo(repo: Path) -> list[str]:
-    root = _resolved_repo_path(repo, DEFAULT_ROOT, "paths.root")
+    config_path = repo / CONFIG_NAME
+    root_name = load_config(repo).root if config_path.is_file() else DEFAULT_ROOT
+    root = _resolved_repo_path(repo, root_name, "paths.root")
     entries = (
-        (repo / CONFIG_NAME, STARTER_CONFIG),
+        (config_path, STARTER_CONFIG),
         (root / "templates" / "request.toml", STARTER_TEMPLATE),
         (root / "requests" / ".gitkeep", ""),
         (root / "results" / ".gitkeep", ""),
@@ -660,8 +663,29 @@ def validate_request(
 
     outputs = _table(data, "outputs")
     log_glob = _text(outputs, "log_glob", "outputs")
-    if "{job_id}" not in log_glob:
+    try:
+        placeholders = [
+            (field, format_spec, conversion)
+            for _, field, format_spec, conversion in string.Formatter().parse(log_glob)
+            if field is not None
+        ]
+    except ValueError as exc:
+        raise ExpctlError(
+            f"invalid outputs.log_glob placeholder syntax: {exc}"
+        ) from exc
+    if not any(field == "job_id" for field, _, _ in placeholders):
         raise ExpctlError("outputs.log_glob must contain {job_id}")
+    unsupported = [
+        field
+        for field, format_spec, conversion in placeholders
+        if field != "job_id" or format_spec or conversion
+    ]
+    if unsupported:
+        rendered = ", ".join(f"{{{field}}}" for field in unsupported)
+        raise ExpctlError(
+            "outputs.log_glob supports only the plain {job_id} placeholder; "
+            f"unsupported: {rendered}"
+        )
     _relative_path(log_glob.format(job_id="123"), "outputs.log_glob")
     metrics = outputs.get("metrics")
     if (
@@ -708,6 +732,104 @@ def _request_hash(path: Path) -> str:
             f"could not read request for hashing at {path}: {exc}"
         ) from exc
     return hashlib.sha256(content).hexdigest()
+
+
+def _new_worktree_name(repo: Path, experiment_id: str) -> str:
+    repository_name = re.sub(r"[^A-Za-z0-9._-]+", "-", repo.name).strip("-._")
+    repository_name = repository_name.lower() or "experiment"
+    short_name = experiment_id.split("-", 1)[1]
+    return _plain_name(f"{repository_name}-{short_name}", "generated code.worktree")
+
+
+def _render_new_request(
+    template: str,
+    *,
+    experiment_id: str,
+    branch: str,
+    commit: str,
+    worktree: str,
+) -> str:
+    replacements = {
+        ("", "id"): experiment_id,
+        ("code", "branch"): branch,
+        ("code", "commit"): commit,
+        ("code", "worktree"): worktree,
+    }
+    found: set[tuple[str, str]] = set()
+    output: list[str] = []
+    section = ""
+    for line in template.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        newline = line[len(body) :]
+        section_match = re.match(r"^\s*\[([^]]+)]\s*(?:#.*)?$", body)
+        if section_match:
+            section = section_match.group(1).strip()
+            output.append(line)
+            continue
+        assignment = re.match(r"^(\s*)([A-Za-z0-9_.-]+)\s*=", body)
+        key = (section, assignment.group(2)) if assignment else None
+        if assignment and key in replacements:
+            value = json.dumps(replacements[key], ensure_ascii=False)
+            output.append(f"{assignment.group(1)}{key[1]} = {value}{newline}")
+            found.add(key)
+        else:
+            output.append(line)
+
+    missing = [
+        f"{section_name + '.' if section_name else ''}{key}"
+        for section_name, key in replacements
+        if (section_name, key) not in found
+    ]
+    if missing:
+        raise ExpctlError(
+            "request template is missing fields required by `expctl new`: "
+            + ", ".join(missing)
+        )
+    return "".join(output)
+
+
+def new_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
+    destination = request_path(repo, config, experiment_id)
+    if destination.exists():
+        raise ExpctlError(f"request already exists: {destination}")
+    template_path = repo / config.root / "templates" / "request.toml"
+    try:
+        template = template_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ExpctlError(
+            f"could not read request template at {template_path}; run `expctl init`: {exc}"
+        ) from exc
+
+    commit = _git_text(repo, "rev-parse", "HEAD").strip()
+    if not COMMIT_RE.fullmatch(commit):
+        raise ExpctlError(f"Git returned an invalid HEAD commit: {commit!r}")
+    branch_result = _run(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=repo,
+        check=False,
+    )
+    branch = branch_result.stdout.strip() or "detached-head"
+    worktree = _new_worktree_name(repo, experiment_id)
+    content = _render_new_request(
+        template,
+        experiment_id=experiment_id,
+        branch=branch,
+        commit=commit,
+        worktree=worktree,
+    )
+    _exclusive_write_text(destination, content)
+    try:
+        load_request(repo, config, experiment_id, check_git=False)
+    except ExpctlError:
+        destination.unlink(missing_ok=True)
+        raise
+    return {
+        "experiment_id": experiment_id,
+        "path": str(destination.relative_to(repo)).replace("\\", "/"),
+        "branch": branch,
+        "commit": commit,
+        "worktree": worktree,
+    }
 
 
 def _worktree_path(
@@ -1698,6 +1820,204 @@ def rerun_request(
     }
 
 
+def _render_summary(
+    heading: str,
+    fields: list[tuple[str, object]],
+    *,
+    next_steps: list[str] | None = None,
+) -> str:
+    visible = [(label, value) for label, value in fields if value not in (None, "")]
+    width = max((len(label) for label, _ in visible), default=0)
+    lines = [heading]
+    lines.extend(
+        f"{label + ':':<{width + 1}}  {_safe_list_cell(value)}"
+        for label, value in visible
+    )
+    if next_steps:
+        lines.extend(["", "Next:"])
+        lines.extend(f"  {_safe_list_cell(step)}" for step in next_steps)
+    return "\n".join(lines)
+
+
+def _render_new_result(result: dict[str, Any]) -> str:
+    experiment_id = str(result["experiment_id"])
+    path = str(result["path"])
+    return _render_summary(
+        "REQUEST CREATED",
+        [
+            ("Experiment", experiment_id),
+            ("Path", path),
+            ("Commit", result["commit"]),
+            ("Branch", result["branch"]),
+            ("Worktree", result["worktree"]),
+        ],
+        next_steps=[
+            f"Edit {path}",
+            shlex.join(["expctl", "validate", experiment_id]),
+        ],
+    )
+
+
+def _render_submit_result(
+    result: dict[str, Any],
+    *,
+    dry_run: bool,
+    worktree_root: Path | None,
+    skip_node_check: bool,
+) -> str:
+    experiment_id = str(result["experiment_id"])
+    nodes = (
+        f"{result.get('verified_max_concurrent_nodes')} verified / "
+        f"{result.get('declared_max_concurrent_nodes')} declared"
+    )
+    fields: list[tuple[str, object]] = [
+        ("Experiment", experiment_id),
+        ("Job", result.get("job_id")),
+        ("Commit", result.get("commit")),
+        ("Worktree", result.get("worktree")),
+        ("Nodes", nodes),
+    ]
+    if dry_run:
+        fields.append(("Command", shlex.join(result["command"])))
+        submit_command = ["expctl", "submit", experiment_id]
+        if worktree_root is not None:
+            submit_command.extend(["--worktree-root", str(worktree_root)])
+        if skip_node_check:
+            submit_command.append("--skip-node-check")
+        return _render_summary(
+            "SUBMISSION PREVIEW",
+            fields,
+            next_steps=[shlex.join(submit_command)],
+        )
+    return _render_summary(
+        "SUBMITTED",
+        fields,
+        next_steps=[shlex.join(["expctl", "status", experiment_id])],
+    )
+
+
+def _render_status_result(result: dict[str, Any], *, result_path: str) -> str:
+    experiment_id = str(result["experiment_id"])
+    receipt_status = str(result.get("receipt_status", "invalid"))
+    counts = result.get("queue_counts", {})
+    accounting = result.get("accounting", {})
+    queue_rows = result.get("queue", [])
+    if receipt_status == "collected":
+        state = "COLLECTED"
+    elif result.get("in_queue"):
+        state = next(iter(counts)) if len(counts) == 1 else "MIXED"
+    elif isinstance(accounting, dict) and accounting.get("state"):
+        state = str(accounting["state"])
+    else:
+        state = receipt_status.upper()
+
+    queue_summary = None
+    if isinstance(counts, dict) and counts:
+        queue_summary = ", ".join(
+            f"{name}={count}" for name, count in sorted(counts.items())
+        )
+    reasons = sorted(
+        {
+            str(row.get("reason"))
+            for row in queue_rows
+            if isinstance(row, dict) and row.get("reason") not in (None, "", "None")
+        }
+    )
+    exit_codes = (
+        sorted(
+            {
+                str(row.get("exit_code"))
+                for row in accounting.get("jobs", [])
+                if isinstance(row, dict) and row.get("exit_code")
+            }
+        )
+        if isinstance(accounting, dict)
+        else []
+    )
+    detail = result.get("detail")
+    if not detail and isinstance(accounting, dict):
+        detail = accounting.get("detail")
+    fields = [
+        ("Experiment", experiment_id),
+        ("Status", state),
+        ("Job", result.get("job_id")),
+        ("Receipt", receipt_status),
+        ("Queue", queue_summary),
+        ("Reason", ", ".join(reasons) if reasons else None),
+        (
+            "Scheduler",
+            accounting.get("state")
+            if receipt_status == "collected" and isinstance(accounting, dict)
+            else None,
+        ),
+        ("Exit", ", ".join(exit_codes) if exit_codes else None),
+        ("Detail", detail),
+    ]
+    if not result.get("job_id"):
+        next_steps = [f"Inspect {result_path}/receipt.json before retrying."]
+    elif receipt_status == "collected":
+        next_steps = [f"Write the conclusion to {result_path}/report.md"]
+    elif result.get("in_queue"):
+        command = shlex.join(["expctl", "status", experiment_id])
+        next_steps = [f"Wait for SLURM, then run: {command}"]
+    else:
+        next_steps = [shlex.join(["expctl", "collect", experiment_id])]
+    return _render_summary("EXPERIMENT STATUS", fields, next_steps=next_steps)
+
+
+def _render_collect_result(
+    result: dict[str, Any], *, experiment_id: str, result_path: str
+) -> str:
+    scheduler = result.get("scheduler", {})
+    scheduler_state = (
+        scheduler.get("state") if isinstance(scheduler, dict) else scheduler
+    )
+    missing = result.get("missing_metrics", [])
+    return _render_summary(
+        "RESULTS COLLECTED",
+        [
+            ("Experiment", experiment_id),
+            ("Scheduler", scheduler_state),
+            ("Logs", len(result.get("logs", []))),
+            ("Metrics", result.get("metrics_file")),
+            ("Missing", ", ".join(missing) if missing else "none"),
+        ],
+        next_steps=[f"Write the conclusion to {result_path}/report.md"],
+    )
+
+
+def _render_rerun_result(result: dict[str, Any]) -> str:
+    experiment_id = str(result["experiment_id"])
+    path = str(result["path"])
+    return _render_summary(
+        "RERUN REQUEST CREATED",
+        [
+            ("Experiment", experiment_id),
+            ("Rerun of", result["rerun_of"]),
+            ("Path", path),
+            ("Commit", result["commit"]),
+            ("Worktree", result["worktree"]),
+        ],
+        next_steps=[
+            shlex.join(["git", "add", path]),
+            shlex.join(["git", "commit", "-m", f"Add rerun request {experiment_id}"]),
+            shlex.join(["expctl", "submit", experiment_id]),
+        ],
+    )
+
+
+def _print_command_result(
+    result: dict[str, Any], human_output: str, *, force_json: bool
+) -> bool:
+    """Print one command result; return whether human output was selected."""
+    human = sys.stdout.isatty() and not force_json
+    if human:
+        print(_stdout_safe(human_output))
+    else:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    return human
+
+
 LIST_HEADERS = ("EXPERIMENT ID", "STATUS", "TITLE")
 STATUS_COLORS = {
     "requested": "\x1b[36m",
@@ -1906,7 +2226,15 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser(
-        "init", help=f"create {CONFIG_NAME} and the {DEFAULT_ROOT}/ skeleton"
+        "init", help=f"create {CONFIG_NAME} and the configured data skeleton"
+    )
+
+    new = subparsers.add_parser(
+        "new", help="create a request from the repository template"
+    )
+    new.add_argument("experiment_id", metavar="ID")
+    new.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
 
     listing = subparsers.add_parser(
@@ -1940,14 +2268,18 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     validate = subparsers.add_parser("validate", help="validate one request")
-    validate.add_argument("experiment_id")
+    validate.add_argument("experiment_id", metavar="ID")
 
     show = subparsers.add_parser("show", help="print one validated request as JSON")
-    show.add_argument("experiment_id")
+    show.add_argument("experiment_id", metavar="ID")
 
     submit = subparsers.add_parser("submit", help="submit one request through SLURM")
-    submit.add_argument("experiment_id")
-    submit.add_argument("--dry-run", action="store_true")
+    submit.add_argument("experiment_id", metavar="ID")
+    submit.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and preview without creating a worktree or calling sbatch",
+    )
     submit.add_argument(
         "--skip-node-check",
         action="store_true",
@@ -1958,25 +2290,34 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="parent directory for detached experiment worktrees",
     )
+    submit.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
+    )
 
     status = subparsers.add_parser(
         "status", help="report queue and accounting state for a submitted request"
     )
-    status.add_argument("experiment_id")
+    status.add_argument("experiment_id", metavar="ID")
+    status.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
+    )
 
     collect = subparsers.add_parser("collect", help="copy logs and extract metrics")
-    collect.add_argument("experiment_id")
+    collect.add_argument("experiment_id", metavar="ID")
     collect.add_argument(
         "--worktree-root",
         type=Path,
         help="parent directory used for the submitted experiment worktree",
+    )
+    collect.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
 
     rerun = subparsers.add_parser(
         "rerun",
         help="copy a submitted request to a new ID so it can be submitted again",
     )
-    rerun.add_argument("experiment_id")
+    rerun.add_argument("experiment_id", metavar="ID")
     rerun.add_argument(
         "--as",
         dest="new_id",
@@ -1984,7 +2325,12 @@ def _parser() -> argparse.ArgumentParser:
         help="ID for the copy (default: <id>-r2, then -r3, ...)",
     )
     rerun.add_argument(
-        "--reason", help='recorded in the copy as rerun_reason, e.g. "preempted"'
+        "--reason",
+        metavar="TEXT",
+        help='recorded in the copy as rerun_reason, e.g. "preempted"',
+    )
+    rerun.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
     return parser
 
@@ -2003,7 +2349,12 @@ def main(argv: list[str] | None = None) -> int:
                 print("Nothing to do; expctl files already exist.")
             return 0
         config = load_config(repo)
-        if args.command == "list":
+        if args.command == "new":
+            result = new_request(repo, config, args.experiment_id)
+            _print_command_result(
+                result, _render_new_result(result), force_json=args.json
+            )
+        elif args.command == "list":
             rows = list_requests(repo, config)
             output_format = args.list_format
             if output_format == "auto":
@@ -2035,10 +2386,26 @@ def main(argv: list[str] | None = None) -> int:
                 skip_node_check=args.skip_node_check,
                 worktree_root=args.worktree_root,
             )
-            print(json.dumps(result, indent=2, sort_keys=True))
+            _print_command_result(
+                result,
+                _render_submit_result(
+                    result,
+                    dry_run=args.dry_run,
+                    worktree_root=args.worktree_root,
+                    skip_node_check=args.skip_node_check,
+                ),
+                force_json=args.json,
+            )
         elif args.command == "status":
             result = status_request(repo, config, args.experiment_id)
-            print(json.dumps(result, indent=2, sort_keys=True))
+            result_path = str(
+                result_dir(repo, config, args.experiment_id).relative_to(repo)
+            ).replace("\\", "/")
+            _print_command_result(
+                result,
+                _render_status_result(result, result_path=result_path),
+                force_json=args.json,
+            )
         elif args.command == "collect":
             result = collect_request(
                 repo,
@@ -2046,7 +2413,18 @@ def main(argv: list[str] | None = None) -> int:
                 args.experiment_id,
                 worktree_root=args.worktree_root,
             )
-            print(json.dumps(result, indent=2, sort_keys=True))
+            result_path = str(
+                result_dir(repo, config, args.experiment_id).relative_to(repo)
+            ).replace("\\", "/")
+            _print_command_result(
+                result,
+                _render_collect_result(
+                    result,
+                    experiment_id=args.experiment_id,
+                    result_path=result_path,
+                ),
+                force_json=args.json,
+            )
         elif args.command == "rerun":
             result = rerun_request(
                 repo,
@@ -2055,12 +2433,15 @@ def main(argv: list[str] | None = None) -> int:
                 new_id=args.new_id,
                 reason=args.reason,
             )
-            print(json.dumps(result, indent=2, sort_keys=True))
-            print(
-                f"next: git add {result['path']} && git commit, "
-                f"then expctl submit {result['experiment_id']}",
-                file=sys.stderr,
+            human = _print_command_result(
+                result, _render_rerun_result(result), force_json=args.json
             )
+            if not human:
+                print(
+                    f"next: git add {result['path']} && git commit, "
+                    f"then expctl submit {result['experiment_id']}",
+                    file=sys.stderr,
+                )
         return 0
     except ExpctlError as exc:
         print(f"error: {exc}", file=sys.stderr)

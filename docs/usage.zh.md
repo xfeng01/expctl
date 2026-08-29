@@ -59,18 +59,22 @@ expctl/
 └── templates/request.toml  # 请求模板
 ```
 
-随后编辑 `expctl.toml`，至少确认允许的 SLURM 参数、节点上限、共享运行时目录和 worktree 位置。若修改 `paths.root`，需将 `init` 生成的目录移动到新位置。
+随后编辑 `expctl.toml`，至少确认允许的 SLURM 参数、节点上限、共享运行时目录和 worktree 位置。若修改 `paths.root`，再次运行 `expctl init` 会在新位置补齐目录，但不会移动或删除旧目录。
 
 将 `expctl.toml`、请求、模板和结果元数据纳入版本控制。不要提交数据集、模型权重、缓存或密钥。expctl 只读写文件，不会自动执行 `git add`、`git commit` 或 `git push`。
 
 ## 三、创建并发布实验请求
 
 1. 提交并推送本次实验所需的脚本、配置和评测代码。
-2. 将 `<root>/templates/request.toml` 复制为 `<root>/requests/<id>.toml`，填写请求字段。
-3. 使用完整的 40 位提交哈希固定代码版本：
+2. 从模板创建请求；命令会自动填写 ID、当前 commit、branch 和 worktree 名称：
 
    ```bash
-   git rev-parse HEAD
+   expctl new 20260901-lr-sweep
+   ```
+
+3. 编辑生成的请求，填写实验问题、判定规则、SLURM 脚本、输出和指标，然后验证：
+
+   ```bash
    expctl validate 20260901-lr-sweep
    ```
 
@@ -91,6 +95,8 @@ expctl submit <id>
 ```
 
 `expctl list` 在交互终端中自动显示按终端宽度对齐的表格，中文按实际显示宽度计算，过长标题以 `…` 截断；状态在支持颜色的终端中会着色。对于带有效作业号的 `submitted` 回执，它会把所有作业号合并为一次 `squeue` 查询，再把已离开队列的作业合并为一次 `sacct` 查询；数组任务同时存在多种状态时显示 `MIXED`。查询是只读的，不修改回执；若 SLURM 命令缺失、查询失败或部分作业无状态，受影响的行安全回退为 `submitted`，并且只在标准错误输出一条警告。输出到管道或文件时仍使用纯净、稳定的 TSV；JSON 同样只写入标准输出。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color`（以及标准 `NO_COLOR` 环境变量）关闭颜色。
+
+`new`、`submit`、`status`、`collect` 和 `rerun` 在交互终端中显示简洁摘要和建议的下一步；输出到管道或文件时保持 JSON。需要在终端中获取 JSON 时使用 `--json`。
 
 `--dry-run` 会验证请求并输出固定提交、worktree 路径、`sbatch` 命令、声明的节点上限和从作业脚本推导出的节点上限。它不会创建 worktree、链接共享目录、检查运行时依赖或当前节点预算，也不会调用 `sbatch`。
 
@@ -143,7 +149,7 @@ expctl collect <id> [--worktree-root <dir>]
 | `slurm.script` | 固定提交中的仓库相对路径，不得越出仓库 |
 | `slurm.max_concurrent_nodes` | 本请求允许的最坏并发节点数，至少为 1，且不能超过非零的 `scheduler.max_total_nodes`；固定脚本必须显式写出数字形式的 `#SBATCH --nodes`，数组范围和 `%N` 节流也必须可静态解析，推导值不得超过这里的声明 |
 | `slurm.env` | 传给 `sbatch --export` 的环境变量；名称须匹配 `[A-Za-z_][A-Za-z0-9_]*` 且不能是 `GROUPS`，值必须是字符串且不能包含逗号或换行 |
-| `outputs.log_glob` | 相对于实验 worktree 的 glob，不得越出 worktree，且必须包含 `{job_id}` |
+| `outputs.log_glob` | 相对于实验 worktree 的 glob，不得越出 worktree；唯一支持的占位符是必须出现的 `{job_id}` |
 | `outputs.metrics` | 非空指标名数组；可提取的名称须匹配 `[A-Za-z_][A-Za-z0-9_.-]*`，对应值必须是独占一行的数字 |
 | `notes.requirements` | 可选的 worktree 相对路径数组；正式提交前逐项检查是否存在 |
 | `notes.instructions` | 可选的操作说明；expctl 不解释其内容 |
@@ -187,16 +193,17 @@ root = ".."
 
 | 命令 | 作用 |
 |---|---|
-| `expctl init` | 补齐默认配置和目录结构 |
+| `expctl init` | 补齐配置和 `paths.root` 指定的目录结构 |
+| `expctl new <id> [--json]` | 从模板创建请求，并填写当前 Git commit、branch 和 worktree 名称 |
 | `expctl list [--table\|--tsv\|--json] [--no-color]` | 列出请求及其仓库状态；在集群上刷新已提交作业状态，终端默认表格，管道默认 TSV |
 | `expctl validate <id>` | 验证请求、固定提交和作业脚本策略 |
 | `expctl show <id>` | 将验证后的请求输出为 JSON |
-| `expctl submit <id>` | 准备 worktree、检查依赖和预算，并提交 SLURM 作业 |
+| `expctl submit <id> [--json]` | 准备 worktree、检查依赖和预算，并提交 SLURM 作业 |
 | `expctl submit <id> --dry-run` | 验证并预览提交，不创建资源或调用 SLURM |
 | `expctl submit <id> --worktree-root <dir>` | 本次提交使用指定的 worktree 父目录 |
-| `expctl status <id>` | 查询队列；不在队列时查询记账记录 |
-| `expctl collect <id> [--worktree-root <dir>]` | 复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致 |
-| `expctl rerun <id> [--as <new-id>] [--reason <text>]` | 把已提交的请求复制为新 ID（默认 `<id>-r2`、`-r3`……），写入 `rerun_of`，供再次提交；commit 和 worktree 不变 |
+| `expctl status <id> [--json]` | 查询队列；不在队列时查询记账记录 |
+| `expctl collect <id> [--worktree-root <dir>] [--json]` | 复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致 |
+| `expctl rerun <id> [--as <new-id>] [--reason <text>] [--json]` | 把已提交的请求复制为新 ID（默认 `<id>-r2`、`-r3`……），写入 `rerun_of`，供再次提交；commit 和 worktree 不变 |
 
 `expctl list` 显示的标准状态：
 

@@ -88,6 +88,19 @@ def test_init_creates_skeleton_and_is_idempotent(tmp_path: Path) -> None:
     assert init_repo(tmp_path) == []
 
 
+def test_init_honors_an_existing_custom_root(tmp_path: Path) -> None:
+    config_text = EXAMPLE_CONFIG.replace(
+        "[scheduler]", '[paths]\nroot = "handoffs/cluster"\n\n[scheduler]'
+    )
+    (tmp_path / "expctl.toml").write_text(config_text, encoding="utf-8")
+
+    created = init_repo(tmp_path)
+
+    assert "handoffs/cluster/templates/request.toml" in created
+    assert (tmp_path / "handoffs" / "cluster" / "requests" / ".gitkeep").is_file()
+    assert not (tmp_path / "expctl").exists()
+
+
 def test_root_directory_is_configurable(tmp_path: Path) -> None:
     config_text = EXAMPLE_CONFIG.replace(
         "[scheduler]", '[paths]\nroot = "handoffs/cluster"\n\n[scheduler]'
@@ -141,6 +154,69 @@ def test_wellformed_request_validates(tmp_path: Path) -> None:
     assert len(request["code"]["commit"]) == 40
 
 
+def test_new_request_fills_git_identity_and_never_overwrites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    template = repo / "expctl" / "templates" / "request.toml"
+    template.parent.mkdir()
+    template.write_text(core.STARTER_TEMPLATE, encoding="utf-8")
+    monkeypatch.setattr(core, "_git_text", lambda *args: "a" * 40 + "\n")
+    monkeypatch.setattr(
+        core,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [], 0, "feature/better-ux\n", ""
+        ),
+    )
+    experiment_id = "20260102-new-sweep"
+
+    result = core.new_request(repo, config, experiment_id)
+    request, path = load_request(repo, config, experiment_id, check_git=False)
+
+    assert result["path"] == f"expctl/requests/{experiment_id}.toml"
+    assert result["branch"] == "feature/better-ux"
+    assert request["id"] == experiment_id
+    assert request["code"]["commit"] == "a" * 40
+    assert request["code"]["branch"] == "feature/better-ux"
+    assert request["code"]["worktree"].endswith("-new-sweep")
+    assert "Next:" in core._render_new_result(result)
+    original = path.read_text(encoding="utf-8")
+    with pytest.raises(ExpctlError, match="already exists"):
+        core.new_request(repo, config, experiment_id)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_new_request_uses_real_git_metadata(tmp_path: Path) -> None:
+    repo = tmp_path / "My Project"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    init_repo(repo)
+    _git(repo, "add", ".")
+    _git(
+        repo,
+        "-c",
+        "user.name=expctl tests",
+        "-c",
+        "user.email=expctl@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    )
+    config = load_config(repo)
+    experiment_id = "20260103-real-git"
+
+    result = core.new_request(repo, config, experiment_id)
+
+    assert result["commit"] == _git(repo, "rev-parse", "HEAD")
+    assert result["branch"] == _git(repo, "branch", "--show-current")
+    assert result["worktree"] == "my-project-real-git"
+    request, _ = load_request(repo, config, experiment_id, check_git=False)
+    assert request["code"]["commit"] == result["commit"]
+
+
 def test_request_cannot_exceed_the_node_ceiling(tmp_path: Path) -> None:
     text = EXAMPLE_REQUEST.replace(
         "max_concurrent_nodes = 4", "max_concurrent_nodes = 5"
@@ -169,6 +245,18 @@ def test_plain_names_reject_dot_segments(tmp_path: Path) -> None:
     )
     with pytest.raises(ExpctlError, match="plain directory name"):
         load_config(repo)
+
+
+def test_log_glob_rejects_unknown_placeholders_cleanly(tmp_path: Path) -> None:
+    request_text = EXAMPLE_REQUEST.replace(
+        'log_glob = "logs/example-{job_id}_*.out"',
+        'log_glob = "logs/{job_id}-{task}.out"',
+    )
+    repo = _example_repo(tmp_path, request_text)
+    config = load_config(repo)
+
+    with pytest.raises(ExpctlError, match="supports only the plain .*job_id"):
+        load_request(repo, config, EXAMPLE_ID, check_git=False)
 
 
 def test_script_node_envelope_includes_array_throttle() -> None:
@@ -322,6 +410,8 @@ def test_list_tsv_is_single_line_per_request_and_parser_exposes_formats() -> Non
         ["collect", EXAMPLE_ID, "--worktree-root", "worktrees"]
     )
     assert collect_args.worktree_root == Path("worktrees")
+    assert core._parser().parse_args(["new", EXAMPLE_ID]).json is False
+    assert core._parser().parse_args(["status", EXAMPLE_ID, "--json"]).json is True
 
 
 def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
@@ -347,6 +437,89 @@ def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
 
     assert core.main(["list", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == rows
+
+
+def test_status_cli_uses_a_human_summary_on_tty_and_honors_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = Config(
+        root="expctl",
+        required_script_lines=(),
+        max_total_nodes=0,
+        shared_dirs=(),
+        create_missing=(),
+        worktree_root="..",
+    )
+    payload = {
+        "experiment_id": EXAMPLE_ID,
+        "job_id": "123",
+        "receipt_status": "submitted",
+        "in_queue": False,
+        "queue_counts": {},
+        "queue": [],
+        "accounting": {"state": "COMPLETED", "jobs": []},
+    }
+    monkeypatch.setattr(core, "find_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(core, "load_config", lambda repo: config)
+    monkeypatch.setattr(core, "status_request", lambda *args: payload)
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: True)
+
+    assert core.main(["status", EXAMPLE_ID]) == 0
+    human = capsys.readouterr().out
+    assert "EXPERIMENT STATUS" in human
+    assert "Status:" in human and "COMPLETED" in human
+    assert f"expctl collect {EXAMPLE_ID}" in human
+
+    assert core.main(["status", EXAMPLE_ID, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == payload
+
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: False)
+    assert core.main(["status", EXAMPLE_ID]) == 0
+    assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_human_result_renderers_include_lifecycle_next_steps() -> None:
+    preview = {
+        "experiment_id": EXAMPLE_ID,
+        "commit": ZERO_COMMIT,
+        "worktree": "/worktrees/example",
+        "command": ["sbatch", "scripts/example.slurm"],
+        "declared_max_concurrent_nodes": 4,
+        "verified_max_concurrent_nodes": 2,
+    }
+    submit_text = core._render_submit_result(
+        preview,
+        dry_run=True,
+        worktree_root=Path("/worktrees"),
+        skip_node_check=False,
+    )
+    collect_text = core._render_collect_result(
+        {
+            "logs": ["one.out"],
+            "metrics_file": "expctl/results/example/metrics.json",
+            "missing_metrics": [],
+            "scheduler": {"state": "COMPLETED"},
+        },
+        experiment_id=EXAMPLE_ID,
+        result_path=f"expctl/results/{EXAMPLE_ID}",
+    )
+    rerun_text = core._render_rerun_result(
+        {
+            "experiment_id": f"{EXAMPLE_ID}-r2",
+            "rerun_of": EXAMPLE_ID,
+            "path": f"expctl/requests/{EXAMPLE_ID}-r2.toml",
+            "commit": ZERO_COMMIT,
+            "worktree": "myproject-example",
+        }
+    )
+
+    assert "SUBMISSION PREVIEW" in submit_text
+    assert f"expctl submit {EXAMPLE_ID}" in submit_text
+    assert "RESULTS COLLECTED" in collect_text and "report.md" in collect_text
+    assert "RERUN REQUEST CREATED" in rerun_text
+    assert f"expctl submit {EXAMPLE_ID}-r2" in rerun_text
 
 
 def test_list_refreshes_submitted_receipts_without_mutating_them(
