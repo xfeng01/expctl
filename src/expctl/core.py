@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -226,6 +226,29 @@ def _atomic_copy2(source: Path, target: Path) -> None:
                 pass
 
 
+def _exclusive_copy2(source: Path, target: Path) -> None:
+    """Copy a file only if the destination does not already exist."""
+    created = False
+    try:
+        with source.open("rb") as source_handle, target.open("xb") as target_handle:
+            created = True
+            shutil.copyfileobj(source_handle, target_handle)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        shutil.copystat(source, target)
+    except FileExistsError as exc:
+        raise ExpctlError(
+            f"file already exists and will not be overwritten: {target}"
+        ) from exc
+    except OSError as exc:
+        if created:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise ExpctlError(f"could not copy {source} to {target}: {exc}") from exc
+
+
 def _exclusive_write_text(path: Path, content: str) -> None:
     """Create a file once; concurrent callers cannot overwrite the winner."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -308,7 +331,8 @@ def load_config(repo: Path) -> Config:
     data_root = tables["paths"].get("root", DEFAULT_ROOT)
     if not isinstance(data_root, str) or not data_root.strip():
         raise ExpctlError("paths.root must be a non-empty string")
-    _relative_path(data_root, "paths.root")
+    resolved_data_root = _resolved_repo_path(repo, data_root, "paths.root")
+    data_root = resolved_data_root.relative_to(repo.resolve()).as_posix()
 
     max_total = tables["scheduler"].get("max_total_nodes", 0)
     if not isinstance(max_total, int) or isinstance(max_total, bool) or max_total < 0:
@@ -350,7 +374,7 @@ def load_config(repo: Path) -> Config:
 
 
 def init_repo(repo: Path) -> list[str]:
-    root = repo / DEFAULT_ROOT
+    root = _resolved_repo_path(repo, DEFAULT_ROOT, "paths.root")
     entries = (
         (repo / CONFIG_NAME, STARTER_CONFIG),
         (root / "templates" / "request.toml", STARTER_TEMPLATE),
@@ -397,6 +421,20 @@ def _relative_path(value: str, field: str) -> PurePosixPath:
     if path.is_absolute() or ".." in path.parts or ":" in normalized:
         raise ExpctlError(f"{field} must stay inside the repository: {value}")
     return path
+
+
+def _resolved_repo_path(repo: Path, value: str, field: str) -> Path:
+    """Resolve a repository-relative path without allowing symlink escapes."""
+    relative = _relative_path(value, field)
+    repository = repo.resolve()
+    resolved = repository.joinpath(*relative.parts).resolve()
+    try:
+        resolved.relative_to(repository)
+    except ValueError as exc:
+        raise ExpctlError(
+            f"{field} must resolve inside the repository: {value}"
+        ) from exc
+    return resolved
 
 
 def _git_text(repo: Path, *args: str) -> str:
@@ -904,6 +942,15 @@ def _worktree_submission_guard(repo: Path, worktree: Path) -> Iterator[None]:
         yield
 
 
+@contextlib.contextmanager
+def _result_collection_guard(repo: Path, experiment_id: str) -> Iterator[None]:
+    """Serialize result publication for one experiment in this repository."""
+    with _git_metadata_lock(
+        repo, f"expctl-collect-{experiment_id}.lock", "result collection"
+    ):
+        yield
+
+
 def _check_worktree_available(
     repo: Path,
     config: Config,
@@ -1358,90 +1405,183 @@ def _live_scheduler_status(repo: Path, job_id: str) -> str | None:
     return statuses.get(job_id)
 
 
-def collect_request(repo: Path, config: Config, experiment_id: str) -> dict[str, Any]:
-    request, path = load_request(repo, config, experiment_id, check_git=False)
-    destination = result_dir(repo, config, experiment_id)
-    receipt_path = destination / "receipt.json"
-    if not receipt_path.is_file():
-        raise ExpctlError(f"submission receipt not found: {receipt_path}")
-    receipt = _load_receipt(receipt_path)
-    if receipt.get("request_sha256") != _request_hash(path):
-        raise ExpctlError(
-            "request changed after submission; restore it before collecting results"
-        )
-
-    job_id = receipt.get("job_id")
-    if not isinstance(job_id, str) or not job_id:
-        raise ExpctlError(
-            f"submission has no confirmed job ID (receipt status: "
-            f"{receipt.get('status', 'invalid')})"
-        )
-    queue = _queue_status(repo, job_id)
-    if queue:
-        states = ", ".join(
-            f"{state}={count}"
-            for state, count in sorted(
-                {
-                    state: sum(row["state"] == state for row in queue)
-                    for state in {row["state"] for row in queue}
-                }.items()
+def collect_request(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    *,
+    worktree_root: Path | None = None,
+) -> dict[str, Any]:
+    # Validate the ID before using it in the Git lock name.
+    request_path(repo, config, experiment_id)
+    with _result_collection_guard(repo, experiment_id):
+        request, path = load_request(repo, config, experiment_id, check_git=False)
+        destination = result_dir(repo, config, experiment_id)
+        receipt_path = destination / "receipt.json"
+        if not receipt_path.is_file():
+            raise ExpctlError(f"submission receipt not found: {receipt_path}")
+        receipt = _load_receipt(receipt_path)
+        if receipt.get("status") == "collected":
+            raise ExpctlError(
+                f"results for {experiment_id} have already been collected; "
+                "existing evidence will not be overwritten"
             )
-        )
-        raise ExpctlError(
-            f"job {job_id} is still in the queue ({states}); collect after it leaves"
-        )
 
-    worktree_text = receipt.get("worktree")
-    if not isinstance(worktree_text, str) or not worktree_text:
-        raise ExpctlError("submission receipt has no valid worktree path")
-    worktree = Path(worktree_text)
-    if not worktree.is_dir():
-        raise ExpctlError(f"submission worktree is missing: {worktree}")
-    pattern = request["outputs"]["log_glob"].format(job_id=job_id)
-    sources = sorted(source for source in worktree.glob(pattern) if source.is_file())
-    if not sources:
-        raise ExpctlError(f"no log files match {worktree / pattern}")
+        request_sha256 = receipt.get("request_sha256")
+        if request_sha256 != _request_hash(path):
+            raise ExpctlError(
+                "request changed after submission; restore it before collecting results"
+            )
 
-    names: dict[str, list[Path]] = {}
-    for source in sources:
-        names.setdefault(source.name.casefold(), []).append(source)
-    collisions = [matches for matches in names.values() if len(matches) > 1]
-    if collisions:
-        rendered = "; ".join(
-            ", ".join(str(path) for path in matches) for matches in collisions
-        )
-        raise ExpctlError(
-            "log files have colliding basenames and cannot be collected safely: "
-            f"{rendered}"
-        )
+        logs_dir = destination / "logs"
+        metrics_path = destination / "metrics.json"
+        existing = [
+            artifact
+            for artifact in (logs_dir, metrics_path)
+            if artifact.exists() or artifact.is_symlink()
+        ]
+        if existing:
+            rendered = ", ".join(str(artifact) for artifact in existing)
+            raise ExpctlError(
+                "collection artifacts already exist and will not be overwritten: "
+                f"{rendered}"
+            )
 
-    logs_dir = destination / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    metric_names = request["outputs"]["metrics"]
-    metrics: dict[str, dict[str, float]] = {}
-    copied: list[str] = []
-    for source in sources:
-        target = logs_dir / source.name
-        _atomic_copy2(source, target)
-        copied.append(str(target.relative_to(repo)).replace("\\", "/"))
-        metrics[source.name] = extract_metrics(
-            target.read_text(encoding="utf-8", errors="replace"), metric_names
-        )
+        job_id = receipt.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ExpctlError(
+                f"submission has no confirmed job ID (receipt status: "
+                f"{receipt.get('status', 'invalid')})"
+            )
+        queue = _queue_status(repo, job_id)
+        if queue:
+            states = ", ".join(
+                f"{state}={count}"
+                for state, count in sorted(
+                    {
+                        state: sum(row["state"] == state for row in queue)
+                        for state in {row["state"] for row in queue}
+                    }.items()
+                )
+            )
+            raise ExpctlError(
+                f"job {job_id} is still in the queue ({states}); "
+                "collect after it leaves"
+            )
 
-    metrics_path = destination / "metrics.json"
-    _atomic_write_json(metrics_path, metrics)
-    found_metrics = {metric for values in metrics.values() for metric in values}
-    collection = {
-        "collected_at": dt.datetime.now(dt.UTC).isoformat(),
-        "logs": copied,
-        "metrics_file": str(metrics_path.relative_to(repo)).replace("\\", "/"),
-        "missing_metrics": sorted(set(metric_names) - found_metrics),
-        "scheduler": _scheduler_status(repo, job_id),
-    }
-    receipt["status"] = "collected"
-    receipt["collection"] = collection
-    _atomic_write_json(receipt_path, receipt)
-    return collection
+        expected_worktree = _worktree_path(
+            repo, config, request, override_root=worktree_root
+        )
+        worktree_text = receipt.get("worktree")
+        if (
+            not isinstance(worktree_text, str)
+            or not worktree_text
+            or not Path(worktree_text).is_absolute()
+        ):
+            raise ExpctlError("submission receipt has no valid absolute worktree path")
+        recorded_worktree = Path(worktree_text).resolve()
+        if recorded_worktree != expected_worktree:
+            raise ExpctlError(
+                f"receipt worktree {recorded_worktree} does not match expected "
+                f"worktree {expected_worktree}; pass the same --worktree-root used "
+                "for submit"
+            )
+        if not expected_worktree.is_dir():
+            raise ExpctlError(f"submission worktree is missing: {expected_worktree}")
+        pattern = request["outputs"]["log_glob"].format(job_id=job_id)
+        sources = sorted(
+            source for source in expected_worktree.glob(pattern) if source.is_file()
+        )
+        if not sources:
+            raise ExpctlError(f"no log files match {expected_worktree / pattern}")
+
+        names: dict[str, list[Path]] = {}
+        for source in sources:
+            names.setdefault(source.name.casefold(), []).append(source)
+        collisions = [matches for matches in names.values() if len(matches) > 1]
+        if collisions:
+            rendered = "; ".join(
+                ", ".join(str(collision) for collision in matches)
+                for matches in collisions
+            )
+            raise ExpctlError(
+                "log files have colliding basenames and cannot be collected safely: "
+                f"{rendered}"
+            )
+
+        try:
+            staging = Path(tempfile.mkdtemp(prefix=".collect-", dir=destination))
+        except OSError as exc:
+            raise ExpctlError(
+                f"could not create result staging directory in {destination}: {exc}"
+            ) from exc
+        published_logs = False
+        published_metrics = False
+        try:
+            staged_logs = staging / "logs"
+            staged_logs.mkdir()
+            metric_names = request["outputs"]["metrics"]
+            metrics: dict[str, dict[str, float]] = {}
+            copied: list[str] = []
+            for source in sources:
+                staged_log = staged_logs / source.name
+                _atomic_copy2(source, staged_log)
+                final_log = logs_dir / source.name
+                copied.append(str(final_log.relative_to(repo)).replace("\\", "/"))
+                metrics[source.name] = extract_metrics(
+                    staged_log.read_text(encoding="utf-8", errors="replace"),
+                    metric_names,
+                )
+
+            staged_metrics = staging / "metrics.json"
+            _atomic_write_json(staged_metrics, metrics)
+            found_metrics = {metric for values in metrics.values() for metric in values}
+            collection = {
+                "collected_at": dt.datetime.now(dt.UTC).isoformat(),
+                "logs": copied,
+                "metrics_file": str(metrics_path.relative_to(repo)).replace("\\", "/"),
+                "missing_metrics": sorted(set(metric_names) - found_metrics),
+                "scheduler": _scheduler_status(repo, job_id),
+            }
+
+            # Do not publish evidence if the request changed during collection.
+            if request_sha256 != _request_hash(path):
+                raise ExpctlError(
+                    "request changed during collection; restore it and try again"
+                )
+
+            try:
+                logs_dir.mkdir()
+            except FileExistsError as exc:
+                raise ExpctlError(
+                    f"collection artifacts already exist and will not be overwritten: "
+                    f"{logs_dir}"
+                ) from exc
+            except OSError as exc:
+                raise ExpctlError(
+                    f"could not create result log directory {logs_dir}: {exc}"
+                ) from exc
+            published_logs = True
+            for staged_log in staged_logs.iterdir():
+                _exclusive_copy2(staged_log, logs_dir / staged_log.name)
+
+            _exclusive_write_text(
+                metrics_path, staged_metrics.read_text(encoding="utf-8")
+            )
+            published_metrics = True
+            receipt["status"] = "collected"
+            receipt["collection"] = collection
+            _atomic_write_json(receipt_path, receipt)
+            return collection
+        except BaseException:
+            if published_metrics:
+                with contextlib.suppress(OSError):
+                    metrics_path.unlink(missing_ok=True)
+            if published_logs:
+                shutil.rmtree(logs_dir, ignore_errors=True)
+            raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def _receipt_summary(repo: Path, receipt_path: Path) -> str:
@@ -1826,6 +1966,11 @@ def _parser() -> argparse.ArgumentParser:
 
     collect = subparsers.add_parser("collect", help="copy logs and extract metrics")
     collect.add_argument("experiment_id")
+    collect.add_argument(
+        "--worktree-root",
+        type=Path,
+        help="parent directory used for the submitted experiment worktree",
+    )
 
     rerun = subparsers.add_parser(
         "rerun",
@@ -1895,7 +2040,12 @@ def main(argv: list[str] | None = None) -> int:
             result = status_request(repo, config, args.experiment_id)
             print(json.dumps(result, indent=2, sort_keys=True))
         elif args.command == "collect":
-            result = collect_request(repo, config, args.experiment_id)
+            result = collect_request(
+                repo,
+                config,
+                args.experiment_id,
+                worktree_root=args.worktree_root,
+            )
             print(json.dumps(result, indent=2, sort_keys=True))
         elif args.command == "rerun":
             result = rerun_request(

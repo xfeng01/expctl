@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.4 — 2026-08-29
+
+- `collect` now serializes result publication, stages logs and metrics, and
+  refuses to overwrite a completed or partial collection.
+- `collect` recomputes the expected worktree instead of trusting the receipt;
+  `--worktree-root` must match a submit-time override.
+- `paths.root` now resolves symlinks and rejects targets outside the repository.
+
 ## 0.4.3 — 2026-08-29
 
 - `expctl list` now batches all submitted job IDs into one `squeue` query and

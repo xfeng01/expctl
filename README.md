@@ -49,7 +49,7 @@ expctl submit <id> [--dry-run] [--worktree-root DIR] [--skip-node-check]
 expctl status <id>
 
 # Copy logs, extract metrics, and record the scheduler verdict.
-expctl collect <id>
+expctl collect <id> [--worktree-root DIR]
 
 # Create a new request for the same pinned code.
 expctl rerun <id> [--as NEW_ID] [--reason TEXT]
@@ -115,6 +115,8 @@ was safely recorded; reconcile it with SLURM manually.
   ID atomically.
 - Each request gets at most one submission attempt. Never delete a receipt to
   resubmit; use `rerun` to create a new ID.
+- `collect` verifies the submitted worktree and publishes results once. If
+  `submit` used `--worktree-root`, pass the same directory to `collect`.
 - `expctl.toml` defines repository policy and should be committed.
 - `expctl` never runs `git add`, `git commit`, or `git push`.
 

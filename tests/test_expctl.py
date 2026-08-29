@@ -114,6 +114,23 @@ def test_root_directory_must_stay_inside_the_repo(tmp_path: Path) -> None:
         load_config(tmp_path)
 
 
+def test_root_directory_symlink_must_stay_inside_the_repo(tmp_path: Path) -> None:
+    if not _symlinks_allowed(tmp_path):
+        pytest.skip("symlinks not permitted here")
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    repo.mkdir()
+    outside.mkdir()
+    (repo / "outside-link").symlink_to(outside, target_is_directory=True)
+    config_text = EXAMPLE_CONFIG.replace(
+        "[scheduler]", '[paths]\nroot = "outside-link"\n\n[scheduler]'
+    )
+    (repo / "expctl.toml").write_text(config_text, encoding="utf-8")
+
+    with pytest.raises(ExpctlError, match="resolve inside the repository"):
+        load_config(repo)
+
+
 def test_wellformed_request_validates(tmp_path: Path) -> None:
     repo = _example_repo(tmp_path)
     config = load_config(repo)
@@ -301,6 +318,10 @@ def test_list_tsv_is_single_line_per_request_and_parser_exposes_formats() -> Non
     assert core._parser().parse_args(["list", "--table"]).list_format == "table"
     assert core._parser().parse_args(["list", "--tsv"]).list_format == "tsv"
     assert core._parser().parse_args(["list", "--json"]).list_format == "json"
+    collect_args = core._parser().parse_args(
+        ["collect", EXAMPLE_ID, "--worktree-root", "worktrees"]
+    )
+    assert collect_args.worktree_root == Path("worktrees")
 
 
 def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
@@ -645,6 +666,19 @@ def _collectable_receipt(repo: Path, worktree: Path) -> Path:
     return receipt
 
 
+def _collect_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path.parent / f"{tmp_path.name}-worktrees"
+    return root, root / "myproject-example"
+
+
+def _disable_collection_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        core,
+        "_result_collection_guard",
+        lambda *args: core.contextlib.nullcontext(),
+    )
+
+
 def test_an_active_job_blocks_reuse_of_its_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -670,9 +704,10 @@ def test_collect_refuses_a_job_that_is_still_queued(
 ) -> None:
     repo = _example_repo(tmp_path)
     config = load_config(repo)
-    worktree = tmp_path.parent / f"{tmp_path.name}-worktree"
-    worktree.mkdir()
+    worktree_root, worktree = _collect_worktree(tmp_path)
+    worktree.mkdir(parents=True)
     _collectable_receipt(repo, worktree)
+    _disable_collection_lock(monkeypatch)
     monkeypatch.setattr(
         core,
         "_queue_status",
@@ -680,7 +715,7 @@ def test_collect_refuses_a_job_that_is_still_queued(
     )
 
     with pytest.raises(ExpctlError, match="still in the queue"):
-        core.collect_request(repo, config, EXAMPLE_ID)
+        core.collect_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
 
 
 def test_collect_rejects_colliding_log_basenames(
@@ -692,16 +727,17 @@ def test_collect_rejects_colliding_log_basenames(
     )
     repo = _example_repo(tmp_path, request_text)
     config = load_config(repo)
-    worktree = tmp_path.parent / f"{tmp_path.name}-worktree"
+    worktree_root, worktree = _collect_worktree(tmp_path)
     for subdir in ("first", "second"):
         directory = worktree / "logs" / subdir
         directory.mkdir(parents=True)
         (directory / "job-123.out").write_text("gen_ppl: 2\n", encoding="utf-8")
     _collectable_receipt(repo, worktree)
+    _disable_collection_lock(monkeypatch)
     monkeypatch.setattr(core, "_queue_status", lambda *args: [])
 
     with pytest.raises(ExpctlError, match="colliding basenames"):
-        core.collect_request(repo, config, EXAMPLE_ID)
+        core.collect_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
 
 
 def test_collect_records_missing_metrics_from_the_copied_bytes(
@@ -709,22 +745,119 @@ def test_collect_records_missing_metrics_from_the_copied_bytes(
 ) -> None:
     repo = _example_repo(tmp_path)
     config = load_config(repo)
-    worktree = tmp_path.parent / f"{tmp_path.name}-worktree"
+    worktree_root, worktree = _collect_worktree(tmp_path)
     logs = worktree / "logs"
     logs.mkdir(parents=True)
     (logs / "example-123_0.out").write_text("loss: 1.5\n", encoding="utf-8")
     receipt_path = _collectable_receipt(repo, worktree)
+    _disable_collection_lock(monkeypatch)
     monkeypatch.setattr(core, "_queue_status", lambda *args: [])
     monkeypatch.setattr(
         core, "_scheduler_status", lambda *args: {"state": "FAILED", "jobs": []}
     )
 
-    collection = core.collect_request(repo, config, EXAMPLE_ID)
+    collection = core.collect_request(
+        repo, config, EXAMPLE_ID, worktree_root=worktree_root
+    )
 
     assert collection["missing_metrics"] == ["gen_ppl"]
     assert collection["scheduler"]["state"] == "FAILED"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["status"] == "collected"
+
+
+def test_collect_never_overwrites_collected_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree_root, worktree = _collect_worktree(tmp_path)
+    source = worktree / "logs" / "example-123_0.out"
+    source.parent.mkdir(parents=True)
+    source.write_text("gen_ppl: 1\n", encoding="utf-8")
+    _collectable_receipt(repo, worktree)
+    _disable_collection_lock(monkeypatch)
+    monkeypatch.setattr(core, "_queue_status", lambda *args: [])
+    monkeypatch.setattr(
+        core, "_scheduler_status", lambda *args: {"state": "COMPLETED", "jobs": []}
+    )
+
+    core.collect_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
+    collected_log = (
+        repo / "expctl" / "results" / EXAMPLE_ID / "logs" / "example-123_0.out"
+    )
+    source.write_text("gen_ppl: 2\n", encoding="utf-8")
+
+    with pytest.raises(ExpctlError, match="already been collected"):
+        core.collect_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
+    assert collected_log.read_text(encoding="utf-8") == "gen_ppl: 1\n"
+
+
+def test_collect_refuses_partial_existing_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    _, worktree = _collect_worktree(tmp_path)
+    _collectable_receipt(repo, worktree)
+    existing_log = repo / "expctl" / "results" / EXAMPLE_ID / "logs" / "existing.out"
+    existing_log.parent.mkdir()
+    existing_log.write_text("keep me\n", encoding="utf-8")
+    _disable_collection_lock(monkeypatch)
+
+    with pytest.raises(ExpctlError, match="artifacts already exist"):
+        core.collect_request(repo, config, EXAMPLE_ID)
+    assert existing_log.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_collect_rolls_back_published_artifacts_if_receipt_update_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree_root, worktree = _collect_worktree(tmp_path)
+    source = worktree / "logs" / "example-123_0.out"
+    source.parent.mkdir(parents=True)
+    source.write_text("gen_ppl: 1\n", encoding="utf-8")
+    receipt_path = _collectable_receipt(repo, worktree)
+    _disable_collection_lock(monkeypatch)
+    monkeypatch.setattr(core, "_queue_status", lambda *args: [])
+    monkeypatch.setattr(
+        core, "_scheduler_status", lambda *args: {"state": "COMPLETED", "jobs": []}
+    )
+    atomic_write_json = core._atomic_write_json
+
+    def fail_receipt_update(path: Path, payload: dict[str, object]) -> None:
+        if path == receipt_path:
+            raise ExpctlError("forced receipt failure")
+        atomic_write_json(path, payload)
+
+    monkeypatch.setattr(core, "_atomic_write_json", fail_receipt_update)
+
+    with pytest.raises(ExpctlError, match="forced receipt failure"):
+        core.collect_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
+
+    destination = repo / "expctl" / "results" / EXAMPLE_ID
+    assert not (destination / "logs").exists()
+    assert not (destination / "metrics.json").exists()
+    assert not list(destination.glob(".collect-*"))
+    assert json.loads(receipt_path.read_text(encoding="utf-8"))["status"] == "submitted"
+
+
+def test_collect_rejects_a_receipt_worktree_outside_the_expected_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree_root, _ = _collect_worktree(tmp_path)
+    recorded_worktree = tmp_path.parent / f"{tmp_path.name}-untrusted-worktree"
+    recorded_worktree.mkdir()
+    _collectable_receipt(repo, recorded_worktree)
+    _disable_collection_lock(monkeypatch)
+    monkeypatch.setattr(core, "_queue_status", lambda *args: [])
+
+    with pytest.raises(ExpctlError, match="does not match expected worktree"):
+        core.collect_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
 
 
 def test_rerun_needs_a_receipt(tmp_path: Path) -> None:

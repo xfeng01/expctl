@@ -116,17 +116,18 @@ expctl status <id>
 确认作业结束且日志写入完成后收集结果：
 
 ```bash
-expctl collect <id>
+expctl collect <id> [--worktree-root <dir>]
 ```
 
 `collect` 会：
 
 - 校验请求文件的 SHA-256 是否与回执一致；
-- 先确认作业已经离开 `squeue`，再将匹配 `outputs.log_glob` 且文件名不冲突的日志原子复制到 `<root>/results/<id>/logs/`；
+- 根据请求重新计算 worktree 并与回执核对；若 `submit` 使用了 `--worktree-root`，`collect` 必须传入相同目录；
+- 先确认作业已经离开 `squeue`，再将匹配 `outputs.log_glob` 且文件名不冲突的日志暂存并发布到 `<root>/results/<id>/logs/`；
 - 从复制后的日志提取指标并写入 `metrics.json`，在回执中记录 `missing_metrics`；
 - 将 `sacct` 结果写入回执，并把回执状态改为 `collected`。
 
-`collect` 不会等待作业；作业仍在队列、没有匹配日志或不同来源日志会覆盖同一目标文件名时都会报错。指标缺失不会阻止失败作业的证据收集，但会明确记录。完成后应审阅原始日志，按 `decision_rule` 写入 `<root>/results/<id>/report.md`，再提交并推送结果目录。
+`collect` 不会等待作业，也不会覆盖已经收集或残留的日志和指标。同一请求的收集过程使用互斥锁串行化；作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或不同来源日志会使用同一目标文件名时都会报错。指标缺失不会阻止失败作业的证据收集，但会明确记录。完成后应审阅原始日志，按 `decision_rule` 写入 `<root>/results/<id>/report.md`，再提交并推送结果目录。
 
 ## 五、请求文件参考
 
@@ -194,7 +195,7 @@ root = ".."
 | `expctl submit <id> --dry-run` | 验证并预览提交，不创建资源或调用 SLURM |
 | `expctl submit <id> --worktree-root <dir>` | 本次提交使用指定的 worktree 父目录 |
 | `expctl status <id>` | 查询队列；不在队列时查询记账记录 |
-| `expctl collect <id>` | 复制日志、提取指标并更新回执 |
+| `expctl collect <id> [--worktree-root <dir>]` | 复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致 |
 | `expctl rerun <id> [--as <new-id>] [--reason <text>]` | 把已提交的请求复制为新 ID（默认 `<id>-r2`、`-r3`……），写入 `rerun_of`，供再次提交；commit 和 worktree 不变 |
 
 `expctl list` 显示的标准状态：
