@@ -601,24 +601,189 @@ def test_list_caches_git_validation_for_shared_commits_and_scripts(
         second, encoding="utf-8"
     )
     config = load_config(repo)
-    calls = {"commit": 0, "script": 0}
+    queries: list[tuple[str, list[str]]] = []
 
-    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        if args[1] == "cat-file":
-            calls["commit"] += 1
-            return subprocess.CompletedProcess(args, 0, "", "")
-        assert args[1] == "show"
-        calls["script"] += 1
-        return subprocess.CompletedProcess(
-            args, 0, "#SBATCH -p example-partition\n#SBATCH --nodes=1\n", ""
-        )
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+        assert args[:2] == ["git", "cat-file"], args
+        names = kwargs["input"].decode("utf-8").splitlines()
+        queries.append((args[2], names))
+        if args[2] == "--batch-check":
+            output = "".join(f"{ZERO_COMMIT} commit 200\n" for _ in names)
+        else:
+            content = "#SBATCH -p example-partition\n#SBATCH --nodes=1\n"
+            output = "".join(
+                f"{ZERO_COMMIT} blob {len(content)}\n{content}\n" for _ in names
+            )
+        return subprocess.CompletedProcess(args, 0, output.encode("utf-8"), b"")
 
     monkeypatch.setattr(core, "_run", fake_run)
 
     rows = core.list_requests(repo, config)
 
     assert [row["id"] for row in rows] == [EXAMPLE_ID, second_id]
-    assert calls == {"commit": 1, "script": 1}
+    assert [row["status"] for row in rows] == ["requested", "requested"]
+    assert queries == [
+        ("--batch-check", [f"{ZERO_COMMIT}^{{commit}}"]),
+        ("--batch", [f"{ZERO_COMMIT}:scripts/sweep.slurm"]),
+    ]
+
+
+def _commit_all(repo: Path, message: str) -> str:
+    _git(repo, "add", "-A")
+    _git(
+        repo,
+        "-c",
+        "user.name=expctl tests",
+        "-c",
+        "user.email=expctl@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        message,
+    )
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _pinned_repo(tmp_path: Path, config_text: str = EXAMPLE_CONFIG) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "expctl.toml").write_text(config_text, encoding="utf-8")
+    (repo / "expctl" / "requests").mkdir(parents=True)
+    return repo
+
+
+def _write_pinned_request(
+    repo: Path,
+    experiment_id: str,
+    commit: str,
+    *,
+    template: str = EXAMPLE_REQUEST,
+    script: str | None = None,
+) -> None:
+    text = template.replace(EXAMPLE_ID, experiment_id).replace(ZERO_COMMIT, commit)
+    if script is not None:
+        text = text.replace("scripts/sweep.slurm", script).replace(
+            "scripts/run-local.py", script
+        )
+    (repo / "expctl" / "requests" / f"{experiment_id}.toml").write_text(
+        text, encoding="utf-8"
+    )
+
+
+def test_list_verifies_distinct_pinned_commits_with_two_git_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _pinned_repo(tmp_path)
+    script = repo / "scripts" / "sweep.slurm"
+    script.parent.mkdir()
+    script.write_text(
+        "#!/bin/bash\n#SBATCH -p example-partition\n#SBATCH --nodes=1\n",
+        encoding="utf-8",
+    )
+    first = _commit_all(repo, "first")
+    (repo / "notes.txt").write_text("second", encoding="utf-8")
+    second = _commit_all(repo, "second")
+    script.write_text("#!/bin/bash\n#SBATCH --nodes=1\n", encoding="utf-8")
+    third = _commit_all(repo, "third")
+    _write_pinned_request(repo, "20260101-first", first)
+    _write_pinned_request(repo, "20260102-second", second)
+    _write_pinned_request(repo, "20260103-third", third)
+    _write_pinned_request(repo, "20260104-unfetched", "f" * 40)
+    _write_pinned_request(repo, "20260105-noscript", second, script="scripts/no.slurm")
+    config = load_config(repo)
+    real_run = core._run
+    commands: list[list[str]] = []
+
+    def counting_run(
+        args: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[Any]:
+        commands.append(args[:3])
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(core, "_run", counting_run)
+    expected = {
+        "20260101-first": ("requested", "Example sweep"),
+        "20260102-second": ("requested", "Example sweep"),
+        "20260103-third": ("invalid", "missing the required line"),
+        "20260104-unfetched": ("invalid", "is not in this clone"),
+        "20260105-noscript": ("invalid", "does not exist at commit"),
+    }
+
+    rows = core.list_requests(repo, config)
+
+    assert commands == [
+        ["git", "cat-file", "--batch-check"],
+        ["git", "cat-file", "--batch"],
+    ]
+    assert {row["id"]: row["status"] for row in rows} == {
+        experiment_id: status for experiment_id, (status, _) in expected.items()
+    }
+    for row in rows:
+        assert expected[row["id"]][1] in row["title"], row
+
+    # Without batched answers, per-request Git validation still resolves rows.
+    monkeypatch.setattr(core, "_git_cat_file_batch", lambda *args, **kwargs: None)
+    commands.clear()
+
+    assert core.list_requests(repo, config) == rows
+    assert ["git", "show", f"{first}:scripts/sweep.slurm"] in commands
+
+
+def test_list_batches_local_script_mode_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _pinned_repo(
+        tmp_path,
+        EXAMPLE_CONFIG.replace(
+            'required_script_lines = ["#SBATCH -p example-partition"]',
+            "required_script_lines = []",
+        ),
+    )
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    for name in ("run-local.py", "plain.py"):
+        (scripts / name).write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "update-index", "--chmod=+x", "scripts/run-local.py")
+    commit = _commit_all(repo, "local scripts")
+    _write_pinned_request(repo, "20260101-exec", commit, template=LOCAL_REQUEST)
+    _write_pinned_request(
+        repo,
+        "20260102-plain",
+        commit,
+        template=LOCAL_REQUEST,
+        script="scripts/plain.py",
+    )
+    _write_pinned_request(
+        repo, "20260103-gone", commit, template=LOCAL_REQUEST, script="scripts/gone.py"
+    )
+    config = load_config(repo)
+    real_run = core._run
+    commands: list[list[str]] = []
+
+    def counting_run(
+        args: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[Any]:
+        commands.append(args[:3])
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(core, "_run", counting_run)
+
+    rows = core.list_requests(repo, config)
+
+    assert commands == [
+        ["git", "cat-file", "--batch-check"],
+        ["git", "cat-file", "--batch"],
+    ]
+    assert {row["id"]: row["status"] for row in rows} == {
+        "20260101-exec": "requested",
+        "20260102-plain": "invalid",
+        "20260103-gone": "invalid",
+    }
+    titles = {row["id"]: row["title"] for row in rows}
+    assert "must be executable at commit" in titles["20260102-plain"]
+    assert "does not exist at commit" in titles["20260103-gone"]
 
 
 def test_limited_list_only_validates_requests_that_can_be_displayed(

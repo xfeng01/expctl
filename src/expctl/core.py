@@ -224,15 +224,18 @@ def _run(
     cwd: Path,
     check: bool = True,
     env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
+    input: bytes | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess[Any]:
     try:
         result = subprocess.run(
             args,
             cwd=cwd,
             check=False,
-            text=True,
+            text=text,
             capture_output=True,
             env=env,
+            input=input,
         )
     except FileNotFoundError as exc:
         raise ExpctlError(f"required command not found: {args[0]}") from exc
@@ -898,12 +901,7 @@ def _validate_request_git(
             ["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=repo, check=False
         )
         commit_cache[commit] = (
-            None
-            if probe.returncode == 0
-            else (
-                f"commit {commit[:12]} is not in this clone; fetch the ref that "
-                f"contains it (git fetch origin {branch}) and retry"
-            )
+            None if probe.returncode == 0 else _missing_commit_error(commit, branch)
         )
     if error := commit_cache[commit]:
         raise ExpctlError(error)
@@ -915,35 +913,20 @@ def _validate_request_git(
             if shown.returncode != 0:
                 detail = shown.stderr.strip() or shown.stdout.strip()
                 if "does not exist" in detail or "exists on disk" in detail:
-                    raise ExpctlError(
-                        f"{backend}.script {script} does not exist at commit "
-                        f"{commit[:12]}; commit and push the script, then pin "
-                        "that commit"
-                    )
+                    raise ExpctlError(_missing_script_error(backend, commit, script))
                 raise ExpctlError(
                     f"command failed (git show {commit}:{script}): {detail}"
                 )
             if backend == "slurm":
-                script_lines = shown.stdout.splitlines()
-                active_script_lines = _slurm_preamble(script_lines)
-                for required in config.required_script_lines:
-                    if required not in active_script_lines:
-                        raise ExpctlError(
-                            f"{script} at {commit[:12]} is missing the required line: "
-                            f"{required}"
-                        )
-                verified_nodes = _script_max_concurrent_nodes(script_lines, script)
+                verified_nodes = _verify_slurm_script(
+                    config, commit, script, shown.stdout
+                )
             else:
                 tree = _run(
                     ["git", "ls-tree", commit, "--", script], cwd=repo, check=False
                 )
                 mode = tree.stdout.split(maxsplit=1)[0] if tree.returncode == 0 else ""
-                if mode != "100755":
-                    raise ExpctlError(
-                        f"local.script {script} must be executable at commit "
-                        f"{commit[:12]}; run git update-index --chmod=+x {script}, "
-                        "commit, and retry"
-                    )
+                _verify_local_script_mode(commit, script, mode)
                 verified_nodes = None
         except ExpctlError as exc:
             script_cache[cache_key] = (None, str(exc))
@@ -961,6 +944,185 @@ def _validate_request_git(
                 f"slurm.max_concurrent_nodes={max_nodes}"
             )
     return verified_nodes
+
+
+def _missing_commit_error(commit: str, branch: str) -> str:
+    return (
+        f"commit {commit[:12]} is not in this clone; fetch the ref that "
+        f"contains it (git fetch origin {branch}) and retry"
+    )
+
+
+def _missing_script_error(backend: str, commit: str, script: str) -> str:
+    return (
+        f"{backend}.script {script} does not exist at commit {commit[:12]}; "
+        "commit and push the script, then pin that commit"
+    )
+
+
+def _verify_slurm_script(config: Config, commit: str, script: str, content: str) -> int:
+    """Check required lines and return the script's worst-case node count."""
+    script_lines = content.splitlines()
+    active_script_lines = _slurm_preamble(script_lines)
+    for required in config.required_script_lines:
+        if required not in active_script_lines:
+            raise ExpctlError(
+                f"{script} at {commit[:12]} is missing the required line: {required}"
+            )
+    return _script_max_concurrent_nodes(script_lines, script)
+
+
+def _verify_local_script_mode(commit: str, script: str, mode: str) -> None:
+    if mode != "100755":
+        raise ExpctlError(
+            f"local.script {script} must be executable at commit {commit[:12]}; "
+            f"run git update-index --chmod=+x {script}, commit, and retry"
+        )
+
+
+def _git_cat_file_batch(
+    repo: Path, mode: str, names: list[str]
+) -> list[tuple[str, bytes | None]] | None:
+    """Resolve many object names with one ``git cat-file --batch*`` process.
+
+    Returns one ``(object_type, content)`` pair per resolved name in input
+    order, with ``("missing", None)`` for names Git cannot resolve; content is
+    only read for ``--batch``. The list is truncated at the first line that
+    cannot be parsed, and ``None`` means Git could not run the query at all.
+    """
+    if not names:
+        return []
+    try:
+        result = _run(
+            ["git", "cat-file", mode],
+            cwd=repo,
+            check=False,
+            input="".join(f"{name}\n" for name in names).encode("utf-8"),
+            text=False,
+        )
+    except ExpctlError:
+        return None
+    if result.returncode != 0:
+        return None
+    output: bytes = result.stdout
+    resolved: list[tuple[str, bytes | None]] = []
+    position = 0
+    for _ in names:
+        newline = output.find(b"\n", position)
+        if newline < 0:
+            break
+        fields = output[position:newline].decode("utf-8", "replace").split()
+        position = newline + 1
+        if fields and fields[-1] in {"missing", "ambiguous"}:
+            resolved.append(("missing", None))
+            continue
+        if len(fields) != 3 or not fields[2].isdigit():
+            break
+        object_type, size = fields[1], int(fields[2])
+        if mode != "--batch":
+            resolved.append((object_type, None))
+            continue
+        content = output[position : position + size]
+        if len(content) != size:
+            break
+        resolved.append((object_type, content))
+        position += size + 1
+    return resolved
+
+
+def _tree_entry_mode(tree: bytes, name: str) -> str | None:
+    """Return the mode of ``name`` inside a raw Git tree object, if present."""
+    target = name.encode("utf-8")
+    position = 0
+    while position < len(tree):
+        terminator = tree.find(b"\0", position)
+        if terminator < 0:
+            return None
+        mode, _, entry = tree[position:terminator].partition(b" ")
+        if entry == target:
+            return mode.decode("ascii", "replace")
+        position = terminator + 21
+    return None
+
+
+def _prefill_git_caches(
+    repo: Path,
+    config: Config,
+    requests: list[dict[str, Any]],
+    *,
+    commit_cache: dict[str, str | None],
+    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]],
+) -> None:
+    """Verify many requests' pinned commits and scripts with two Git queries.
+
+    Fills the caches consumed by ``_validate_request_git`` so that a listing
+    needs a constant number of Git processes rather than two per request.
+    Anything Git does not answer cleanly here is left uncached, and the
+    per-request validation resolves it (and its precise error) as before.
+    """
+    pending_commits: dict[str, str] = {}
+    pending_scripts: list[tuple[str, str, str]] = []
+    for request in requests:
+        commit = request["code"]["commit"]
+        backend, execution = _execution_table(request)
+        script = execution["script"]
+        if commit not in commit_cache:
+            pending_commits.setdefault(commit, request["code"]["branch"])
+        key = (backend, commit, script)
+        if key not in script_cache and key not in pending_scripts:
+            pending_scripts.append(key)
+
+    probes = _git_cat_file_batch(
+        repo, "--batch-check", [f"{commit}^{{commit}}" for commit in pending_commits]
+    )
+    for (commit, branch), (object_type, _) in zip(
+        pending_commits.items(), probes or []
+    ):
+        if object_type == "commit":
+            commit_cache[commit] = None
+        elif object_type == "missing":
+            commit_cache[commit] = _missing_commit_error(commit, branch)
+
+    lookups: list[tuple[str, str, str, str]] = []
+    for backend, commit, script in pending_scripts:
+        if commit not in commit_cache or commit_cache[commit] is not None:
+            continue
+        relative = PurePosixPath(script)
+        if str(relative) != script:
+            continue
+        if backend == "slurm":
+            lookups.append((backend, commit, script, f"{commit}:{script}"))
+        else:
+            parent = "" if relative.parent == PurePosixPath() else str(relative.parent)
+            lookups.append((backend, commit, script, f"{commit}:{parent}"))
+    objects = _git_cat_file_batch(repo, "--batch", [name for *_, name in lookups])
+    for (backend, commit, script, _), (object_type, content) in zip(
+        lookups, objects or []
+    ):
+        key = (backend, commit, script)
+        try:
+            if object_type == "missing":
+                raise ExpctlError(_missing_script_error(backend, commit, script))
+            if content is None:
+                continue
+            if backend == "slurm":
+                if object_type != "blob":
+                    continue
+                verified_nodes: int | None = _verify_slurm_script(
+                    config, commit, script, content.decode("utf-8", "replace")
+                )
+            else:
+                if object_type != "tree":
+                    continue
+                mode = _tree_entry_mode(content, PurePosixPath(script).name)
+                if mode is None:
+                    raise ExpctlError(_missing_script_error(backend, commit, script))
+                _verify_local_script_mode(commit, script, mode)
+                verified_nodes = None
+        except ExpctlError as exc:
+            script_cache[key] = (None, str(exc))
+        else:
+            script_cache[key] = (verified_nodes, None)
 
 
 def _request_hash(path: Path) -> str:
@@ -4073,6 +4235,43 @@ def _list_color_enabled() -> bool:
 LIST_STATUS_SCAN_BATCH_SIZE = 50
 
 
+def _list_row_status(
+    repo: Path, config: Config, experiment_id: str
+) -> tuple[str, str | None]:
+    """Return a request's displayed state and, for pending SLURM jobs, its ID.
+
+    Local jobs are refreshed immediately; SLURM job IDs are returned so the
+    caller can refresh them together with one scheduler query.
+    """
+    receipt = result_dir(repo, config, experiment_id) / "receipt.json"
+    if not receipt.is_file():
+        return "requested", None
+    receipt_data = _load_receipt(receipt)
+    stored_status = receipt_data.get("status")
+    status = (
+        stored_status if isinstance(stored_status, str) and stored_status else "invalid"
+    )
+    job_id = receipt_data.get("job_id")
+    if (
+        status in {"submitted", "cancel_requested"}
+        and isinstance(job_id, str)
+        and job_id
+    ):
+        if _receipt_backend(receipt_data) == "local":
+            live = _local_status_request(
+                repo,
+                config,
+                experiment_id,
+                receipt_data,
+                checked_at=dt.datetime.now(dt.UTC).isoformat(),
+            )
+            return _status_state(live), None
+        return status, job_id
+    if status == "collected" and report_path(repo, config, experiment_id).is_file():
+        return "reviewed", None
+    return status, None
+
+
 def _list_request_batch(
     repo: Path,
     config: Config,
@@ -4081,13 +4280,37 @@ def _list_request_batch(
     commit_cache: dict[str, str | None],
     script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]],
 ) -> tuple[list[dict[str, str]], str | None]:
-    """Validate and refresh one bounded batch of request paths."""
+    """Validate and refresh one bounded batch of request paths.
+
+    Requests are parsed first so their pinned commits and scripts can be
+    verified with a couple of batched Git queries instead of one Git process
+    per request.
+    """
     rows: list[dict[str, str]] = []
-    submitted_rows: dict[str, list[dict[str, str]]] = {}
+    loaded: list[tuple[int, str, dict[str, Any]]] = []
     for path in paths:
         experiment_id = path.stem
         try:
             data, _ = load_request(repo, config, experiment_id, check_git=False)
+        except ExpctlError as exc:
+            rows.append({"id": experiment_id, "status": "invalid", "title": str(exc)})
+            continue
+        loaded.append((len(rows), experiment_id, data))
+        rows.append(
+            {"id": experiment_id, "status": "requested", "title": data["title"]}
+        )
+
+    _prefill_git_caches(
+        repo,
+        config,
+        [data for _, _, data in loaded],
+        commit_cache=commit_cache,
+        script_cache=script_cache,
+    )
+
+    submitted_rows: dict[str, list[dict[str, str]]] = {}
+    for index, experiment_id, data in loaded:
+        try:
             _validate_request_git(
                 repo,
                 config,
@@ -4095,49 +4318,13 @@ def _list_request_batch(
                 commit_cache=commit_cache,
                 script_cache=script_cache,
             )
-            receipt = result_dir(repo, config, experiment_id) / "receipt.json"
-            status = "requested"
-            if receipt.is_file():
-                receipt_data = _load_receipt(receipt)
-                stored_status = receipt_data.get("status")
-                status = (
-                    stored_status
-                    if isinstance(stored_status, str) and stored_status
-                    else "invalid"
-                )
-                job_id = receipt_data.get("job_id")
-                if (
-                    status in {"submitted", "cancel_requested"}
-                    and isinstance(job_id, str)
-                    and job_id
-                ):
-                    row = {
-                        "id": experiment_id,
-                        "status": status,
-                        "title": data["title"],
-                    }
-                    backend = _receipt_backend(receipt_data)
-                    if backend == "local":
-                        live = _local_status_request(
-                            repo,
-                            config,
-                            experiment_id,
-                            receipt_data,
-                            checked_at=dt.datetime.now(dt.UTC).isoformat(),
-                        )
-                        row["status"] = _status_state(live)
-                    else:
-                        submitted_rows.setdefault(job_id, []).append(row)
-                    rows.append(row)
-                    continue
-                if (
-                    status == "collected"
-                    and report_path(repo, config, experiment_id).is_file()
-                ):
-                    status = "reviewed"
-            rows.append({"id": experiment_id, "status": status, "title": data["title"]})
+            status, job_id = _list_row_status(repo, config, experiment_id)
         except ExpctlError as exc:
-            rows.append({"id": experiment_id, "status": "invalid", "title": str(exc)})
+            rows[index] = {"id": experiment_id, "status": "invalid", "title": str(exc)}
+            continue
+        rows[index]["status"] = status
+        if job_id is not None:
+            submitted_rows.setdefault(job_id, []).append(rows[index])
 
     warning = None
     if submitted_rows:

@@ -159,8 +159,9 @@ file. Receipts are never modified by a refresh.
 
 `list` sorts newest IDs first by default. `--status` is case-insensitive, may
 contain comma-separated values, and may be repeated. Filtering uses refreshed
-execution states; repeated commit/script validation is cached within each
-listing. The configured or command-line limit is applied after filtering and
+execution states. Each listing verifies pinned commits and scripts with a
+couple of batched `git cat-file` queries rather than one Git process per
+request. The configured or command-line limit is applied after filtering and
 sorting. Without a status filter, a limited listing validates and refreshes
 only those N request paths. Status-filtered listings scan in bounded batches
 and stop once N matches are found; `--all` performs a complete scan.
