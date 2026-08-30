@@ -53,6 +53,11 @@ expctl validate <id>
 # Preview or submit through the backend declared by the request.
 expctl submit <id> [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
 
+# Submit every request that has no receipt yet, oldest ID first. Each request
+# is validated and submitted on its own; failures are reported and the rest
+# continue, and the exit status is non-zero if any failed.
+expctl submit --all [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
+
 # Show detailed state once, or refresh until the job finishes.
 expctl status <id> [--watch [SECONDS]] [--json]
 
@@ -109,6 +114,12 @@ CONFIG = "configs/run.toml"
 
 SLURM submissions use `sbatch`; status, cancellation, and final accounting use
 `squeue`, `scancel`, and `sacct`.
+
+`slurm.max_concurrent_nodes` is optional. When set, the pinned script must
+declare a numeric `#SBATCH --nodes` (array ranges and `%N` throttles included)
+whose worst case stays within it. Omit it to leave the request's node envelope
+unlimited; a non-zero `scheduler.max_total_nodes` still requires a derivable
+count, which is then reserved against the budget.
 
 ```toml
 [local]

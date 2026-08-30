@@ -109,6 +109,8 @@ max_concurrent_nodes = 1
 CONFIG = "configs/run.toml"
 ```
 
+`max_concurrent_nodes` 是可选的：省略时该请求的节点数不受限制，脚本也不再要求写出 `#SBATCH --nodes`（启用 `scheduler.max_total_nodes` 时除外，见下文）。
+
 直接在当前计算节点运行：
 
 ```toml
@@ -133,6 +135,8 @@ expctl show <id>
 expctl submit <id> --dry-run
 expctl submit <id>
 ```
+
+`expctl submit --all` 会按 ID 从旧到新提交所有还没有回执的请求（即 `list` 中状态为 `requested` 的请求）。每个请求单独验证和提交：某个请求无效或节点预算不足时只跳过该请求并记录错误，其余请求继续；有任何失败时退出码为非零。`--dry-run`、`--worktree-root` 和 `--skip-node-check` 同样适用于每个请求。
 
 `expctl list` 在交互终端中显示对齐表格，管道或文件输出默认使用稳定 TSV。它批量刷新 SLURM 作业状态，并从记录的进程身份和退出状态文件刷新 local 状态；刷新是只读的，不修改回执。SLURM 查询失败时，受影响的行回退为 `submitted` 并只在标准错误输出一条警告。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color` 关闭颜色。
 
@@ -225,7 +229,7 @@ expctl clean <id>
 | `code.branch` | 仅供阅读的分支标签，不参与检出或校验 |
 | `code.worktree` | 实验 worktree 的普通目录名（不能是 `.` 或 `..`）；不得与主仓库重叠 |
 | `slurm.script` | 固定提交中的仓库相对路径，不得越出仓库 |
-| `slurm.max_concurrent_nodes` | 本请求允许的最坏并发节点数，至少为 1，且不能超过非零的 `scheduler.max_total_nodes`；固定脚本必须显式写出数字形式的 `#SBATCH --nodes`，数组范围和 `%N` 节流也必须可静态解析，推导值不得超过这里的声明 |
+| `slurm.max_concurrent_nodes` | 可选。设置时为本请求允许的最坏并发节点数，至少为 1，且不能超过非零的 `scheduler.max_total_nodes`；此时固定脚本必须显式写出数字形式的 `#SBATCH --nodes`，数组范围和 `%N` 节流也必须可静态解析，推导值不得超过这里的声明。省略时本请求不限制节点数；但若启用了 `scheduler.max_total_nodes`，脚本仍必须能推导出节点数且不超过该上限，该推导值会用于节点预算 |
 | `slurm.env` | 传给 `sbatch --export` 的环境变量；名称须匹配 `[A-Za-z_][A-Za-z0-9_]*` 且不能是 `GROUPS`，值必须是字符串且不能包含逗号或换行 |
 | `local.script` | 固定提交中的仓库相对可执行文件；必须带 Git 可执行位 |
 | `local.args` | 可选的字符串数组，按顺序作为脚本参数，不经过 shell 展开 |
@@ -272,7 +276,7 @@ root = ".."
 - `runtime.create_missing`：提交前可在主工作树中自动创建的共享目录，必须是 `shared_dirs` 的子集。
 - `worktree.root`：实验 worktree 的父目录；相对路径以仓库根目录为基准。
 
-SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURING`、`SUSPENDED` 和 `RESIZING` 作业按实际节点名去重，`PENDING` 作业按 `squeue` 报告的节点数累加，再加上请求中的 `slurm.max_concurrent_nodes`。数组任务使用 `squeue -r` 展开，因此该检查有意偏保守。expctl 会在同一 Git checkout 内串行化预算查询和 `sbatch`，但不同 clone 或人工提交之间的硬上限仍应由 SLURM QOS/account 策略保证。`--skip-node-check` 仅适用于 SLURM，并且只应在操作者明确授权后使用。
+SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURING`、`SUSPENDED` 和 `RESIZING` 作业按实际节点名去重，`PENDING` 作业按 `squeue` 报告的节点数累加，再加上请求中的 `slurm.max_concurrent_nodes`（未声明时使用脚本推导出的节点数）。数组任务使用 `squeue -r` 展开，因此该检查有意偏保守。expctl 会在同一 Git checkout 内串行化预算查询和 `sbatch`，但不同 clone 或人工提交之间的硬上限仍应由 SLURM QOS/account 策略保证。`--skip-node-check` 仅适用于 SLURM，并且只应在操作者明确授权后使用。
 
 ## 八、命令与状态
 
@@ -287,6 +291,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl submit <id> [--json]` | 准备 worktree，并通过请求声明的后端启动作业 |
 | `expctl submit <id> --dry-run` | 验证并预览提交，不创建资源或启动作业 |
 | `expctl submit <id> --worktree-root <dir>` | 本次提交使用指定的 worktree 父目录 |
+| `expctl submit --all [--dry-run] [--json]` | 按 ID 从旧到新提交所有还没有回执的请求；单个失败不影响其余请求 |
 | `expctl status <id> [--watch [<seconds>]] [--json]` | 查询一次状态，或按所选后端定时刷新直到终态 |
 | `expctl logs <id> [--tail <n>] [--follow] [--worktree-root <dir>]` | 查看运行中或已收集的日志；默认显示末尾 100 行 |
 | `expctl cancel <id> [--reason <text>] [--dry-run] [--json]` | 预览或执行后端取消，并在回执中记录审计信息 |

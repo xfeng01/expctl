@@ -340,6 +340,219 @@ def test_request_cannot_exceed_the_node_ceiling(tmp_path: Path) -> None:
         load_request(repo, config, EXAMPLE_ID, check_git=False)
 
 
+def test_max_concurrent_nodes_is_optional_without_a_node_budget(
+    tmp_path: Path,
+) -> None:
+    repo = _pinned_repo(
+        tmp_path, EXAMPLE_CONFIG.replace("max_total_nodes = 4", "max_total_nodes = 0")
+    )
+    script = repo / "scripts" / "sweep.slurm"
+    script.parent.mkdir()
+    script.write_text("#!/bin/bash\n#SBATCH -p example-partition\n", encoding="utf-8")
+    commit = _commit_all(repo, "script without a node envelope")
+    unlimited = EXAMPLE_REQUEST.replace("max_concurrent_nodes = 4\n", "")
+    _write_pinned_request(repo, EXAMPLE_ID, commit, template=unlimited)
+    _write_pinned_request(repo, "20260102-capped", commit)
+    config = load_config(repo)
+
+    request, _ = load_request(repo, config, EXAMPLE_ID)
+    assert "max_concurrent_nodes" not in request["slurm"]
+    assert core._validate_request_git(repo, config, request) is None
+    with pytest.raises(ExpctlError, match="explicit integer"):
+        load_request(repo, config, "20260102-capped")
+    statuses = {row["id"]: row["status"] for row in core.list_requests(repo, config)}
+    assert statuses == {EXAMPLE_ID: "requested", "20260102-capped": "invalid"}
+
+
+def test_unlimited_request_still_needs_a_node_envelope_for_the_budget(
+    tmp_path: Path,
+) -> None:
+    repo = _pinned_repo(tmp_path)
+    script = repo / "scripts" / "sweep.slurm"
+    script.parent.mkdir()
+    unlimited = EXAMPLE_REQUEST.replace("max_concurrent_nodes = 4\n", "")
+    config = load_config(repo)
+
+    script.write_text("#!/bin/bash\n#SBATCH -p example-partition\n", encoding="utf-8")
+    _write_pinned_request(
+        repo, EXAMPLE_ID, _commit_all(repo, "no nodes"), template=unlimited
+    )
+    with pytest.raises(ExpctlError, match="explicit integer"):
+        load_request(repo, config, EXAMPLE_ID)
+
+    script.write_text(
+        "#!/bin/bash\n#SBATCH -p example-partition\n#SBATCH --nodes=8\n",
+        encoding="utf-8",
+    )
+    _write_pinned_request(
+        repo, EXAMPLE_ID, _commit_all(repo, "too many"), template=unlimited
+    )
+    with pytest.raises(ExpctlError, match="scheduler.max_total_nodes=4"):
+        load_request(repo, config, EXAMPLE_ID)
+
+    script.write_text(
+        "#!/bin/bash\n#SBATCH -p example-partition\n#SBATCH --nodes=2\n",
+        encoding="utf-8",
+    )
+    _write_pinned_request(
+        repo, EXAMPLE_ID, _commit_all(repo, "fits"), template=unlimited
+    )
+    request, _ = load_request(repo, config, EXAMPLE_ID)
+    assert core._validate_request_git(repo, config, request) == 2
+
+
+def test_unlimited_request_reserves_the_derived_nodes_against_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    request = tomllib.loads(EXAMPLE_REQUEST.replace("max_concurrent_nodes = 4\n", ""))
+    _stub_submit_preflight(monkeypatch, repo, request)
+    monkeypatch.setattr(
+        core,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "123;cluster\n", ""),
+    )
+    monkeypatch.setattr(
+        core, "_node_budget_guard", lambda *args: core.contextlib.nullcontext()
+    )
+    budgeted: list[int] = []
+
+    def fake_budget(_repo: Path, _config: Config, requested: int) -> dict[str, int]:
+        budgeted.append(requested)
+        return {"requested_nodes": requested}
+
+    monkeypatch.setattr(core, "_check_node_budget", fake_budget)
+
+    preview = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=True,
+        skip_node_check=False,
+        worktree_root=None,
+    )
+    assert preview["declared_max_concurrent_nodes"] is None
+    assert preview["verified_max_concurrent_nodes"] == 1
+
+    receipt = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=False,
+        skip_node_check=False,
+        worktree_root=tmp_path.parent / f"{tmp_path.name}-worktrees",
+    )
+    assert budgeted == [1]
+    assert receipt["declared_max_concurrent_nodes"] is None
+    assert receipt["verified_max_concurrent_nodes"] == 1
+
+
+def test_node_envelope_rendering_handles_unlimited_requests() -> None:
+    assert core._format_node_envelope(2, 4) == "2 verified / 4 declared"
+    assert core._format_node_envelope(2, None) == "2 verified / unlimited"
+    assert (
+        core._format_node_envelope(None, None) == "not derived from script / unlimited"
+    )
+
+
+def test_submit_all_handles_every_request_without_a_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    _write_pinned_request(repo, "20251231-older", ZERO_COMMIT)
+    _write_pinned_request(repo, "20260102-broken", ZERO_COMMIT)
+    _write_pinned_request(repo, "20260103-done", ZERO_COMMIT)
+    receipt = core.result_dir(repo, config, "20260103-done") / "receipt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text("{}", encoding="utf-8")
+    attempted: list[tuple[str, bool]] = []
+
+    def fake_submit(
+        _repo: Path, _config: Config, experiment_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        attempted.append((experiment_id, kwargs["dry_run"]))
+        if experiment_id == "20260102-broken":
+            raise ExpctlError("SLURM node budget would exceed 4")
+        return {"experiment_id": experiment_id, "job_id": "1"}
+
+    monkeypatch.setattr(core, "submit_request", fake_submit)
+
+    assert core.requested_experiment_ids(repo, config) == [
+        "20251231-older",
+        EXAMPLE_ID,
+        "20260102-broken",
+    ]
+    result = core.submit_requested(
+        repo, config, dry_run=False, skip_node_check=False, worktree_root=None
+    )
+
+    assert attempted == [
+        ("20251231-older", False),
+        (EXAMPLE_ID, False),
+        ("20260102-broken", False),
+    ]
+    assert [item["experiment_id"] for item in result["results"]] == [
+        "20251231-older",
+        EXAMPLE_ID,
+    ]
+    assert result["failed"] == [
+        {
+            "experiment_id": "20260102-broken",
+            "error": "SLURM node budget would exceed 4",
+        }
+    ]
+    text = core._render_submit_batch_result(
+        result, dry_run=False, worktree_root=None, skip_node_check=False
+    )
+    assert "SUBMITTED 2 OF 3 REQUESTED" in text
+    assert "20260102-broken" in text and "node budget" in text
+    assert core._render_submit_batch_result(
+        {"requested": [], "results": [], "failed": []},
+        dry_run=True,
+        worktree_root=None,
+        skip_node_check=False,
+    ).startswith("No requested experiments")
+
+
+def test_submit_all_cli_reports_failures_with_a_nonzero_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _example_repo(tmp_path)
+    monkeypatch.setattr(core, "find_repo_root", lambda: repo)
+    _write_pinned_request(repo, "20260102-broken", ZERO_COMMIT)
+
+    def fake_submit(
+        _repo: Path, _config: Config, experiment_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        if experiment_id == "20260102-broken":
+            raise ExpctlError("commit is not in this clone")
+        return {"experiment_id": experiment_id, "command": ["sbatch"]}
+
+    monkeypatch.setattr(core, "submit_request", fake_submit)
+
+    assert core.main(["submit", "--all", "--dry-run", "--json"]) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["dry_run"] is True
+    assert payload["requested"] == [EXAMPLE_ID, "20260102-broken"]
+    assert [item["experiment_id"] for item in payload["results"]] == [EXAMPLE_ID]
+    assert payload["failed"][0]["experiment_id"] == "20260102-broken"
+    assert "1 of 2 requested experiments failed" in captured.err
+
+    (repo / "expctl" / "requests" / "20260102-broken.toml").unlink()
+    assert core.main(["submit", "--all", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["failed"] == []
+
+    assert core.main(["submit", "--json"]) == 2
+    assert "exactly one of" in capsys.readouterr().err
+    assert core.main(["submit", EXAMPLE_ID, "--all", "--json"]) == 2
+    assert "exactly one of" in capsys.readouterr().err
+
+
 def test_plain_names_reject_dot_segments(tmp_path: Path) -> None:
     text = EXAMPLE_REQUEST.replace('worktree = "myproject-example"', 'worktree = ".."')
     repo = _example_repo(tmp_path, text)

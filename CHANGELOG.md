@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.0 — 2026-08-30
+
+- `slurm.max_concurrent_nodes` is now optional. Omitting it leaves a request's
+  node envelope unlimited, and the pinned script no longer needs a parseable
+  `#SBATCH --nodes` unless `scheduler.max_total_nodes` is enabled, in which
+  case the derived count must fit the budget and is reserved against it.
+  Receipts, `--dry-run`, and `validate` report an omitted cap as `unlimited`.
+- Added `expctl submit --all`, which submits every request without a receipt,
+  oldest ID first. Each request is validated and submitted independently, so
+  one failure is reported without blocking the others; the command exits
+  non-zero when any request failed. `--dry-run` previews the whole batch.
+
 ## 0.10.2 — 2026-08-30
 
 - `list` now verifies pinned commits and scripts with two batched

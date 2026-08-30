@@ -375,14 +375,16 @@ expctl/
     <p><code>validate</code> 会检查请求格式、固定提交和脚本。SLURM 脚本必须满足仓库策略；local 脚本必须在固定提交中带可执行位。交互终端会显示后端、commit、脚本、环境变量、日志、指标和依赖摘要。</p>
 
     <h2 id="runner"><span class="num">四</span>提交、查看和收集</h2>
-    <p>每个请求必须且只能选择一种后端。SLURM 使用 <code>[slurm]</code>、<code>script</code>、<code>max_concurrent_nodes</code> 和可选的 <code>[slurm.env]</code>；计算节点直跑使用 <code>[local]</code>、<code>script</code>、可选的 <code>args</code> 和 <code>[local.env]</code>。</p>
+    <p>每个请求必须且只能选择一种后端。SLURM 使用 <code>[slurm]</code>、<code>script</code>、可选的 <code>max_concurrent_nodes</code> 和可选的 <code>[slurm.env]</code>；计算节点直跑使用 <code>[local]</code>、<code>script</code>、可选的 <code>args</code> 和 <code>[local.env]</code>。</p>
     <div class="note"><p>local 脚本必须在 Git 中带可执行位；<code>outputs.log_glob</code> 必须是含 <code>{job_id}</code> 的精确路径，不能使用通配符。local 会捕获 stdout/stderr，固定启动节点主机名，并用 Linux <code>/proc</code> 核对 PID 身份；状态、取消和收集必须在同一节点执行。它不提供排队、资源隔离或主机重启恢复。</p></div>
     <p>在执行主机上的项目仓库里：</p>
 <pre data-lang="bash"><code>git pull --ff-only
 expctl list
 expctl show &lt;id&gt;
 expctl submit &lt;id&gt; --dry-run
-expctl submit &lt;id&gt;</code></pre>
+expctl submit &lt;id&gt;
+expctl submit --all</code></pre>
+    <p><code>expctl submit --all</code> 会按 ID 从旧到新提交所有还没有回执的请求。每个请求单独验证和提交，某个请求失败时只跳过它并记录错误，其余继续；有任何失败时退出码为非零。</p>
     <p><code>expctl list</code> 在交互终端中显示对齐表格，管道输出保持稳定 TSV。它批量刷新 SLURM 状态，并从进程身份和退出状态文件刷新 local 状态；刷新只读且不修改回执。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式。</p>
     <p><code>list</code> 默认按 ID 从新到旧排列；<code>--sort oldest</code> 可反转。<code>--status running,failed</code> 按实时或回执状态筛选。<code>display.list_limit</code> 设置仓库默认显示数量，<code>--limit 20</code> 可临时覆盖，<code>--all</code> 显示全部。没有状态筛选时只处理最终可能显示的 N 个请求；带状态筛选时分批扫描，找到 N 个匹配项后停止；<code>--all</code> 才完整扫描。未配置该字段的旧仓库仍显示所有请求。</p>
     <p>面向生命周期的命令在交互终端中使用对齐表格显示详情和建议的下一步；输出到管道或文件时保持 JSON，原始日志除外。需要在终端中获取 JSON 时使用命令支持的 <code>--json</code>。</p>
@@ -429,7 +431,7 @@ expctl clean &lt;id&gt;</code></pre>
         <tr><td><code>code.branch</code></td><td>仅供阅读的分支标签，不参与检出或校验</td></tr>
         <tr><td><code>code.worktree</code></td><td>实验 worktree 的普通目录名，不能是 <code>.</code> 或 <code>..</code>，且不得与主仓库重叠</td></tr>
         <tr><td><code>slurm.script</code></td><td>固定提交中的仓库相对路径，不得越出仓库</td></tr>
-        <tr><td><code>slurm.max_concurrent_nodes</code></td><td>允许的最坏并发节点数；固定脚本必须显式声明数字形式的 <code>#SBATCH --nodes</code>，数组范围和 <code>%N</code> 节流也必须可静态解析，推导值不得超过这里的声明</td></tr>
+        <tr><td><code>slurm.max_concurrent_nodes</code></td><td>可选的最坏并发节点数；设置时固定脚本必须显式声明数字形式的 <code>#SBATCH --nodes</code>，数组范围和 <code>%N</code> 节流也必须可静态解析，推导值不得超过这里的声明；省略时不限制（启用 <code>scheduler.max_total_nodes</code> 时脚本仍须可推导节点数并用于预算）</td></tr>
         <tr><td><code>slurm.env</code></td><td>传给 <code>sbatch --export</code> 的环境变量；名称须匹配 <code>[A-Za-z_][A-Za-z0-9_]*</code> 且不能是 <code>GROUPS</code>，值必须是字符串且不能包含逗号或换行</td></tr>
         <tr><td><code>local.script</code></td><td>固定提交中的仓库相对可执行文件；必须带 Git 可执行位</td></tr>
         <tr><td><code>local.args</code></td><td>可选字符串数组，按顺序作为参数，不经过 shell 展开</td></tr>
@@ -471,7 +473,7 @@ root = ".."</code></pre>
       <li><code>runtime.create_missing</code>：提交前可自动创建的共享目录，必须是 <code>shared_dirs</code> 的子集。</li>
       <li><code>worktree.root</code>：实验 worktree 的父目录；相对路径以仓库根目录为基准。</li>
     </ul>
-    <p>节点预算会统计所有占用或正在申请资源的相关状态，并加上请求中的 <code>slurm.max_concurrent_nodes</code>。数组任务使用 <code>squeue -r</code> 展开，因此检查有意偏保守。同一 Git checkout 内的查询—提交窗口会串行化；跨 clone 和人工提交的硬上限仍需 SLURM QOS/account 保证。</p>
+    <p>节点预算会统计所有占用或正在申请资源的相关状态，并加上请求中的 <code>slurm.max_concurrent_nodes</code>（未声明时为脚本推导值）。数组任务使用 <code>squeue -r</code> 展开，因此检查有意偏保守。同一 Git checkout 内的查询—提交窗口会串行化；跨 clone 和人工提交的硬上限仍需 SLURM QOS/account 保证。</p>
     <div class="warn"><p><code>--skip-node-check</code> 仅用于 SLURM，会跳过节点预算检查，只应在操作者明确授权后使用。</p></div>
 
     <h2 id="commands"><span class="num">七</span>命令与状态</h2>
@@ -488,6 +490,7 @@ root = ".."</code></pre>
         <tr><td><code>expctl submit &lt;id&gt; [--json]</code></td><td>准备 worktree，并通过请求声明的后端启动作业</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; --dry-run</code></td><td>验证并预览提交，不创建资源或启动作业</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; --worktree-root &lt;dir&gt;</code></td><td>本次提交使用指定的 worktree 父目录</td></tr>
+        <tr><td><code>expctl submit --all [--dry-run] [--json]</code></td><td>按 ID 从旧到新提交所有还没有回执的请求；单个失败不影响其余请求</td></tr>
         <tr><td><code>expctl status &lt;id&gt; [--watch [SECONDS]] [--json]</code></td><td>查询一次状态，或按所选后端定时刷新到终态</td></tr>
         <tr><td><code>expctl logs &lt;id&gt; [--tail N] [--follow] [--worktree-root DIR]</code></td><td>查看运行中或已收集日志；默认显示末尾 100 行</td></tr>
         <tr><td><code>expctl cancel &lt;id&gt; [--reason TEXT] [--dry-run] [--json]</code></td><td>预览或执行后端取消，并记录审计信息</td></tr>

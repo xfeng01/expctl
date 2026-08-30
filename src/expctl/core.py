@@ -118,8 +118,10 @@ worktree = "myproject-short-name"
 
 [slurm]
 script = "scripts/example.slurm"
-# Audited upper bound. The script must declare numeric #SBATCH --nodes;
-# numeric array ranges and their %N throttle are included in this bound.
+# Optional audited upper bound. When set, the script must declare a numeric
+# #SBATCH --nodes; numeric array ranges and their %N throttle are included in
+# this bound. Remove the line to leave the node envelope unlimited (a non-zero
+# scheduler.max_total_nodes still needs a derivable count).
 max_concurrent_nodes = 1
 
 [slurm.env]
@@ -768,15 +770,16 @@ def validate_request(
     _relative_path(script, f"{backend}.script")
     if backend == "slurm":
         max_nodes = execution.get("max_concurrent_nodes")
-        if not isinstance(max_nodes, int) or isinstance(max_nodes, bool):
-            raise ExpctlError("slurm.max_concurrent_nodes must be an integer")
-        if max_nodes < 1:
-            raise ExpctlError("slurm.max_concurrent_nodes must be at least 1")
-        if config.max_total_nodes and max_nodes > config.max_total_nodes:
-            raise ExpctlError(
-                "slurm.max_concurrent_nodes must be between 1 and "
-                f"{config.max_total_nodes} (scheduler.max_total_nodes)"
-            )
+        if max_nodes is not None:
+            if not isinstance(max_nodes, int) or isinstance(max_nodes, bool):
+                raise ExpctlError("slurm.max_concurrent_nodes must be an integer")
+            if max_nodes < 1:
+                raise ExpctlError("slurm.max_concurrent_nodes must be at least 1")
+            if config.max_total_nodes and max_nodes > config.max_total_nodes:
+                raise ExpctlError(
+                    "slurm.max_concurrent_nodes must be between 1 and "
+                    f"{config.max_total_nodes} (scheduler.max_total_nodes)"
+                )
     else:
         args = execution.get("args", [])
         if not isinstance(args, list) or not all(
@@ -876,18 +879,24 @@ def validate_request(
         _validate_request_git(repo, config, data)
 
 
+# Cached verification of one pinned script: (verified concurrent nodes, the
+# reason the node envelope could not be derived, a fatal script error).
+_ScriptCacheEntry = tuple[int | None, str | None, str | None]
+
+
 def _validate_request_git(
     repo: Path,
     config: Config,
     request: dict[str, Any],
     *,
     commit_cache: dict[str, str | None] | None = None,
-    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]]
-    | None = None,
+    script_cache: dict[tuple[str, str, str], _ScriptCacheEntry] | None = None,
 ) -> int | None:
     """Validate pinned Git content, optionally reusing results across requests.
 
-    Returns the worst-case concurrent node count derived from the script.
+    Returns the worst-case concurrent node count derived from the script, or
+    None when the request leaves the node envelope unlimited and the script
+    does not declare one.
     """
     commit = request["code"]["commit"]
     branch = request["code"]["branch"]
@@ -918,7 +927,7 @@ def _validate_request_git(
                     f"command failed (git show {commit}:{script}): {detail}"
                 )
             if backend == "slurm":
-                verified_nodes = _verify_slurm_script(
+                verified_nodes, envelope_error = _verify_slurm_script(
                     config, commit, script, shown.stdout
                 )
             else:
@@ -927,22 +936,58 @@ def _validate_request_git(
                 )
                 mode = tree.stdout.split(maxsplit=1)[0] if tree.returncode == 0 else ""
                 _verify_local_script_mode(commit, script, mode)
-                verified_nodes = None
+                verified_nodes, envelope_error = None, None
         except ExpctlError as exc:
-            script_cache[cache_key] = (None, str(exc))
+            script_cache[cache_key] = (None, None, str(exc))
         else:
-            script_cache[cache_key] = (verified_nodes, None)
-    verified_nodes, error = script_cache[cache_key]
+            script_cache[cache_key] = (verified_nodes, envelope_error, None)
+    verified_nodes, envelope_error, error = script_cache[cache_key]
     if error:
         raise ExpctlError(error)
     if backend == "slurm":
-        assert verified_nodes is not None
-        max_nodes = execution["max_concurrent_nodes"]
-        if verified_nodes > max_nodes:
-            raise ExpctlError(
-                f"{script} can use {verified_nodes} concurrent nodes, exceeding "
-                f"slurm.max_concurrent_nodes={max_nodes}"
-            )
+        _check_node_envelope(config, execution, verified_nodes, envelope_error)
+    return verified_nodes
+
+
+def _check_node_envelope(
+    config: Config,
+    execution: dict[str, Any],
+    verified_nodes: int | None,
+    envelope_error: str | None,
+) -> None:
+    """Enforce the declared node cap, or the budget's need for a derived count.
+
+    A request without ``slurm.max_concurrent_nodes`` is unlimited: the script
+    is not required to declare a parseable node envelope unless the
+    repository enables ``scheduler.max_total_nodes``, whose budget check
+    needs a worst-case count to reserve.
+    """
+    declared = execution.get("max_concurrent_nodes")
+    if declared is None and not config.max_total_nodes:
+        return
+    if envelope_error:
+        raise ExpctlError(envelope_error)
+    assert verified_nodes is not None
+    script = execution["script"]
+    if declared is not None and verified_nodes > declared:
+        raise ExpctlError(
+            f"{script} can use {verified_nodes} concurrent nodes, exceeding "
+            f"slurm.max_concurrent_nodes={declared}"
+        )
+    if declared is None and verified_nodes > config.max_total_nodes:
+        raise ExpctlError(
+            f"{script} can use {verified_nodes} concurrent nodes, exceeding "
+            f"scheduler.max_total_nodes={config.max_total_nodes}; reduce the "
+            "script's node envelope or declare slurm.max_concurrent_nodes"
+        )
+
+
+def _budget_nodes(execution: dict[str, Any], verified_nodes: int | None) -> int:
+    """Nodes to reserve against the budget: the declared cap, else the script's."""
+    declared = execution.get("max_concurrent_nodes")
+    if declared is not None:
+        return int(declared)
+    assert verified_nodes is not None, "node envelope checked before budgeting"
     return verified_nodes
 
 
@@ -960,8 +1005,15 @@ def _missing_script_error(backend: str, commit: str, script: str) -> str:
     )
 
 
-def _verify_slurm_script(config: Config, commit: str, script: str, content: str) -> int:
-    """Check required lines and return the script's worst-case node count."""
+def _verify_slurm_script(
+    config: Config, commit: str, script: str, content: str
+) -> tuple[int | None, str | None]:
+    """Check required lines and derive the script's worst-case node count.
+
+    Returns ``(nodes, None)`` when the envelope is derivable and
+    ``(None, reason)`` otherwise; whether that reason is fatal depends on the
+    request (see ``_check_node_envelope``).
+    """
     script_lines = content.splitlines()
     active_script_lines = _slurm_preamble(script_lines)
     for required in config.required_script_lines:
@@ -969,7 +1021,16 @@ def _verify_slurm_script(config: Config, commit: str, script: str, content: str)
             raise ExpctlError(
                 f"{script} at {commit[:12]} is missing the required line: {required}"
             )
-    return _script_max_concurrent_nodes(script_lines, script)
+    return _script_node_envelope(script_lines, script)
+
+
+def _script_node_envelope(
+    script_lines: list[str], script: str
+) -> tuple[int | None, str | None]:
+    try:
+        return _script_max_concurrent_nodes(script_lines, script), None
+    except ExpctlError as exc:
+        return None, str(exc)
 
 
 def _verify_local_script_mode(commit: str, script: str, mode: str) -> None:
@@ -1051,7 +1112,7 @@ def _prefill_git_caches(
     requests: list[dict[str, Any]],
     *,
     commit_cache: dict[str, str | None],
-    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]],
+    script_cache: dict[tuple[str, str, str], _ScriptCacheEntry],
 ) -> None:
     """Verify many requests' pinned commits and scripts with two Git queries.
 
@@ -1108,7 +1169,7 @@ def _prefill_git_caches(
             if backend == "slurm":
                 if object_type != "blob":
                     continue
-                verified_nodes: int | None = _verify_slurm_script(
+                verified_nodes, envelope_error = _verify_slurm_script(
                     config, commit, script, content.decode("utf-8", "replace")
                 )
             else:
@@ -1118,11 +1179,11 @@ def _prefill_git_caches(
                 if mode is None:
                     raise ExpctlError(_missing_script_error(backend, commit, script))
                 _verify_local_script_mode(commit, script, mode)
-                verified_nodes = None
+                verified_nodes, envelope_error = None, None
         except ExpctlError as exc:
-            script_cache[key] = (None, str(exc))
+            script_cache[key] = (None, None, str(exc))
         else:
-            script_cache[key] = (verified_nodes, None)
+            script_cache[key] = (verified_nodes, envelope_error, None)
 
 
 def _request_hash(path: Path) -> str:
@@ -2056,7 +2117,10 @@ def submit_request(
         script_lines = _git_text(
             repo, "show", f"{code['commit']}:{execution['script']}"
         ).splitlines()
-        verified_nodes = _script_max_concurrent_nodes(script_lines, execution["script"])
+        verified_nodes, envelope_error = _script_node_envelope(
+            script_lines, execution["script"]
+        )
+        _check_node_envelope(config, execution, verified_nodes, envelope_error)
         policy_options = tuple(_required_sbatch_options(config.required_script_lines))
         command = build_sbatch_command(request, policy_options)
         execution_environment, cleared_environment = _sbatch_environment()
@@ -2075,7 +2139,7 @@ def submit_request(
     if backend == "slurm":
         preview.update(
             {
-                "declared_max_concurrent_nodes": execution["max_concurrent_nodes"],
+                "declared_max_concurrent_nodes": execution.get("max_concurrent_nodes"),
                 "verified_max_concurrent_nodes": verified_nodes,
                 "cleared_sbatch_environment": cleared_environment,
             }
@@ -2103,7 +2167,7 @@ def submit_request(
     if backend == "slurm":
         pending.update(
             {
-                "declared_max_concurrent_nodes": execution["max_concurrent_nodes"],
+                "declared_max_concurrent_nodes": execution.get("max_concurrent_nodes"),
                 "verified_max_concurrent_nodes": verified_nodes,
                 "cleared_sbatch_environment": cleared_environment,
                 "sbatch_command": command,
@@ -2150,7 +2214,7 @@ def submit_request(
                     and not skip_node_check
                 ):
                     budget = _check_node_budget(
-                        repo, config, execution["max_concurrent_nodes"]
+                        repo, config, _budget_nodes(execution, verified_nodes)
                     )
                 if _request_hash(path) != request_hash:
                     raise ExpctlError(
@@ -2226,6 +2290,55 @@ def submit_request(
             except (ExpctlError, OSError):
                 pass
         raise
+
+
+def requested_experiment_ids(repo: Path, config: Config) -> list[str]:
+    """IDs of requests that have no receipt yet, oldest ID first."""
+    requests_dir = repo / config.root / "requests"
+    return sorted(
+        path.stem
+        for path in requests_dir.glob("*.toml")
+        if not (result_dir(repo, config, path.stem) / "receipt.json").is_file()
+    )
+
+
+def submit_requested(
+    repo: Path,
+    config: Config,
+    *,
+    dry_run: bool,
+    skip_node_check: bool,
+    worktree_root: Path | None,
+) -> dict[str, Any]:
+    """Submit every request without a receipt, continuing past failures.
+
+    Requests are handled oldest first. Each one is validated and submitted on
+    its own, so an invalid request or an exhausted node budget only skips
+    that request; the others still run. Failures are reported in the result.
+    """
+    requested = requested_experiment_ids(repo, config)
+    results: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
+    for experiment_id in requested:
+        try:
+            results.append(
+                submit_request(
+                    repo,
+                    config,
+                    experiment_id,
+                    dry_run=dry_run,
+                    skip_node_check=skip_node_check,
+                    worktree_root=worktree_root,
+                )
+            )
+        except ExpctlError as exc:
+            failed.append({"experiment_id": experiment_id, "error": str(exc)})
+    return {
+        "dry_run": dry_run,
+        "requested": requested,
+        "results": results,
+        "failed": failed,
+    }
 
 
 def _queue_statuses(repo: Path, job_ids: list[str]) -> list[dict[str, str]]:
@@ -3682,8 +3795,9 @@ def _render_validate_summary(
             (
                 "Nodes",
                 (
-                    f"{verified_nodes} verified / "
-                    f"{execution['max_concurrent_nodes']} declared"
+                    _format_node_envelope(
+                        verified_nodes, execution.get("max_concurrent_nodes")
+                    )
                     if backend == "slurm"
                     else None
                 ),
@@ -3783,6 +3897,14 @@ def _render_doctor_result(
     return "\n".join(lines)
 
 
+def _format_node_envelope(verified: object, declared: object) -> str:
+    verified_text = (
+        "not derived from script" if verified is None else f"{verified} verified"
+    )
+    declared_text = "unlimited" if declared is None else f"{declared} declared"
+    return f"{verified_text} / {declared_text}"
+
+
 def _render_submit_result(
     result: dict[str, Any],
     *,
@@ -3794,9 +3916,9 @@ def _render_submit_result(
     backend = str(result.get("backend", "slurm"))
     nodes = None
     if backend == "slurm":
-        nodes = (
-            f"{result.get('verified_max_concurrent_nodes')} verified / "
-            f"{result.get('declared_max_concurrent_nodes')} declared"
+        nodes = _format_node_envelope(
+            result.get("verified_max_concurrent_nodes"),
+            result.get("declared_max_concurrent_nodes"),
         )
     fields: list[tuple[str, object]] = [
         ("Experiment", experiment_id),
@@ -3826,6 +3948,46 @@ def _render_submit_result(
         fields,
         next_steps=[shlex.join(["expctl", "status", experiment_id, "--watch"])],
     )
+
+
+def _render_submit_batch_result(
+    result: dict[str, Any],
+    *,
+    dry_run: bool,
+    worktree_root: Path | None,
+    skip_node_check: bool,
+) -> str:
+    requested = list(result.get("requested", []))
+    if not requested:
+        return "No requested experiments without a receipt; nothing to submit."
+    sections = [
+        _render_submit_result(
+            item,
+            dry_run=dry_run,
+            worktree_root=worktree_root,
+            skip_node_check=skip_node_check,
+        )
+        for item in result.get("results", [])
+    ]
+    failed = [
+        (str(item.get("experiment_id")), str(item.get("error")))
+        for item in result.get("failed", [])
+    ]
+    done = len(sections)
+    heading = "PREVIEWED" if dry_run else "SUBMITTED"
+    summary = [f"{heading} {done} OF {len(requested)} REQUESTED"]
+    if failed:
+        summary.append(_render_table(("EXPERIMENT ID", "ERROR"), list(failed)))
+    if dry_run and done:
+        submit_command = ["expctl", "submit", "--all"]
+        if worktree_root is not None:
+            submit_command.extend(["--worktree-root", str(worktree_root)])
+        if skip_node_check:
+            submit_command.append("--skip-node-check")
+        summary.extend(["", _render_next_steps([shlex.join(submit_command)])])
+    elif done:
+        summary.extend(["", _render_next_steps(["expctl list"])])
+    return "\n\n".join(sections + ["\n".join(summary)])
 
 
 def _render_status_result(result: dict[str, Any], *, result_path: str) -> str:
@@ -4278,7 +4440,7 @@ def _list_request_batch(
     paths: list[Path],
     *,
     commit_cache: dict[str, str | None],
-    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]],
+    script_cache: dict[tuple[str, str, str], _ScriptCacheEntry],
 ) -> tuple[list[dict[str, str]], str | None]:
     """Validate and refresh one bounded batch of request paths.
 
@@ -4369,7 +4531,7 @@ def list_requests(
     selected: list[dict[str, str]] = []
     warnings: list[str] = []
     commit_cache: dict[str, str | None] = {}
-    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]] = {}
+    script_cache: dict[tuple[str, str, str], _ScriptCacheEntry] = {}
     for offset in range(0, len(paths), batch_size):
         rows, warning = _list_request_batch(
             repo,
@@ -4549,8 +4711,17 @@ def _parser() -> argparse.ArgumentParser:
     show = subparsers.add_parser("show", help="print one validated request as JSON")
     show.add_argument("experiment_id", metavar="ID")
 
-    submit = subparsers.add_parser("submit", help="start one SLURM or local request")
-    submit.add_argument("experiment_id", metavar="ID")
+    submit = subparsers.add_parser(
+        "submit", help="start one request, or every request without a receipt"
+    )
+    submit.add_argument(
+        "experiment_id", metavar="ID", nargs="?", help="request to submit"
+    )
+    submit.add_argument(
+        "--all",
+        action="store_true",
+        help="submit every request that has no receipt yet, oldest ID first",
+    )
     submit.add_argument(
         "--dry-run",
         action="store_true",
@@ -4793,6 +4964,36 @@ def main(argv: list[str] | None = None) -> int:
             request, _ = load_request(repo, config, args.experiment_id)
             print(json.dumps(request, indent=2, sort_keys=True))
         elif args.command == "submit":
+            if args.all == (args.experiment_id is not None):
+                raise ExpctlError(
+                    "submit needs exactly one of an experiment ID or --all"
+                )
+            if args.all:
+                batch = submit_requested(
+                    repo,
+                    config,
+                    dry_run=args.dry_run,
+                    skip_node_check=args.skip_node_check,
+                    worktree_root=args.worktree_root,
+                )
+                _print_command_result(
+                    batch,
+                    _render_submit_batch_result(
+                        batch,
+                        dry_run=args.dry_run,
+                        worktree_root=args.worktree_root,
+                        skip_node_check=args.skip_node_check,
+                    ),
+                    force_json=args.json,
+                )
+                if batch["failed"]:
+                    print(
+                        f"error: {len(batch['failed'])} of {len(batch['requested'])} "
+                        "requested experiments failed",
+                        file=sys.stderr,
+                    )
+                    return 2
+                return 0
             result = submit_request(
                 repo,
                 config,
