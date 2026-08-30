@@ -4,6 +4,7 @@ import subprocess
 import time
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -620,6 +621,80 @@ def test_list_caches_git_validation_for_shared_commits_and_scripts(
     assert calls == {"commit": 1, "script": 1}
 
 
+def test_limited_list_only_validates_requests_that_can_be_displayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    requests = repo / "expctl" / "requests"
+    for experiment_id in ("20260102-middle", "20260103-new"):
+        (requests / f"{experiment_id}.toml").write_text(
+            EXAMPLE_REQUEST.replace(EXAMPLE_ID, experiment_id), encoding="utf-8"
+        )
+    real_load_request = core.load_request
+    loaded: list[str] = []
+
+    def tracked_load_request(
+        loaded_repo: Path,
+        loaded_config: Config,
+        experiment_id: str,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], Path]:
+        loaded.append(experiment_id)
+        return real_load_request(loaded_repo, loaded_config, experiment_id, **kwargs)
+
+    monkeypatch.setattr(core, "load_request", tracked_load_request)
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: None)
+
+    rows = core.list_requests(repo, config, sort_order="newest", limit=1)
+
+    assert [row["id"] for row in rows] == ["20260103-new"]
+    assert loaded == ["20260103-new"]
+
+
+def test_status_filtered_limit_scans_in_order_until_enough_rows_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    requests = repo / "expctl" / "requests"
+    for experiment_id in ("20260102-match", "20260103-third", "20260104-new"):
+        (requests / f"{experiment_id}.toml").write_text(
+            EXAMPLE_REQUEST.replace(EXAMPLE_ID, experiment_id), encoding="utf-8"
+        )
+    receipt_dir = repo / "expctl" / "results" / "20260102-match"
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "receipt.json").write_text(
+        json.dumps({"status": "collected"}), encoding="utf-8"
+    )
+    real_load_request = core.load_request
+    loaded: list[str] = []
+
+    def tracked_load_request(
+        loaded_repo: Path,
+        loaded_config: Config,
+        experiment_id: str,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], Path]:
+        loaded.append(experiment_id)
+        return real_load_request(loaded_repo, loaded_config, experiment_id, **kwargs)
+
+    monkeypatch.setattr(core, "load_request", tracked_load_request)
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: None)
+    monkeypatch.setattr(core, "LIST_STATUS_SCAN_BATCH_SIZE", 1)
+
+    rows = core.list_requests(
+        repo,
+        config,
+        statuses={"collected"},
+        sort_order="newest",
+        limit=1,
+    )
+
+    assert [row["id"] for row in rows] == ["20260102-match"]
+    assert loaded == ["20260104-new", "20260103-third", "20260102-match"]
+
+
 def test_doctor_reports_repository_and_cluster_readiness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -702,7 +777,11 @@ def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
     )
     monkeypatch.setattr(core, "find_repo_root", lambda: tmp_path)
     monkeypatch.setattr(core, "load_config", lambda repo: config)
-    monkeypatch.setattr(core, "list_requests", lambda repo, loaded: rows)
+    monkeypatch.setattr(
+        core,
+        "list_requests",
+        lambda repo, loaded, **options: core._select_list_rows(rows, **options),
+    )
 
     assert core.main(["list"]) == 0
     assert capsys.readouterr().out == f"{EXAMPLE_ID}\trequested\t中文标题\n"
@@ -715,7 +794,13 @@ def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
         {"id": "20260102-running", "status": "RUNNING", "title": "active"},
         {"id": "20260103-failed", "status": "FAILED", "title": "failed"},
     ]
-    monkeypatch.setattr(core, "list_requests", lambda repo, loaded: filtered_rows)
+    monkeypatch.setattr(
+        core,
+        "list_requests",
+        lambda repo, loaded, **options: core._select_list_rows(
+            filtered_rows, **options
+        ),
+    )
     assert core.main(["list", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == [filtered_rows[2]]
 

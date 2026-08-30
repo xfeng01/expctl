@@ -136,7 +136,7 @@ expctl submit <id>
 
 `expctl list` 在交互终端中显示对齐表格，管道或文件输出默认使用稳定 TSV。它批量刷新 SLURM 作业状态，并从记录的进程身份和退出状态文件刷新 local 状态；刷新是只读的，不修改回执。SLURM 查询失败时，受影响的行回退为 `submitted` 并只在标准错误输出一条警告。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color` 关闭颜色。
 
-`list` 默认按 ID 从新到旧排列；可用 `--sort oldest` 反转。`--status running,failed` 按实时或回执状态筛选且不区分大小写。`display.list_limit` 设置仓库默认显示数量，`--limit 20` 可临时覆盖，`--all` 则忽略默认限制并显示全部；限制在筛选和排序后应用。未配置 `display.list_limit` 的旧仓库仍显示所有请求。相同 commit 和脚本的 Git 校验会在单次列表中复用。
+`list` 默认按 ID 从新到旧排列；可用 `--sort oldest` 反转。`--status running,failed` 按实时或回执状态筛选且不区分大小写。`display.list_limit` 设置仓库默认显示数量，`--limit 20` 可临时覆盖，`--all` 则忽略默认限制并显示全部；限制在筛选和排序后应用。没有状态筛选时，有限列表只验证和刷新最终可能显示的 N 个请求；带状态筛选时按固定大小分批扫描，找到 N 个匹配项后停止；`--all` 才执行完整扫描。未配置 `display.list_limit` 的旧仓库仍显示所有请求。相同 commit 和脚本的 Git 校验会在单次列表中复用。
 
 面向生命周期的命令在交互终端中使用对齐表格显示详情和建议的下一步；输出到管道或文件时保持 JSON，原始日志除外。需要在终端中获取 JSON 时使用命令支持的 `--json`。
 

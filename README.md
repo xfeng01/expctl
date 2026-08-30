@@ -161,7 +161,9 @@ file. Receipts are never modified by a refresh.
 contain comma-separated values, and may be repeated. Filtering uses refreshed
 execution states; repeated commit/script validation is cached within each
 listing. The configured or command-line limit is applied after filtering and
-sorting.
+sorting. Without a status filter, a limited listing validates and refreshes
+only those N request paths. Status-filtered listings scan in bounded batches
+and stop once N matches are found; `--all` performs a complete scan.
 
 For SLURM, `status` falls back to `sacct` when `squeue` is unavailable. For
 local runs, it checks the recorded process identity and exit-status file. With

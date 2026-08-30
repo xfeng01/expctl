@@ -4070,13 +4070,21 @@ def _list_color_enabled() -> bool:
     )
 
 
-def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
-    requests_dir = repo / config.root / "requests"
+LIST_STATUS_SCAN_BATCH_SIZE = 50
+
+
+def _list_request_batch(
+    repo: Path,
+    config: Config,
+    paths: list[Path],
+    *,
+    commit_cache: dict[str, str | None],
+    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]],
+) -> tuple[list[dict[str, str]], str | None]:
+    """Validate and refresh one bounded batch of request paths."""
     rows: list[dict[str, str]] = []
     submitted_rows: dict[str, list[dict[str, str]]] = {}
-    commit_cache: dict[str, str | None] = {}
-    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]] = {}
-    for path in sorted(requests_dir.glob("*.toml"), key=lambda p: p.stem):
+    for path in paths:
         experiment_id = path.stem
         try:
             data, _ = load_request(repo, config, experiment_id, check_git=False)
@@ -4131,14 +4139,69 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
         except ExpctlError as exc:
             rows.append({"id": experiment_id, "status": "invalid", "title": str(exc)})
 
+    warning = None
     if submitted_rows:
         live_statuses, warning = _live_scheduler_statuses(repo, list(submitted_rows))
         for job_id, live_status in live_statuses.items():
             for row in submitted_rows.get(job_id, []):
                 row["status"] = live_status
-        if warning:
-            print(f"warning: {warning}", file=sys.stderr)
-    return rows
+    return rows, warning
+
+
+def list_requests(
+    repo: Path,
+    config: Config,
+    *,
+    statuses: set[str] | None = None,
+    sort_order: str = "oldest",
+    limit: int | None = None,
+) -> list[dict[str, str]]:
+    """List requests while avoiding work for rows that cannot be displayed.
+
+    Unfiltered limited listings process exactly the requested paths. A limited
+    status-filtered listing scans in bounded batches and stops once enough
+    matching rows have been resolved. Unlimited listings retain one full batch
+    so SLURM status refreshes stay consolidated.
+    """
+    statuses = set() if statuses is None else statuses
+    requests_dir = repo / config.root / "requests"
+    paths = sorted(
+        requests_dir.glob("*.toml"),
+        key=lambda path: path.stem,
+        reverse=sort_order == "newest",
+    )
+    if limit is not None and not statuses:
+        paths = paths[:limit]
+
+    batch_size = len(paths)
+    if statuses and limit is not None:
+        batch_size = max(LIST_STATUS_SCAN_BATCH_SIZE, limit)
+    if batch_size == 0:
+        return []
+
+    selected: list[dict[str, str]] = []
+    warnings: list[str] = []
+    commit_cache: dict[str, str | None] = {}
+    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]] = {}
+    for offset in range(0, len(paths), batch_size):
+        rows, warning = _list_request_batch(
+            repo,
+            config,
+            paths[offset : offset + batch_size],
+            commit_cache=commit_cache,
+            script_cache=script_cache,
+        )
+        if warning and warning not in warnings:
+            warnings.append(warning)
+        selected.extend(
+            row for row in rows if not statuses or row["status"].casefold() in statuses
+        )
+        if limit is not None and len(selected) >= limit:
+            break
+
+    if warnings:
+        print(f"warning: {'; '.join(warnings)}", file=sys.stderr)
+    return selected[:limit] if limit is not None else selected
 
 
 def _status_filter_argument(value: str) -> tuple[str, ...]:
@@ -4496,7 +4559,6 @@ def main(argv: list[str] | None = None) -> int:
                 result, _render_new_result(result), force_json=args.json
             )
         elif args.command == "list":
-            rows = list_requests(repo, config)
             statuses = {status for group in args.status for status in group}
             effective_limit = (
                 None
@@ -4505,8 +4567,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.limit is not None
                 else config.list_limit
             )
-            rows = _select_list_rows(
-                rows,
+            rows = list_requests(
+                repo,
+                config,
                 statuses=statuses,
                 sort_order=args.sort,
                 limit=effective_limit,
