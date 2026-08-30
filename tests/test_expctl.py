@@ -110,6 +110,7 @@ def test_init_creates_skeleton_and_is_idempotent(tmp_path: Path) -> None:
     assert (tmp_path / "expctl" / "templates" / "request.toml").is_file()
     assert (tmp_path / "expctl" / "requests" / ".gitkeep").is_file()
     assert load_config(tmp_path).max_total_nodes == 0
+    assert load_config(tmp_path).list_limit == 20
     assert init_repo(tmp_path) == []
 
 
@@ -140,6 +141,25 @@ def test_root_directory_is_configurable(tmp_path: Path) -> None:
 
     assert config.root == "handoffs/cluster"
     assert path.parent == requests
+
+
+def test_list_limit_is_optional_and_must_be_positive(tmp_path: Path) -> None:
+    (tmp_path / "expctl.toml").write_text(EXAMPLE_CONFIG, encoding="utf-8")
+    assert load_config(tmp_path).list_limit is None
+
+    configured = EXAMPLE_CONFIG.replace(
+        "[scheduler]", "[display]\nlist_limit = 12\n\n[scheduler]"
+    )
+    (tmp_path / "expctl.toml").write_text(configured, encoding="utf-8")
+    assert load_config(tmp_path).list_limit == 12
+
+    for invalid in ("0", "-1", "true", '"12"'):
+        invalid_config = EXAMPLE_CONFIG.replace(
+            "[scheduler]", f"[display]\nlist_limit = {invalid}\n\n[scheduler]"
+        )
+        (tmp_path / "expctl.toml").write_text(invalid_config, encoding="utf-8")
+        with pytest.raises(ExpctlError, match="display.list_limit"):
+            load_config(tmp_path)
 
 
 def test_root_directory_must_stay_inside_the_repo(tmp_path: Path) -> None:
@@ -549,6 +569,8 @@ def test_list_tsv_is_single_line_per_request_and_parser_exposes_formats() -> Non
     )
     assert list_args.status == [("running", "failed"), ("requested",)]
     assert list_args.sort == "oldest" and list_args.limit == 2
+    assert list_args.all is False
+    assert core._parser().parse_args(["list", "--all"]).all is True
 
 
 def test_list_filters_sorts_and_limits_after_live_status_resolution() -> None:
@@ -676,6 +698,7 @@ def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
         shared_dirs=(),
         create_missing=(),
         worktree_root="..",
+        list_limit=1,
     )
     monkeypatch.setattr(core, "find_repo_root", lambda: tmp_path)
     monkeypatch.setattr(core, "load_config", lambda repo: config)
@@ -693,6 +716,12 @@ def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
         {"id": "20260103-failed", "status": "FAILED", "title": "failed"},
     ]
     monkeypatch.setattr(core, "list_requests", lambda repo, loaded: filtered_rows)
+    assert core.main(["list", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == [filtered_rows[2]]
+
+    assert core.main(["list", "--json", "--all"]) == 0
+    assert json.loads(capsys.readouterr().out) == list(reversed(filtered_rows))
+
     assert (
         core.main(["list", "--json", "--status", "running,failed", "--limit", "1"]) == 0
     )

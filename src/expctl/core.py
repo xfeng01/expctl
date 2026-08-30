@@ -80,6 +80,10 @@ version = 1
 # Directory (relative to the repo root) holding requests/, results/, templates/.
 root = "expctl"
 
+[display]
+# Default number of rows shown by `expctl list`. Use `list --all` to override.
+list_limit = 20
+
 [scheduler]
 # Verbatim lines that must appear in the job script at the pinned commit.
 # #SBATCH options here are also passed on the command line so the script cannot
@@ -211,6 +215,7 @@ class Config:
     shared_dirs: tuple[str, ...]
     create_missing: tuple[str, ...]
     worktree_root: str
+    list_limit: int | None = None
 
 
 def _run(
@@ -416,7 +421,7 @@ def load_config(repo: Path) -> Config:
         raise ExpctlError(f"{CONFIG_NAME} version must be 1")
 
     tables: dict[str, dict[str, Any]] = {}
-    for name in ("paths", "scheduler", "runtime", "worktree"):
+    for name in ("paths", "display", "scheduler", "runtime", "worktree"):
         table = data.get(name, {})
         if not isinstance(table, dict):
             raise ExpctlError(f"[{name}] in {CONFIG_NAME} must be a table")
@@ -427,6 +432,14 @@ def load_config(repo: Path) -> Config:
         raise ExpctlError("paths.root must be a non-empty string")
     resolved_data_root = _resolved_repo_path(repo, data_root, "paths.root")
     data_root = resolved_data_root.relative_to(repo.resolve()).as_posix()
+
+    list_limit = tables["display"].get("list_limit")
+    if list_limit is not None and (
+        not isinstance(list_limit, int)
+        or isinstance(list_limit, bool)
+        or list_limit < 1
+    ):
+        raise ExpctlError("display.list_limit must be an integer >= 1")
 
     max_total = tables["scheduler"].get("max_total_nodes", 0)
     if not isinstance(max_total, int) or isinstance(max_total, bool) or max_total < 0:
@@ -464,6 +477,7 @@ def load_config(repo: Path) -> Config:
         shared_dirs=shared,
         create_missing=create_missing,
         worktree_root=root,
+        list_limit=list_limit,
     )
 
 
@@ -4266,11 +4280,17 @@ def _parser() -> argparse.ArgumentParser:
         default="newest",
         help="sort by experiment ID (default: newest)",
     )
-    listing.add_argument(
+    list_count = listing.add_mutually_exclusive_group()
+    list_count.add_argument(
         "--limit",
         type=_positive_int,
         metavar="N",
-        help="show at most N experiments after filtering and sorting",
+        help="override display.list_limit for this command",
+    )
+    list_count.add_argument(
+        "--all",
+        action="store_true",
+        help="show all matching experiments, ignoring display.list_limit",
     )
 
     validate = subparsers.add_parser("validate", help="validate one request")
@@ -4478,11 +4498,18 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "list":
             rows = list_requests(repo, config)
             statuses = {status for group in args.status for status in group}
+            effective_limit = (
+                None
+                if args.all
+                else args.limit
+                if args.limit is not None
+                else config.list_limit
+            )
             rows = _select_list_rows(
                 rows,
                 statuses=statuses,
                 sort_order=args.sort,
-                limit=args.limit,
+                limit=effective_limit,
             )
             output_format = args.list_format
             if output_format == "auto":

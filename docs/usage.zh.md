@@ -136,7 +136,7 @@ expctl submit <id>
 
 `expctl list` 在交互终端中显示对齐表格，管道或文件输出默认使用稳定 TSV。它批量刷新 SLURM 作业状态，并从记录的进程身份和退出状态文件刷新 local 状态；刷新是只读的，不修改回执。SLURM 查询失败时，受影响的行回退为 `submitted` 并只在标准错误输出一条警告。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color` 关闭颜色。
 
-`list` 默认按 ID 从新到旧排列；可用 `--sort oldest` 反转。`--status running,failed` 按实时或回执状态筛选且不区分大小写，`--limit 20` 在筛选和排序后限制数量。相同 commit 和脚本的 Git 校验会在单次列表中复用。
+`list` 默认按 ID 从新到旧排列；可用 `--sort oldest` 反转。`--status running,failed` 按实时或回执状态筛选且不区分大小写。`display.list_limit` 设置仓库默认显示数量，`--limit 20` 可临时覆盖，`--all` 则忽略默认限制并显示全部；限制在筛选和排序后应用。未配置 `display.list_limit` 的旧仓库仍显示所有请求。相同 commit 和脚本的 Git 校验会在单次列表中复用。
 
 面向生命周期的命令在交互终端中使用对齐表格显示详情和建议的下一步；输出到管道或文件时保持 JSON，原始日志除外。需要在终端中获取 JSON 时使用命令支持的 `--json`。
 
@@ -249,6 +249,9 @@ version = 1
 [paths]
 root = "expctl"
 
+[display]
+list_limit = 20
+
 [scheduler]
 required_script_lines = ["#SBATCH -p my-partition"]
 max_total_nodes = 4
@@ -262,6 +265,7 @@ root = ".."
 ```
 
 - `paths.root`：请求、结果和模板的仓库相对目录。
+- `display.list_limit`：可选，`expctl list` 默认显示的最大条数，必须是正整数；省略时显示全部。命令行 `--limit` 可覆盖，`--all` 可忽略该限制。
 - `scheduler.required_script_lines`：仅用于 SLURM；必须出现在固定脚本可生效的头部区域，其中的 `#SBATCH` 选项还会作为命令行参数再次传入。
 - `scheduler.max_total_nodes`：仅用于 SLURM；当前用户的跨作业节点上限，`0` 表示禁用检查。
 - `runtime.shared_dirs`：从主工作树链接到实验 worktree 的顶层目录名。源目录不存在时跳过。
@@ -277,7 +281,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl init` | 补齐配置和 `paths.root` 指定的目录结构 |
 | `expctl doctor [--backend local\|slurm] [--cluster] [--json]` | 检查仓库和两个后端；选择 `--backend` 后对应检查计入退出码，`--cluster` 是 SLURM 别名 |
 | `expctl new <id> [--allow-dirty] [--json]` | 从模板创建请求并填写 Git 元数据；默认拒绝未提交改动 |
-| `expctl list [--table\|--tsv\|--json] [--status <states>] [--sort newest\|oldest] [--limit <n>] [--no-color]` | 列出请求及实时状态；默认从新到旧，终端表格，管道 TSV |
+| `expctl list [--table\|--tsv\|--json] [--status <states>] [--sort newest\|oldest] [--limit <n>\|--all] [--no-color]` | 列出请求及实时状态；默认数量可由 `display.list_limit` 配置，`--all` 显示全部 |
 | `expctl validate <id>` | 验证请求、固定提交和作业脚本策略 |
 | `expctl show <id>` | 将验证后的请求输出为 JSON |
 | `expctl submit <id> [--json]` | 准备 worktree，并通过请求声明的后端启动作业 |

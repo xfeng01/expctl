@@ -41,7 +41,7 @@ expctl doctor [--backend slurm|local] [--cluster] [--json]
 expctl new <id> [--allow-dirty] [--json]
 
 # List, filter, sort, and limit experiment requests.
-expctl list [--table | --tsv | --json] [--status STATUS[,STATUS...]] [--sort newest|oldest] [--limit N] [--no-color]
+expctl list [--table | --tsv | --json] [--status STATUS[,STATUS...]] [--sort newest|oldest] [--limit N | --all] [--no-color]
 
 # Print one validated request as JSON.
 expctl show <id>
@@ -82,6 +82,17 @@ expctl <command> --help
 
 `--skip-node-check` applies only to SLURM. It bypasses the cross-job node-budget
 check and requires explicit operator authorization.
+
+Set a repository-wide default row count in `expctl.toml`:
+
+```toml
+[display]
+list_limit = 20
+```
+
+`expctl list --limit N` overrides it once, while `expctl list --all` shows all
+matching requests. Existing configurations without `display.list_limit`
+continue to show every request.
 
 ## Execution backends
 
@@ -149,7 +160,8 @@ file. Receipts are never modified by a refresh.
 `list` sorts newest IDs first by default. `--status` is case-insensitive, may
 contain comma-separated values, and may be repeated. Filtering uses refreshed
 execution states; repeated commit/script validation is cached within each
-listing.
+listing. The configured or command-line limit is applied after filtering and
+sorting.
 
 For SLURM, `status` falls back to `sacct` when `squeue` is unavailable. For
 local runs, it checks the recorded process identity and exit-status file. With

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added repository-level `display.list_limit` for the default `expctl list`
+  row count. `--limit N` overrides it for one command and `--all` bypasses it.
+
 ## 0.9.0 — 2026-08-29
 
 - Added a `local` backend for asynchronous execution on an already allocated

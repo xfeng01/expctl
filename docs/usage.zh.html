@@ -384,7 +384,7 @@ expctl show &lt;id&gt;
 expctl submit &lt;id&gt; --dry-run
 expctl submit &lt;id&gt;</code></pre>
     <p><code>expctl list</code> 在交互终端中显示对齐表格，管道输出保持稳定 TSV。它批量刷新 SLURM 状态，并从进程身份和退出状态文件刷新 local 状态；刷新只读且不修改回执。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式。</p>
-    <p><code>list</code> 默认按 ID 从新到旧排列；<code>--sort oldest</code> 可反转。<code>--status running,failed</code> 按实时或回执状态筛选且不区分大小写，<code>--limit 20</code> 在筛选和排序后限制数量。相同 commit 和脚本的 Git 校验会在单次列表中复用。</p>
+    <p><code>list</code> 默认按 ID 从新到旧排列；<code>--sort oldest</code> 可反转。<code>--status running,failed</code> 按实时或回执状态筛选。<code>display.list_limit</code> 设置仓库默认显示数量，<code>--limit 20</code> 可临时覆盖，<code>--all</code> 显示全部；限制在筛选和排序后应用。未配置该字段的旧仓库仍显示所有请求。</p>
     <p>面向生命周期的命令在交互终端中使用对齐表格显示详情和建议的下一步；输出到管道或文件时保持 JSON，原始日志除外。需要在终端中获取 JSON 时使用命令支持的 <code>--json</code>。</p>
     <p><code>--dry-run</code> 会验证请求并输出后端、固定提交、worktree 和命令，但不会启动作业。正式提交会创建干净的 detached worktree，检查依赖，再通过所选后端启动并原子完成回执。SLURM 会额外检查资源和节点预算；local 会启动独立进程组并记录 PID、启动标识和退出状态文件。</p>
     <div class="note"><p>若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 <code>receipt.json</code>。</p></div>
@@ -449,6 +449,9 @@ expctl clean &lt;id&gt;</code></pre>
 [paths]
 root = "expctl"
 
+[display]
+list_limit = 20
+
 [scheduler]
 required_script_lines = ["#SBATCH -p my-partition"]
 max_total_nodes = 4
@@ -461,6 +464,7 @@ create_missing = ["runs", "logs"]
 root = ".."</code></pre>
     <ul>
       <li><code>paths.root</code>：请求、结果和模板的仓库相对目录。</li>
+      <li><code>display.list_limit</code>：可选，<code>expctl list</code> 默认显示的最大条数；省略时显示全部，<code>--limit</code> 可覆盖，<code>--all</code> 可忽略限制。</li>
       <li><code>scheduler.required_script_lines</code>：仅用于 SLURM；必须出现在固定脚本可生效的头部区域。</li>
       <li><code>scheduler.max_total_nodes</code>：仅用于 SLURM；当前用户的跨作业节点上限，<code>0</code> 表示禁用检查。</li>
       <li><code>runtime.shared_dirs</code>：从主工作树链接到实验 worktree 的顶层目录名。源目录不存在时跳过。</li>
@@ -478,7 +482,7 @@ root = ".."</code></pre>
         <tr><td><code>expctl init</code></td><td>补齐配置和 <code>paths.root</code> 指定的目录结构</td></tr>
         <tr><td><code>expctl doctor [--backend local|slurm] [--cluster] [--json]</code></td><td>检查仓库和两个后端；选择后端时对应检查计入退出码</td></tr>
         <tr><td><code>expctl new &lt;id&gt; [--allow-dirty] [--json]</code></td><td>从模板创建请求并填写 Git 元数据；默认拒绝未提交改动</td></tr>
-        <tr><td><code>expctl list [--table|--tsv|--json] [--status &lt;states&gt;] [--sort newest|oldest] [--limit &lt;n&gt;] [--no-color]</code></td><td>列出请求及实时状态；默认从新到旧，终端表格，管道 TSV</td></tr>
+        <tr><td><code>expctl list [--table|--tsv|--json] [--status &lt;states&gt;] [--sort newest|oldest] [--limit &lt;n&gt;|--all] [--no-color]</code></td><td>列出请求及实时状态；默认数量可由 <code>display.list_limit</code> 配置，<code>--all</code> 显示全部</td></tr>
         <tr><td><code>expctl validate &lt;id&gt;</code></td><td>验证请求、固定提交和作业脚本策略</td></tr>
         <tr><td><code>expctl show &lt;id&gt;</code></td><td>将验证后的请求输出为 JSON</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; [--json]</code></td><td>准备 worktree，并通过请求声明的后端启动作业</td></tr>
