@@ -5,13 +5,13 @@ can be installed, copy `core.py` anywhere and run `python core.py <command>`
 (Python 3.11+, stdlib only).
 
 Protocol: an immutable request file (`<root>/requests/<id>.toml`) pins the
-exact commit, entrypoint, and resource envelope of a run. Submitting writes a
+exact commit, execution backend, and entrypoint of a run. Submitting writes a
 receipt (`<root>/results/<id>/receipt.json`); collecting copies logs and
 scrapes metrics next to it. State is defined by which files exist — requests
 are never edited after submission; running one again is a new request
 (`expctl rerun` copies it under a fresh ID). `<root>` is `expctl/` unless
 `expctl.toml` says otherwise; that file also holds the per-repository policy
-(required scheduler flags, node ceiling, shared runtime directories).
+(SLURM constraints, shared runtime directories, and worktree location).
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import socket
 import string
 import subprocess
 import sys
@@ -39,7 +41,7 @@ from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-try:  # submit only runs on POSIX, but the read-only commands support Windows.
+try:  # Execution lifecycle writes need POSIX locks; authoring supports Windows.
     import fcntl
 except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX CI
     fcntl = None  # type: ignore[assignment]
@@ -47,7 +49,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
@@ -119,6 +121,10 @@ max_concurrent_nodes = 1
 [slurm.env]
 EXAMPLE_OPTION = "value"
 
+# To run directly on the current compute node, replace [slurm] and [slurm.env]
+# with [local] and [local.env]. A local script must be executable in Git and may
+# also define `args = ["..."]`.
+
 [outputs]
 log_glob = "logs/example-{job_id}.out"
 metrics = ["metric_name"]
@@ -126,6 +132,58 @@ metrics = ["metric_name"]
 [notes]
 requirements = ["runs/example/ckpt.pt"]
 instructions = "Any non-obvious recovery or rerun instructions."
+"""
+_LOCAL_RUNNER_CODE = r"""
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+status_path = Path(sys.argv[1])
+command = sys.argv[2:]
+started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+try:
+    completed = subprocess.run(command, check=False)
+    returncode = completed.returncode
+    error = None
+except BaseException as exc:
+    returncode = 127
+    error = f"{type(exc).__name__}: {exc}"
+payload = {
+    "command": command,
+    "started_at": started_at,
+    "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "returncode": returncode,
+}
+if error is not None:
+    payload["error"] = error
+temporary = None
+try:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="",
+        dir=status_path.parent,
+        prefix=f".{status_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, status_path)
+finally:
+    if temporary is not None:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+raise SystemExit(returncode)
 """
 _BUILTIN_TEMPLATE = tomllib.loads(STARTER_TEMPLATE)
 # Fields whose starter-template defaults must be replaced before a request is
@@ -446,6 +504,14 @@ def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _execution_table(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    backends = [name for name in ("slurm", "local") if name in data]
+    if len(backends) != 1:
+        raise ExpctlError("request must contain exactly one [slurm] or [local] table")
+    backend = backends[0]
+    return backend, _table(data, backend)
+
+
 def _text(data: dict[str, Any], key: str, context: str = "request") -> str:
     value = data.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -680,30 +746,45 @@ def validate_request(
         raise ExpctlError("code.commit must be a full 40-character Git commit")
     _plain_name(worktree, "code.worktree")
 
-    slurm = _table(data, "slurm")
-    script = _text(slurm, "script", "slurm")
-    _relative_path(script, "slurm.script")
-    max_nodes = slurm.get("max_concurrent_nodes")
-    if not isinstance(max_nodes, int) or isinstance(max_nodes, bool):
-        raise ExpctlError("slurm.max_concurrent_nodes must be an integer")
-    if max_nodes < 1:
-        raise ExpctlError("slurm.max_concurrent_nodes must be at least 1")
-    if config.max_total_nodes and max_nodes > config.max_total_nodes:
-        raise ExpctlError(
-            "slurm.max_concurrent_nodes must be between 1 and "
-            f"{config.max_total_nodes} (scheduler.max_total_nodes)"
-        )
+    backend, execution = _execution_table(data)
+    script = _text(execution, "script", backend)
+    _relative_path(script, f"{backend}.script")
+    if backend == "slurm":
+        max_nodes = execution.get("max_concurrent_nodes")
+        if not isinstance(max_nodes, int) or isinstance(max_nodes, bool):
+            raise ExpctlError("slurm.max_concurrent_nodes must be an integer")
+        if max_nodes < 1:
+            raise ExpctlError("slurm.max_concurrent_nodes must be at least 1")
+        if config.max_total_nodes and max_nodes > config.max_total_nodes:
+            raise ExpctlError(
+                "slurm.max_concurrent_nodes must be between 1 and "
+                f"{config.max_total_nodes} (scheduler.max_total_nodes)"
+            )
+    else:
+        args = execution.get("args", [])
+        if not isinstance(args, list) or not all(
+            isinstance(item, str) and "\0" not in item for item in args
+        ):
+            raise ExpctlError(
+                "local.args must be an array of strings without NUL bytes"
+            )
 
-    env = slurm.get("env", {})
+    env = execution.get("env", {})
     if not isinstance(env, dict):
-        raise ExpctlError("slurm.env must be a table")
+        raise ExpctlError(f"{backend}.env must be a table")
     for key, value in env.items():
-        if not ENV_RE.fullmatch(key) or key == "GROUPS":
+        if (
+            not ENV_RE.fullmatch(key)
+            or key == "GROUPS"
+            or key in {"EXPCTL_BACKEND", "EXPCTL_EXPERIMENT_ID", "EXPCTL_JOB_ID"}
+        ):
             raise ExpctlError(f"unsafe or reserved environment name: {key}")
         if not isinstance(value, str):
-            raise ExpctlError(f"slurm.env.{key} must be a quoted string")
-        if any(character in value for character in (",", "\n", "\r")):
-            raise ExpctlError(f"slurm.env.{key} cannot contain commas or newlines")
+            raise ExpctlError(f"{backend}.env.{key} must be a quoted string")
+        forbidden = (",", "\n", "\r") if backend == "slurm" else ("\0",)
+        if any(character in value for character in forbidden):
+            restriction = "commas or newlines" if backend == "slurm" else "NUL bytes"
+            raise ExpctlError(f"{backend}.env.{key} cannot contain {restriction}")
 
     outputs = _table(data, "outputs")
     log_glob = _text(outputs, "log_glob", "outputs")
@@ -731,6 +812,13 @@ def validate_request(
             f"unsupported: {rendered}"
         )
     _relative_path(log_glob.format(job_id="123"), "outputs.log_glob")
+    if backend == "local" and any(
+        character in log_glob.format(job_id="local-preview") for character in "*?["
+    ):
+        raise ExpctlError(
+            "outputs.log_glob must name one exact log file for local execution; "
+            "wildcards are only supported with SLURM"
+        )
     metrics = outputs.get("metrics")
     if (
         not isinstance(metrics, list)
@@ -777,16 +865,17 @@ def _validate_request_git(
     request: dict[str, Any],
     *,
     commit_cache: dict[str, str | None] | None = None,
-    script_cache: dict[tuple[str, str], tuple[int | None, str | None]] | None = None,
-) -> int:
+    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]]
+    | None = None,
+) -> int | None:
     """Validate pinned Git content, optionally reusing results across requests.
 
     Returns the worst-case concurrent node count derived from the script.
     """
     commit = request["code"]["commit"]
     branch = request["code"]["branch"]
-    script = request["slurm"]["script"]
-    max_nodes = request["slurm"]["max_concurrent_nodes"]
+    backend, execution = _execution_table(request)
+    script = execution["script"]
     commit_cache = {} if commit_cache is None else commit_cache
     script_cache = {} if script_cache is None else script_cache
 
@@ -805,7 +894,7 @@ def _validate_request_git(
     if error := commit_cache[commit]:
         raise ExpctlError(error)
 
-    cache_key = (commit, script)
+    cache_key = (backend, commit, script)
     if cache_key not in script_cache:
         try:
             shown = _run(["git", "show", f"{commit}:{script}"], cwd=repo, check=False)
@@ -813,22 +902,35 @@ def _validate_request_git(
                 detail = shown.stderr.strip() or shown.stdout.strip()
                 if "does not exist" in detail or "exists on disk" in detail:
                     raise ExpctlError(
-                        f"slurm.script {script} does not exist at commit "
+                        f"{backend}.script {script} does not exist at commit "
                         f"{commit[:12]}; commit and push the script, then pin "
                         "that commit"
                     )
                 raise ExpctlError(
                     f"command failed (git show {commit}:{script}): {detail}"
                 )
-            script_lines = shown.stdout.splitlines()
-            active_script_lines = _slurm_preamble(script_lines)
-            for required in config.required_script_lines:
-                if required not in active_script_lines:
+            if backend == "slurm":
+                script_lines = shown.stdout.splitlines()
+                active_script_lines = _slurm_preamble(script_lines)
+                for required in config.required_script_lines:
+                    if required not in active_script_lines:
+                        raise ExpctlError(
+                            f"{script} at {commit[:12]} is missing the required line: "
+                            f"{required}"
+                        )
+                verified_nodes = _script_max_concurrent_nodes(script_lines, script)
+            else:
+                tree = _run(
+                    ["git", "ls-tree", commit, "--", script], cwd=repo, check=False
+                )
+                mode = tree.stdout.split(maxsplit=1)[0] if tree.returncode == 0 else ""
+                if mode != "100755":
                     raise ExpctlError(
-                        f"{script} at {commit[:12]} is missing the required line: "
-                        f"{required}"
+                        f"local.script {script} must be executable at commit "
+                        f"{commit[:12]}; run git update-index --chmod=+x {script}, "
+                        "commit, and retry"
                     )
-            verified_nodes = _script_max_concurrent_nodes(script_lines, script)
+                verified_nodes = None
         except ExpctlError as exc:
             script_cache[cache_key] = (None, str(exc))
         else:
@@ -836,12 +938,14 @@ def _validate_request_git(
     verified_nodes, error = script_cache[cache_key]
     if error:
         raise ExpctlError(error)
-    assert verified_nodes is not None
-    if verified_nodes > max_nodes:
-        raise ExpctlError(
-            f"{script} can use {verified_nodes} concurrent nodes, exceeding "
-            f"slurm.max_concurrent_nodes={max_nodes}"
-        )
+    if backend == "slurm":
+        assert verified_nodes is not None
+        max_nodes = execution["max_concurrent_nodes"]
+        if verified_nodes > max_nodes:
+            raise ExpctlError(
+                f"{script} can use {verified_nodes} concurrent nodes, exceeding "
+                f"slurm.max_concurrent_nodes={max_nodes}"
+            )
     return verified_nodes
 
 
@@ -1080,7 +1184,20 @@ def doctor_repo(repo: Path) -> dict[str, Any]:
             "POSIX locking",
             fcntl is not None,
             "available" if fcntl is not None else "fcntl unavailable",
-            scope="cluster",
+            scope="execution",
+        )
+    )
+    process_identity = _process_start_token(os.getpid())
+    checks.append(
+        _doctor_entry(
+            "Process identity",
+            process_identity is not None,
+            (
+                "Linux /proc start time available"
+                if process_identity is not None
+                else "Linux /proc process start time unavailable"
+            ),
+            scope="local",
         )
     )
     for command in ("sbatch", "squeue", "sacct", "scancel"):
@@ -1090,7 +1207,7 @@ def doctor_repo(repo: Path) -> dict[str, Any]:
                 command,
                 command_path is not None,
                 command_path or "not found on PATH",
-                scope="cluster",
+                scope="slurm",
             )
         )
     scontrol_path = shutil.which("scontrol")
@@ -1105,7 +1222,7 @@ def doctor_repo(repo: Path) -> dict[str, Any]:
                 if scontrol_required
                 else "not found; only required when node budgeting is enabled"
             ),
-            scope="cluster",
+            scope="slurm",
             required=scontrol_required,
         )
     )
@@ -1115,15 +1232,22 @@ def doctor_repo(repo: Path) -> dict[str, Any]:
         for check in checks
         if check["scope"] == "repository" and check["required"]
     )
-    cluster_ready = repository_ready and all(
+    local_ready = repository_ready and all(
         check["ok"]
         for check in checks
-        if check["scope"] == "cluster" and check["required"]
+        if check["scope"] in {"execution", "local"} and check["required"]
+    )
+    slurm_ready = repository_ready and all(
+        check["ok"]
+        for check in checks
+        if check["scope"] in {"execution", "slurm"} and check["required"]
     )
     return {
         "repository": str(repo),
         "repository_ready": repository_ready,
-        "cluster_ready": cluster_ready,
+        "local_ready": local_ready,
+        "slurm_ready": slurm_ready,
+        "cluster_ready": slurm_ready,
         "checks": checks,
     }
 
@@ -1325,7 +1449,7 @@ def _check_node_budget(repo: Path, config: Config, requested: int) -> dict[str, 
 def _git_metadata_lock(repo: Path, name: str, purpose: str) -> Iterator[None]:
     if fcntl is None:
         raise ExpctlError(
-            f"safe {purpose} locking requires POSIX fcntl; submit on the cluster host"
+            f"safe {purpose} locking requires POSIX fcntl; run on the execution host"
         )
     lock_text = _git_text(repo, "rev-parse", "--git-path", name).strip()
     lock_path = Path(lock_text)
@@ -1420,8 +1544,18 @@ def _check_worktree_available(
                 f"worktree {worktree} is claimed by {other_id} with an "
                 f"unconfirmed submission ({other.get('status', 'invalid')})"
             )
-        queue = _queue_status(repo, job_id)
-        if queue:
+        backend = _receipt_backend(other)
+        if backend == "local":
+            if host_error := _local_host_error(other):
+                raise ExpctlError(
+                    f"worktree {worktree} is claimed by {other_id}: {host_error}"
+                )
+            active = _local_process_running(
+                other, other_path.parent / "local-status.json"
+            )
+        else:
+            active = bool(_queue_status(repo, job_id))
+        if active:
             raise ExpctlError(
                 f"worktree {worktree} is still used by {other_id} (job {job_id})"
             )
@@ -1441,6 +1575,14 @@ def build_sbatch_command(
     return command
 
 
+def build_local_command(request: dict[str, Any]) -> list[str]:
+    backend, local = _execution_table(request)
+    if backend != "local":
+        raise ExpctlError("build_local_command requires a [local] request")
+    script = str(local["script"]).replace("\\", "/")
+    return [f"./{script}", *local.get("args", [])]
+
+
 def _sbatch_environment() -> tuple[dict[str, str], list[str]]:
     """Prevent ambient SBATCH_* options from overriding the pinned script."""
     removed = sorted(key for key in os.environ if key.startswith("SBATCH_"))
@@ -1448,6 +1590,261 @@ def _sbatch_environment() -> tuple[dict[str, str], list[str]]:
         key: value for key, value in os.environ.items() if key not in removed
     }
     return environment, removed
+
+
+def _receipt_backend(receipt: dict[str, Any]) -> str:
+    backend = receipt.get("backend", "slurm")
+    if backend not in {"slurm", "local"}:
+        raise ExpctlError(f"submission receipt has unsupported backend: {backend}")
+    return str(backend)
+
+
+def _local_host_error(receipt: dict[str, Any]) -> str | None:
+    recorded = receipt.get("hostname")
+    if not isinstance(recorded, str) or not recorded:
+        return "local submission receipt has no execution hostname"
+    current = socket.gethostname()
+    if recorded != current:
+        return (
+            f"local job belongs to host {recorded}, but this host is {current}; "
+            f"run the command on {recorded}"
+        )
+    return None
+
+
+def _local_status_path(repo: Path, config: Config, experiment_id: str) -> Path:
+    return result_dir(repo, config, experiment_id) / "local-status.json"
+
+
+def _process_start_token(pid: int) -> str | None:
+    """Return Linux's stable process start tick, when procfs is available."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    closing = stat.rfind(")")
+    if closing < 0:
+        return None
+    fields = stat[closing + 2 :].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def _process_state(pid: int) -> str | None:
+    """Return Linux's one-letter process state, including ``Z`` for zombies."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    closing = stat.rfind(")")
+    if closing < 0:
+        return None
+    fields = stat[closing + 2 :].split()
+    return fields[0] if fields else None
+
+
+def _local_process_running(receipt: dict[str, Any], status_path: Path) -> bool:
+    if status_path.is_file():
+        return False
+    pid = receipt.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
+        return False
+    expected_token = receipt.get("process_start_token")
+    if isinstance(expected_token, str):
+        actual_token = _process_start_token(pid)
+        if actual_token != expected_token:
+            return False
+    if _process_state(pid) == "Z":
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _local_accounting(
+    receipt: dict[str, Any], status_path: Path
+) -> tuple[dict[str, Any], bool]:
+    job_id = str(receipt.get("job_id", "unknown"))
+    if status_path.is_file():
+        completion = _load_json_object(status_path, "local completion status")
+        returncode = completion.get("returncode")
+        if not isinstance(returncode, int) or isinstance(returncode, bool):
+            return (
+                {
+                    "state": "FAILED",
+                    "detail": f"invalid returncode in {status_path}",
+                    "jobs": [],
+                },
+                False,
+            )
+        state = "COMPLETED" if returncode == 0 else "FAILED"
+        accounting: dict[str, Any] = {
+            "state": state,
+            "jobs": [
+                {
+                    "job_id": job_id,
+                    "state": state,
+                    "exit_code": f"{returncode}:0",
+                }
+            ],
+            "started_at": completion.get("started_at"),
+            "finished_at": completion.get("finished_at"),
+        }
+        if completion.get("error"):
+            accounting["detail"] = completion["error"]
+        return accounting, False
+    if _local_process_running(receipt, status_path):
+        return {"state": "RUNNING", "jobs": []}, True
+    if isinstance(receipt.get("cancellation"), dict):
+        return (
+            {
+                "state": "CANCELLED",
+                "jobs": [
+                    {
+                        "job_id": job_id,
+                        "state": "CANCELLED",
+                        "exit_code": "SIGTERM",
+                    }
+                ],
+            },
+            False,
+        )
+    return (
+        {
+            "state": "FAILED",
+            "detail": "local runner exited without recording a completion status",
+            "jobs": [],
+        },
+        False,
+    )
+
+
+def _local_status_request(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    receipt: dict[str, Any],
+    *,
+    checked_at: str,
+) -> dict[str, Any]:
+    job_id = receipt.get("job_id")
+    host_error = _local_host_error(receipt)
+    if host_error:
+        accounting, running = {"state": "UNKNOWN", "detail": host_error}, False
+    else:
+        accounting, running = _local_accounting(
+            receipt, _local_status_path(repo, config, experiment_id)
+        )
+    payload: dict[str, Any] = {
+        "experiment_id": experiment_id,
+        "backend": "local",
+        "job_id": job_id,
+        "pid": receipt.get("pid"),
+        "hostname": receipt.get("hostname"),
+        "receipt_status": receipt.get("status"),
+        "in_queue": running,
+        "queue_counts": {"RUNNING": 1} if running else {},
+        "queue": (
+            [{"job": job_id, "state": "RUNNING", "reason": ""}] if running else []
+        ),
+        "checked_at": checked_at,
+        "source": "local",
+    }
+    if not running:
+        payload["accounting"] = accounting
+        if accounting.get("detail"):
+            payload["detail"] = accounting["detail"]
+    if isinstance(receipt.get("cancellation"), dict):
+        payload["cancellation"] = receipt["cancellation"]
+    report = report_path(repo, config, experiment_id)
+    if report.is_file():
+        payload["report"] = str(report.relative_to(repo)).replace("\\", "/")
+    return payload
+
+
+def _start_local_process(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    request: dict[str, Any],
+    worktree: Path,
+    *,
+    job_id: str,
+) -> dict[str, Any]:
+    if fcntl is None or os.name != "posix":
+        raise ExpctlError("local execution requires a Linux compute node")
+    if _process_start_token(os.getpid()) is None:
+        raise ExpctlError(
+            "local execution requires Linux /proc process identity support"
+        )
+    _, local = _execution_table(request)
+    relative_script = _relative_path(str(local["script"]), "local.script")
+    script = worktree.joinpath(*relative_script.parts)
+    if not script.is_file():
+        raise ExpctlError(f"local script is missing from the worktree: {script}")
+    if not os.access(script, os.X_OK):
+        raise ExpctlError(f"local script is not executable: {script}")
+
+    relative_log = _relative_path(
+        request["outputs"]["log_glob"].format(job_id=job_id),
+        "outputs.log_glob",
+    )
+    log_path = worktree.joinpath(*relative_log.parts)
+    status_path = _local_status_path(repo, config, experiment_id)
+    if status_path.exists():
+        raise ExpctlError(f"local completion status already exists: {status_path}")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    environment = dict(os.environ)
+    environment.update(local.get("env", {}))
+    environment.update(
+        {
+            "EXPCTL_BACKEND": "local",
+            "EXPCTL_EXPERIMENT_ID": experiment_id,
+            "EXPCTL_JOB_ID": job_id,
+        }
+    )
+    target_command = [str(script), *local.get("args", [])]
+    supervisor_command = [
+        sys.executable,
+        "-c",
+        _LOCAL_RUNNER_CODE,
+        str(status_path),
+        *target_command,
+    ]
+    created_log = False
+    try:
+        with log_path.open("xb") as log_handle:
+            created_log = True
+            process = subprocess.Popen(
+                supervisor_command,
+                cwd=worktree,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except FileExistsError as exc:
+        raise ExpctlError(f"local log already exists: {log_path}") from exc
+    except OSError as exc:
+        if created_log:
+            with contextlib.suppress(OSError):
+                log_path.unlink(missing_ok=True)
+        raise ExpctlError(f"could not start local experiment: {exc}") from exc
+    return {
+        "job_id": job_id,
+        "pid": process.pid,
+        "process_start_token": _process_start_token(process.pid),
+        "hostname": socket.gethostname(),
+        "local_status_file": str(status_path.relative_to(repo)).replace("\\", "/"),
+        "log": str(relative_log),
+    }
 
 
 def submit_request(
@@ -1474,26 +1871,41 @@ def submit_request(
             f"once; to run it again: expctl rerun {experiment_id}"
         )
 
+    backend, execution = _execution_table(request)
+    if backend == "local" and skip_node_check:
+        raise ExpctlError("--skip-node-check applies only to SLURM requests")
     code = _table(request, "code")
     worktree = _worktree_path(repo, config, request, worktree_root)
-    policy_options = tuple(_required_sbatch_options(config.required_script_lines))
-    command = build_sbatch_command(request, policy_options)
-    sbatch_environment, cleared_sbatch_environment = _sbatch_environment()
-    script_lines = _git_text(
-        repo, "show", f"{code['commit']}:{request['slurm']['script']}"
-    ).splitlines()
-    verified_nodes = _script_max_concurrent_nodes(
-        script_lines, request["slurm"]["script"]
-    )
-    preview = {
+    if backend == "slurm":
+        script_lines = _git_text(
+            repo, "show", f"{code['commit']}:{execution['script']}"
+        ).splitlines()
+        verified_nodes = _script_max_concurrent_nodes(script_lines, execution["script"])
+        policy_options = tuple(_required_sbatch_options(config.required_script_lines))
+        command = build_sbatch_command(request, policy_options)
+        execution_environment, cleared_environment = _sbatch_environment()
+    else:
+        verified_nodes = None
+        command = build_local_command(request)
+        execution_environment = None
+        cleared_environment = []
+    preview: dict[str, Any] = {
         "experiment_id": experiment_id,
+        "backend": backend,
         "commit": code["commit"],
         "worktree": str(worktree),
         "command": command,
-        "declared_max_concurrent_nodes": request["slurm"]["max_concurrent_nodes"],
-        "verified_max_concurrent_nodes": verified_nodes,
-        "cleared_sbatch_environment": cleared_sbatch_environment,
     }
+    if backend == "slurm":
+        preview.update(
+            {
+                "declared_max_concurrent_nodes": execution["max_concurrent_nodes"],
+                "verified_max_concurrent_nodes": verified_nodes,
+                "cleared_sbatch_environment": cleared_environment,
+            }
+        )
+    else:
+        preview["log"] = request["outputs"]["log_glob"]
     if dry_run:
         return preview
 
@@ -1501,6 +1913,7 @@ def submit_request(
     pending: dict[str, Any] = {
         "schema_version": 1,
         "experiment_id": experiment_id,
+        "backend": backend,
         "submission_attempt_id": attempt_id,
         "request_sha256": request_hash,
         "branch_label": code["branch"],
@@ -1509,11 +1922,19 @@ def submit_request(
         "started_at": dt.datetime.now(dt.UTC).isoformat(),
         "submitted_by": getpass.getuser(),
         "status": "preparing",
-        "declared_max_concurrent_nodes": request["slurm"]["max_concurrent_nodes"],
-        "verified_max_concurrent_nodes": verified_nodes,
-        "cleared_sbatch_environment": cleared_sbatch_environment,
-        "sbatch_command": command,
+        "command": command,
     }
+    if backend == "slurm":
+        pending.update(
+            {
+                "declared_max_concurrent_nodes": execution["max_concurrent_nodes"],
+                "verified_max_concurrent_nodes": verified_nodes,
+                "cleared_sbatch_environment": cleared_environment,
+                "sbatch_command": command,
+            }
+        )
+    else:
+        pending["hostname"] = socket.gethostname()
     try:
         _exclusive_write_text(
             receipt_path, json.dumps(pending, indent=2, sort_keys=True) + "\n"
@@ -1542,14 +1963,18 @@ def submit_request(
 
             guard = (
                 _node_budget_guard(repo)
-                if config.max_total_nodes and not skip_node_check
+                if backend == "slurm" and config.max_total_nodes and not skip_node_check
                 else contextlib.nullcontext()
             )
             with guard:
                 budget = None
-                if config.max_total_nodes and not skip_node_check:
+                if (
+                    backend == "slurm"
+                    and config.max_total_nodes
+                    and not skip_node_check
+                ):
                     budget = _check_node_budget(
-                        repo, config, request["slurm"]["max_concurrent_nodes"]
+                        repo, config, execution["max_concurrent_nodes"]
                     )
                 if _request_hash(path) != request_hash:
                     raise ExpctlError(
@@ -1562,42 +1987,57 @@ def submit_request(
                 pending["node_budget"] = budget
                 pending["submitting_at"] = dt.datetime.now(dt.UTC).isoformat()
                 _atomic_write_json(receipt_path, pending)
-                submission_started = True
-                try:
-                    result = _run(command, cwd=worktree, env=sbatch_environment)
-                except ExpctlError as exc:
-                    pending["status"] = "submission_unknown"
-                    pending["submission_error"] = str(exc)
-                    _atomic_write_json(receipt_path, pending)
-                    raise ExpctlError(
-                        "sbatch did not return a confirmed job ID; submission outcome "
-                        f"is unknown and this request is locked. Inspect {receipt_path} "
-                        "and the scheduler before taking further action"
-                    ) from exc
+                local_details: dict[str, Any] = {}
+                if backend == "slurm":
+                    submission_started = True
+                    try:
+                        result = _run(command, cwd=worktree, env=execution_environment)
+                    except ExpctlError as exc:
+                        pending["status"] = "submission_unknown"
+                        pending["submission_error"] = str(exc)
+                        _atomic_write_json(receipt_path, pending)
+                        raise ExpctlError(
+                            "sbatch did not return a confirmed job ID; submission "
+                            f"outcome is unknown and this request is locked. Inspect "
+                            f"{receipt_path} and SLURM before taking further action"
+                        ) from exc
 
-                job_id = result.stdout.strip().split(";", 1)[0]
-                if not job_id or not re.fullmatch(r"\d+(?:_\d+)?", job_id):
-                    pending["status"] = "submission_unknown"
-                    pending["submission_error"] = (
-                        f"could not parse sbatch job ID from: {result.stdout!r}"
+                    job_id = result.stdout.strip().split(";", 1)[0]
+                    if not job_id or not re.fullmatch(r"\d+(?:_\d+)?", job_id):
+                        pending["status"] = "submission_unknown"
+                        pending["submission_error"] = (
+                            f"could not parse sbatch job ID from: {result.stdout!r}"
+                        )
+                        _atomic_write_json(receipt_path, pending)
+                        raise ExpctlError(
+                            "sbatch returned an unrecognized response; submission "
+                            f"outcome is unknown and this request is locked. Inspect "
+                            f"{receipt_path} and SLURM before taking further action"
+                        )
+                else:
+                    job_id = f"local-{attempt_id[:12]}"
+                    local_details = _start_local_process(
+                        repo,
+                        config,
+                        experiment_id,
+                        request,
+                        worktree,
+                        job_id=job_id,
                     )
-                    _atomic_write_json(receipt_path, pending)
-                    raise ExpctlError(
-                        "sbatch returned an unrecognized response; submission outcome "
-                        f"is unknown and this request is locked. Inspect {receipt_path} "
-                        "and the scheduler before taking further action"
-                    )
+                    submission_started = True
 
                 receipt = dict(pending)
                 receipt["job_id"] = job_id
+                receipt.update(local_details)
                 receipt["submitted_at"] = dt.datetime.now(dt.UTC).isoformat()
                 receipt["status"] = "submitted"
                 receipt.pop("submitting_at", None)
                 try:
                     _atomic_write_json(receipt_path, receipt)
                 except ExpctlError as exc:
+                    system = "SLURM" if backend == "slurm" else "local"
                     raise ExpctlError(
-                        f"SLURM job {job_id} was submitted, but its receipt could not "
+                        f"{system} job {job_id} was submitted, but its receipt could not "
                         f"be finalized at {receipt_path}; do not submit again: {exc}"
                     ) from exc
                 return receipt
@@ -1649,11 +2089,13 @@ def status_request(repo: Path, config: Config, experiment_id: str) -> dict[str, 
     if not receipt_path.is_file():
         raise ExpctlError(f"not submitted yet: no receipt at {receipt_path}")
     receipt = _load_receipt(receipt_path)
+    backend = _receipt_backend(receipt)
     job_id = receipt.get("job_id")
     checked_at = dt.datetime.now(dt.UTC).isoformat()
     if not isinstance(job_id, str) or not job_id:
         payload = {
             "experiment_id": experiment_id,
+            "backend": backend,
             "job_id": None,
             "receipt_status": receipt.get("status", "invalid"),
             "in_queue": False,
@@ -1667,6 +2109,14 @@ def status_request(repo: Path, config: Config, experiment_id: str) -> dict[str, 
         if isinstance(receipt.get("cancellation"), dict):
             payload["cancellation"] = receipt["cancellation"]
         return payload
+    if backend == "local":
+        return _local_status_request(
+            repo,
+            config,
+            experiment_id,
+            receipt,
+            checked_at=checked_at,
+        )
     queue_error: str | None = None
     try:
         queue = _queue_status(repo, job_id)
@@ -1678,6 +2128,7 @@ def status_request(repo: Path, config: Config, experiment_id: str) -> dict[str, 
         counts[row["state"]] = counts.get(row["state"], 0) + 1
     payload: dict[str, Any] = {
         "experiment_id": experiment_id,
+        "backend": "slurm",
         "job_id": job_id,
         "receipt_status": receipt.get("status"),
         "in_queue": bool(queue),
@@ -1740,6 +2191,10 @@ def _status_is_terminal(result: dict[str, Any]) -> bool:
         return True
     if result.get("in_queue"):
         return False
+    if result.get("backend") == "local":
+        # A local job that is not running cannot change state on its own,
+        # including the host-mismatch case, so watching it would never end.
+        return True
     state = _status_state(result)
     normalized = {
         normalized
@@ -1784,16 +2239,17 @@ def _cancel_request_locked(
     reason: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Cancel one confirmed SLURM job and record who requested it."""
+    """Cancel one confirmed job and record who requested it."""
     receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
     if not receipt_path.is_file():
         raise ExpctlError(f"not submitted yet: no receipt at {receipt_path}")
     receipt = _load_receipt(receipt_path)
+    backend = _receipt_backend(receipt)
     job_id = receipt.get("job_id")
     if not isinstance(job_id, str) or not job_id:
         raise ExpctlError(
             "cannot cancel a submission without a confirmed job ID; "
-            "reconcile it with SLURM manually"
+            f"reconcile it with {backend} manually"
         )
     if isinstance(receipt.get("cancellation"), dict):
         cancellation = receipt["cancellation"]
@@ -1808,10 +2264,27 @@ def _cancel_request_locked(
         if not reason:
             raise ExpctlError("cancellation reason must not be empty")
 
-    command = ["scancel", job_id]
+    if backend == "slurm":
+        command = ["scancel", job_id]
+    else:
+        if host_error := _local_host_error(receipt):
+            raise ExpctlError(host_error)
+        pid = receipt.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
+            raise ExpctlError("local submission receipt has no valid process ID")
+        status_path = _local_status_path(repo, config, experiment_id)
+        accounting, running = _local_accounting(receipt, status_path)
+        if not running:
+            raise ExpctlError(
+                f"local job {job_id} has already finished ({accounting['state']})"
+            )
+        command = ["kill", "-TERM", "--", f"-{pid}"]
     result: dict[str, Any] = {
         "experiment_id": experiment_id,
+        "backend": backend,
         "job_id": job_id,
+        "pid": receipt.get("pid") if backend == "local" else None,
+        "hostname": receipt.get("hostname") if backend == "local" else None,
         "command": command,
         "dry_run": dry_run,
         "reason": reason,
@@ -1819,7 +2292,24 @@ def _cancel_request_locked(
     if dry_run:
         return result
 
-    _run(command, cwd=repo)
+    if backend == "slurm":
+        _run(command, cwd=repo)
+    else:
+        expected_token = receipt.get("process_start_token")
+        pid = int(receipt["pid"])
+        actual_token = _process_start_token(pid)
+        if isinstance(expected_token, str) and actual_token != expected_token:
+            raise ExpctlError(
+                f"refusing to signal reused PID {pid}; local job {job_id} has ended"
+            )
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError as exc:
+            raise ExpctlError(
+                f"local job {job_id} finished before cancellation"
+            ) from exc
+        except OSError as exc:
+            raise ExpctlError(f"could not cancel local job {job_id}: {exc}") from exc
     cancellation = {
         "requested_at": dt.datetime.now(dt.UTC).isoformat(),
         "requested_by": getpass.getuser(),
@@ -1830,8 +2320,9 @@ def _cancel_request_locked(
     try:
         _atomic_write_json(receipt_path, receipt)
     except ExpctlError as exc:
+        system = "SLURM" if backend == "slurm" else "local runner"
         raise ExpctlError(
-            f"SLURM accepted the cancellation for job {job_id}, but the receipt "
+            f"{system} accepted the cancellation for job {job_id}, but the receipt "
             f"could not be updated at {receipt_path}: {exc}"
         ) from exc
     result.update(cancellation)
@@ -2447,6 +2938,7 @@ def collect_request(
         if not receipt_path.is_file():
             raise ExpctlError(f"submission receipt not found: {receipt_path}")
         receipt = _load_receipt(receipt_path)
+        backend = _receipt_backend(receipt)
         if receipt.get("status") == "collected":
             raise ExpctlError(
                 f"results for {experiment_id} have already been collected; "
@@ -2479,21 +2971,33 @@ def collect_request(
                 f"submission has no confirmed job ID (receipt status: "
                 f"{receipt.get('status', 'invalid')})"
             )
-        queue = _queue_status(repo, job_id)
-        if queue:
-            states = ", ".join(
-                f"{state}={count}"
-                for state, count in sorted(
-                    {
-                        state: sum(row["state"] == state for row in queue)
-                        for state in {row["state"] for row in queue}
-                    }.items()
+        if backend == "local":
+            if host_error := _local_host_error(receipt):
+                raise ExpctlError(host_error)
+            execution_status, running = _local_accounting(
+                receipt, _local_status_path(repo, config, experiment_id)
+            )
+            if running:
+                raise ExpctlError(
+                    f"local job {job_id} is still running; collect after it finishes"
                 )
-            )
-            raise ExpctlError(
-                f"job {job_id} is still in the queue ({states}); "
-                "collect after it leaves"
-            )
+        else:
+            queue = _queue_status(repo, job_id)
+            if queue:
+                states = ", ".join(
+                    f"{state}={count}"
+                    for state, count in sorted(
+                        {
+                            state: sum(row["state"] == state for row in queue)
+                            for state in {row["state"] for row in queue}
+                        }.items()
+                    )
+                )
+                raise ExpctlError(
+                    f"job {job_id} is still in the queue ({states}); "
+                    "collect after it leaves"
+                )
+            execution_status = None
 
         expected_worktree = _worktree_path(
             repo, config, request, override_root=worktree_root
@@ -2563,11 +3067,12 @@ def collect_request(
             _atomic_write_json(staged_metrics, metrics)
             found_metrics = {metric for values in metrics.values() for metric in values}
             collection = {
+                "backend": backend,
                 "collected_at": dt.datetime.now(dt.UTC).isoformat(),
                 "logs": copied,
                 "metrics_file": str(metrics_path.relative_to(repo)).replace("\\", "/"),
                 "missing_metrics": sorted(set(metric_names) - found_metrics),
-                "scheduler": _scheduler_status(repo, job_id),
+                "scheduler": execution_status or _scheduler_status(repo, job_id),
             }
 
             # Do not publish evidence if the request changed during collection.
@@ -2665,9 +3170,11 @@ def _render_report(
     logs = [str(log) for log in collection.get("logs", []) if log]
     facts = [
         ("Request", request_line),
+        ("Backend", receipt.get("backend", "slurm")),
+        ("Host", receipt.get("hostname")),
         ("Commit", f"`{code['commit']}` ({code['branch']})"),
         ("Job", submitted),
-        ("Scheduler", verdict),
+        ("Execution", verdict),
         ("Collected", collection.get("collected_at")),
         ("Logs", ", ".join(f"`{log}`" for log in logs) or "none"),
     ]
@@ -2731,6 +3238,7 @@ def report_request(repo: Path, config: Config, experiment_id: str) -> dict[str, 
     if not receipt_path.is_file():
         raise ExpctlError(f"not submitted yet: no receipt at {receipt_path}")
     receipt = _load_receipt(receipt_path)
+    backend = _receipt_backend(receipt)
     if receipt.get("status") != "collected":
         raise ExpctlError(
             f"results for {experiment_id} are not collected yet (receipt status: "
@@ -2762,6 +3270,7 @@ def report_request(repo: Path, config: Config, experiment_id: str) -> dict[str, 
     found = sorted({metric for values in metrics.values() for metric in values})
     return {
         "experiment_id": experiment_id,
+        "backend": backend,
         "path": str(target.relative_to(repo)).replace("\\", "/"),
         "result_path": str(destination.relative_to(repo)).replace("\\", "/"),
         "metrics": found,
@@ -2777,9 +3286,15 @@ def _receipt_summary(repo: Path, receipt_path: Path) -> str:
     except ExpctlError:
         return "unreadable receipt"
     parts: list[str] = []
+    try:
+        backend = _receipt_backend(receipt)
+    except ExpctlError:
+        return "receipt with unsupported backend"
     job_id = receipt.get("job_id")
     if job_id:
-        parts.append(f"job {job_id}")
+        parts.append(f"{backend} job {job_id}")
+    if backend == "local" and receipt.get("pid"):
+        parts.append(f"PID {receipt['pid']}")
     when, who = receipt.get("submitted_at"), receipt.get("submitted_by")
     if when or who:
         parts.append(
@@ -2787,13 +3302,21 @@ def _receipt_summary(repo: Path, receipt_path: Path) -> str:
         )
     if receipt.get("status"):
         parts.append(f"receipt status {receipt['status']}")
-    if job_id:
+    if job_id and backend == "slurm":
         try:
             state = _scheduler_status(repo, str(job_id))["state"]
         except ExpctlError:  # no sacct on this host
             state = "UNKNOWN"
         if state != "UNKNOWN":
             parts.append(f"sacct {state}")
+    elif job_id:
+        if host_error := _local_host_error(receipt):
+            parts.append(host_error)
+        else:
+            accounting, _ = _local_accounting(
+                receipt, receipt_path.parent / "local-status.json"
+            )
+            parts.append(f"local {accounting['state']}")
     return ", ".join(parts) or "no details"
 
 
@@ -2878,6 +3401,7 @@ def rerun_request(
     return {
         "experiment_id": new_id,
         "rerun_of": experiment_id,
+        "backend": _execution_table(request)[0],
         "path": str(new_path.relative_to(repo)).replace("\\", "/"),
         "commit": request["code"]["commit"],
         "worktree": request["code"]["worktree"],
@@ -2964,22 +3488,33 @@ def _render_new_result(result: dict[str, Any]) -> str:
 
 
 def _render_validate_summary(
-    experiment_id: str, request: dict[str, Any], *, verified_nodes: int
+    experiment_id: str, request: dict[str, Any], *, verified_nodes: int | None
 ) -> str:
-    code, slurm, outputs = request["code"], request["slurm"], request["outputs"]
+    code, outputs = request["code"], request["outputs"]
+    backend, execution = _execution_table(request)
     metrics = list(outputs["metrics"])
     requirements = list(request.get("notes", {}).get("requirements", []))
-    env = slurm.get("env", {})
+    env = execution.get("env", {})
     shown_metrics = ", ".join(metrics[:6]) + (", ..." if len(metrics) > 6 else "")
     return _render_summary(
         "REQUEST VALID",
         [
             ("Experiment", experiment_id),
+            ("Backend", backend),
             ("Commit", f"{code['commit'][:12]} ({code['branch']})"),
-            ("Script", slurm["script"]),
+            ("Script", execution["script"]),
             (
                 "Nodes",
-                f"{verified_nodes} verified / {slurm['max_concurrent_nodes']} declared",
+                (
+                    f"{verified_nodes} verified / "
+                    f"{execution['max_concurrent_nodes']} declared"
+                    if backend == "slurm"
+                    else None
+                ),
+            ),
+            (
+                "Args",
+                shlex.join(execution.get("args", [])) if backend == "local" else None,
             ),
             ("Env", ", ".join(f"{k}={v}" for k, v in sorted(env.items())) or None),
             ("Logs", outputs["log_glob"]),
@@ -2991,14 +3526,22 @@ def _render_validate_summary(
 
 
 def _render_doctor_result(
-    result: dict[str, Any], *, require_cluster: bool = False
+    result: dict[str, Any],
+    *,
+    require_cluster: bool = False,
+    required_backend: str | None = None,
 ) -> str:
     checks = result["checks"]
-    cluster_note = (
-        "informational here; --cluster makes it required"
-        if not result["cluster_ready"] and not require_cluster
-        else ""
-    )
+    selected = "slurm" if require_cluster else required_backend
+    local_ready = bool(result.get("local_ready", result["cluster_ready"]))
+    slurm_ready = bool(result.get("slurm_ready", result["cluster_ready"]))
+    local_note = ""
+    slurm_note = ""
+    if selected is None:
+        if not local_ready:
+            local_note = "informational; --backend local makes it required"
+        if not slurm_ready:
+            slurm_note = "informational; --backend slurm makes it required"
     lines = [
         "EXPCTL DOCTOR",
         _render_table(
@@ -3010,9 +3553,14 @@ def _render_doctor_result(
                     "",
                 ),
                 (
-                    "Cluster",
-                    "READY" if result["cluster_ready"] else "NOT READY",
-                    cluster_note,
+                    "Local",
+                    "READY" if local_ready else "NOT READY",
+                    local_note,
+                ),
+                (
+                    "SLURM",
+                    "READY" if slurm_ready else "NOT READY",
+                    slurm_note,
                 ),
             ],
         ),
@@ -3021,26 +3569,36 @@ def _render_doctor_result(
     ]
     check_rows: list[tuple[object, ...]] = []
     for check in checks:
+        scope_required = (
+            check["scope"] == "repository"
+            or (check["scope"] == "execution" and selected in {"local", "slurm"})
+            or (check["scope"] == "local" and selected == "local")
+            or (check["scope"] in {"slurm", "cluster"} and selected == "slurm")
+        )
         if check["ok"]:
             status = "OK"
-        elif check["scope"] == "cluster" and not require_cluster:
-            status = "INFO"
-        elif check["required"]:
+        elif not check["required"]:
+            status = "OPTIONAL"
+        elif scope_required:
             status = "FAIL"
         else:
-            status = "OPTIONAL"
+            status = "INFO"
         check_rows.append((check["name"], status, check["detail"]))
     lines.append(_render_table(("CHECK", "STATUS", "DETAIL"), check_rows))
     if not result["repository_ready"]:
         next_steps = ["Fix the failed repository checks above."]
-    elif not result["cluster_ready"] and require_cluster:
+    elif selected == "slurm" and not slurm_ready:
         next_steps = [
             "Run expctl on a POSIX cluster host with the missing SLURM tools."
         ]
-    elif not result["cluster_ready"]:
+    elif selected == "local" and not local_ready:
+        next_steps = [
+            "Run expctl on a Linux compute node with fcntl and /proc support."
+        ]
+    elif selected is None and (not local_ready or not slurm_ready):
         next_steps = [
             "Repository is ready for authoring.",
-            "On the cluster host, run: expctl doctor --cluster",
+            "On the execution host, run: expctl doctor --backend local|slurm",
         ]
     else:
         next_steps = []
@@ -3057,15 +3615,22 @@ def _render_submit_result(
     skip_node_check: bool,
 ) -> str:
     experiment_id = str(result["experiment_id"])
-    nodes = (
-        f"{result.get('verified_max_concurrent_nodes')} verified / "
-        f"{result.get('declared_max_concurrent_nodes')} declared"
-    )
+    backend = str(result.get("backend", "slurm"))
+    nodes = None
+    if backend == "slurm":
+        nodes = (
+            f"{result.get('verified_max_concurrent_nodes')} verified / "
+            f"{result.get('declared_max_concurrent_nodes')} declared"
+        )
     fields: list[tuple[str, object]] = [
         ("Experiment", experiment_id),
+        ("Backend", backend),
         ("Job", result.get("job_id")),
+        ("PID", result.get("pid")),
+        ("Host", result.get("hostname")),
         ("Commit", result.get("commit")),
         ("Worktree", result.get("worktree")),
+        ("Log", result.get("log")),
         ("Nodes", nodes),
     ]
     if dry_run:
@@ -3124,14 +3689,17 @@ def _render_status_result(result: dict[str, Any], *, result_path: str) -> str:
         detail = accounting.get("detail")
     fields = [
         ("Experiment", experiment_id),
+        ("Backend", result.get("backend", "slurm")),
         ("Status", state),
         ("Job", result.get("job_id")),
+        ("PID", result.get("pid")),
+        ("Host", result.get("hostname")),
         ("Receipt", receipt_status),
         ("Queue", queue_summary),
         ("Source", result.get("source")),
         ("Reason", ", ".join(reasons) if reasons else None),
         (
-            "Scheduler",
+            "Execution",
             accounting.get("state")
             if receipt_status == "collected" and isinstance(accounting, dict)
             else None,
@@ -3185,7 +3753,10 @@ def _render_cancel_result(result: dict[str, Any]) -> str:
             "CANCELLATION PREVIEW",
             [
                 ("Experiment", experiment_id),
+                ("Backend", result.get("backend", "slurm")),
                 ("Job", result["job_id"]),
+                ("PID", result.get("pid")),
+                ("Host", result.get("hostname")),
                 ("Reason", result.get("reason")),
                 ("Command", shlex.join(result["command"])),
             ],
@@ -3195,7 +3766,10 @@ def _render_cancel_result(result: dict[str, Any]) -> str:
         "CANCELLATION REQUESTED",
         [
             ("Experiment", experiment_id),
+            ("Backend", result.get("backend", "slurm")),
             ("Job", result["job_id"]),
+            ("PID", result.get("pid")),
+            ("Host", result.get("hostname")),
             ("Reason", result.get("reason")),
             ("Requested", result.get("requested_at")),
             ("By", result.get("requested_by")),
@@ -3214,7 +3788,8 @@ def _render_collect_result(result: dict[str, Any], *, experiment_id: str) -> str
         "RESULTS COLLECTED",
         [
             ("Experiment", experiment_id),
-            ("Scheduler", scheduler_state),
+            ("Backend", result.get("backend", "slurm")),
+            ("Execution", scheduler_state),
             ("Logs", len(result.get("logs", []))),
             ("Metrics", result.get("metrics_file")),
             ("Missing", ", ".join(missing) if missing else "none"),
@@ -3232,8 +3807,9 @@ def _render_report_result(result: dict[str, Any]) -> str:
         "REPORT CREATED",
         [
             ("Experiment", experiment_id),
+            ("Backend", result.get("backend", "slurm")),
             ("Path", path),
-            ("Scheduler", result.get("scheduler")),
+            ("Execution", result.get("scheduler")),
             ("Metrics", ", ".join(found) if found else "none extracted"),
             ("Missing", ", ".join(missing) if missing else None),
         ],
@@ -3251,6 +3827,7 @@ def _render_rerun_result(result: dict[str, Any]) -> str:
         "RERUN REQUEST CREATED",
         [
             ("Experiment", experiment_id),
+            ("Backend", result.get("backend", "slurm")),
             ("Rerun of", result["rerun_of"]),
             ("Path", path),
             ("Commit", result["commit"]),
@@ -3484,7 +4061,7 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     submitted_rows: dict[str, list[dict[str, str]]] = {}
     commit_cache: dict[str, str | None] = {}
-    script_cache: dict[tuple[str, str], tuple[int | None, str | None]] = {}
+    script_cache: dict[tuple[str, str, str], tuple[int | None, str | None]] = {}
     for path in sorted(requests_dir.glob("*.toml"), key=lambda p: p.stem):
         experiment_id = path.stem
         try:
@@ -3517,7 +4094,18 @@ def list_requests(repo: Path, config: Config) -> list[dict[str, str]]:
                         "status": status,
                         "title": data["title"],
                     }
-                    submitted_rows.setdefault(job_id, []).append(row)
+                    backend = _receipt_backend(receipt_data)
+                    if backend == "local":
+                        live = _local_status_request(
+                            repo,
+                            config,
+                            experiment_id,
+                            receipt_data,
+                            checked_at=dt.datetime.now(dt.UTC).isoformat(),
+                        )
+                        row["status"] = _status_state(live)
+                    else:
+                        submitted_rows.setdefault(job_id, []).append(row)
                     rows.append(row)
                     continue
                 if (
@@ -3605,12 +4193,18 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     doctor = subparsers.add_parser(
-        "doctor", help="check repository configuration and cluster dependencies"
+        "doctor", help="check repository and execution-backend dependencies"
     )
-    doctor.add_argument(
+    doctor_mode = doctor.add_mutually_exclusive_group()
+    doctor_mode.add_argument(
         "--cluster",
         action="store_true",
-        help="also require the SLURM checks (exit 1 unless this is a cluster host)",
+        help="require the SLURM checks (legacy alias for --backend slurm)",
+    )
+    doctor_mode.add_argument(
+        "--backend",
+        choices=("slurm", "local"),
+        help="require dependencies for this execution backend",
     )
     doctor.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
@@ -3685,17 +4279,17 @@ def _parser() -> argparse.ArgumentParser:
     show = subparsers.add_parser("show", help="print one validated request as JSON")
     show.add_argument("experiment_id", metavar="ID")
 
-    submit = subparsers.add_parser("submit", help="submit one request through SLURM")
+    submit = subparsers.add_parser("submit", help="start one SLURM or local request")
     submit.add_argument("experiment_id", metavar="ID")
     submit.add_argument(
         "--dry-run",
         action="store_true",
-        help="validate and preview without creating a worktree or calling sbatch",
+        help="validate and preview without creating a worktree or starting the job",
     )
     submit.add_argument(
         "--skip-node-check",
         action="store_true",
-        help="submit without squeue evidence; requires explicit operator authorization",
+        help="skip the SLURM node-budget check; requires operator authorization",
     )
     submit.add_argument(
         "--worktree-root",
@@ -3723,20 +4317,20 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     cancel = subparsers.add_parser(
-        "cancel", help="cancel a submitted SLURM job and record the request"
+        "cancel", help="cancel a submitted SLURM or local job and record the request"
     )
     cancel.add_argument("experiment_id", metavar="ID")
     cancel.add_argument("--reason", metavar="TEXT", help="record why it was cancelled")
     cancel.add_argument(
         "--dry-run",
         action="store_true",
-        help="show the scancel command without cancelling the job",
+        help="show the cancellation command without signalling the job",
     )
     cancel.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
 
-    logs = subparsers.add_parser("logs", help="show or follow scheduler log files")
+    logs = subparsers.add_parser("logs", help="show or follow execution log files")
     logs.add_argument("experiment_id", metavar="ID")
     logs.add_argument(
         "--tail",
@@ -3852,20 +4446,23 @@ def main(argv: list[str] | None = None) -> int:
             for entry in created:
                 print(f"created {entry}")
             if created:
-                print(f"Edit {CONFIG_NAME} to set your cluster policy.")
+                print(f"Edit {CONFIG_NAME} to set your execution policy.")
             else:
                 print("Nothing to do; expctl files already exist.")
             return 0
         if args.command == "doctor":
             result = doctor_repo(repo)
+            required_backend = "slurm" if args.cluster else args.backend
             _print_command_result(
                 result,
-                _render_doctor_result(result, require_cluster=args.cluster),
+                _render_doctor_result(result, required_backend=required_backend),
                 force_json=args.json,
             )
-            ready = result["repository_ready"] and (
-                result["cluster_ready"] or not args.cluster
-            )
+            ready = result["repository_ready"]
+            if required_backend == "slurm":
+                ready = bool(result.get("slurm_ready", result["cluster_ready"]))
+            elif required_backend == "local":
+                ready = bool(result.get("local_ready", result["cluster_ready"]))
             return 0 if ready else 1
         config = load_config(repo)
         if args.command == "new":

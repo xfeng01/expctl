@@ -18,15 +18,16 @@ weaken the repository's own cluster and branch rules here.
   before the run. Never reuse an ID for changed settings.
 - To inspect the queue, run `expctl list`, then `show` or `validate` the
   selected request. Report invalid or ambiguous requests instead of guessing.
-- To submit, first show the operator the pinned commit, job script, runtime
-  requirements, declared and verified maximum node counts, and `--dry-run`
-  output. An explicit request
-  to consume cluster resources is required before the real
-  `expctl submit <id>`; never substitute `git pull && sbatch`.
+- To submit, first identify the request's `slurm` or `local` backend and show
+  the operator the pinned commit, script, runtime requirements, backend
+  settings, and `--dry-run` output. An explicit request to consume compute
+  resources is required before the real `expctl submit <id>`; never substitute
+  an ad hoc `sbatch` or direct script invocation.
 - To check a submitted run, use `expctl status <id>` or `--watch`; use
   `expctl logs <id> --tail 100` for evidence and `--follow` only when ongoing
-  monitoring is requested. Report scheduler state factually; do not collect
-  while `in_queue` is true.
+  monitoring is requested. Report execution state factually; do not collect
+  while `in_queue` is true. For a `local` request, run status, cancellation,
+  and collection on the execution hostname recorded in its receipt.
 - To cancel, show `expctl cancel <id> --dry-run` and require explicit operator
   authorization before the real command. Record a concise `--reason`, wait
   for a terminal state, and still collect the available evidence.
@@ -40,8 +41,8 @@ weaken the repository's own cluster and branch rules here.
 ## Safety and stopping conditions
 
 - If the `expctl` command is unavailable, stop and ask the operator to install
-  it. Do not substitute ad hoc `git`/`sbatch` commands and do not vendor a copy
-  into the repository.
+  it. Do not substitute ad hoc Git, scheduler, or direct execution commands,
+  and do not vendor a copy into the repository.
 - Never select a newer branch head in place of `code.commit`.
 - Never edit a request or delete its receipt after the receipt exists. A
   rerun of unchanged code is `expctl rerun <id> --reason "..."` (a new
@@ -50,11 +51,12 @@ weaken the repository's own cluster and branch rules here.
 - Do not run `expctl clean <id>` unless the operator explicitly requests
   worktree cleanup after collection; preview it with `--dry-run` first.
 - If a receipt says `preparing`, `submitting`, or `submission_unknown`, stop and
-  ask the operator to reconcile it with SLURM. Do not delete it, rerun it, or
-  infer that no job exists merely because no job ID was recorded.
+  ask the operator to reconcile it with the configured backend. For SLURM,
+  check the scheduler. Do not delete it, rerun it, or infer that no work exists
+  merely because no job ID was recorded.
 - Never add checkpoints, datasets, credentials, caches, or unreviewed
   sensitive output to Git.
-- Do not use `--skip-node-check` autonomously. If scheduler status is
+- Do not use SLURM's `--skip-node-check` autonomously. If scheduler status is
   unavailable, stop before submission unless the operator supplies independent
   node-budget evidence and explicitly authorizes the override.
 - Do not retry a failed or preempted job automatically. Collect the evidence

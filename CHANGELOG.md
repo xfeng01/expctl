@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0 — 2026-08-29
+
+- Added a `local` backend for asynchronous execution on an already allocated
+  Linux compute node, including PID-safe status checks, process-group
+  cancellation, log capture, collection, and reporting. Requests must select
+  exactly one of `slurm` or `local`.
+- `doctor --backend local|slurm` can now enforce readiness for the selected
+  execution backend; `--cluster` remains an alias for SLURM.
+
 ## 0.8.0 — 2026-08-29
 
 - Added `expctl report <id>`: scaffolds `results/<id>/report.md` from the

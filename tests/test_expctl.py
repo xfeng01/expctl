@@ -1,5 +1,7 @@
 import json
+import os
 import subprocess
+import time
 import tomllib
 from pathlib import Path
 
@@ -62,6 +64,29 @@ NUM_SAMPLES = "256"
 [outputs]
 log_glob = "logs/example-{{job_id}}_*.out"
 metrics = ["gen_ppl"]
+"""
+LOCAL_REQUEST = f"""\
+version = 1
+id = "{EXAMPLE_ID}"
+title = "Local example"
+question = "Does direct execution work?"
+decision_rule = "The local process exits successfully."
+
+[code]
+branch = "main"
+commit = "{ZERO_COMMIT}"
+worktree = "myproject-local-example"
+
+[local]
+script = "scripts/run-local.py"
+args = ["--one", "two words"]
+
+[local.env]
+LOCAL_VALUE = "3.5"
+
+[outputs]
+log_glob = "logs/local-{{job_id}}.out"
+metrics = ["score"]
 """
 
 
@@ -152,6 +177,58 @@ def test_wellformed_request_validates(tmp_path: Path) -> None:
 
     assert path.name == f"{EXAMPLE_ID}.toml"
     assert len(request["code"]["commit"]) == 40
+
+
+def test_local_request_validates_an_executable_pinned_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path, LOCAL_REQUEST)
+    config = load_config(repo)
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[1] == "cat-file":
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[1] == "show":
+            return subprocess.CompletedProcess(args, 0, "#!/usr/bin/env python3\n", "")
+        assert args[1] == "ls-tree"
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            f"100755 blob {'a' * 40}\tscripts/run-local.py\n",
+            "",
+        )
+
+    monkeypatch.setattr(core, "_run", fake_run)
+
+    request, _ = load_request(repo, config, EXAMPLE_ID)
+
+    assert core._execution_table(request)[0] == "local"
+    assert core.build_local_command(request) == [
+        "./scripts/run-local.py",
+        "--one",
+        "two words",
+    ]
+    assert core._validate_request_git(repo, config, request) is None
+
+
+def test_request_requires_one_backend_and_local_logs_are_exact(tmp_path: Path) -> None:
+    both = LOCAL_REQUEST.replace(
+        "[local]",
+        '[slurm]\nscript = "scripts/sweep.slurm"\nmax_concurrent_nodes = 1\n\n[local]',
+    )
+    repo = _example_repo(tmp_path, both)
+    config = load_config(repo)
+    with pytest.raises(ExpctlError, match="exactly one"):
+        load_request(repo, config, EXAMPLE_ID, check_git=False)
+
+    wildcard = LOCAL_REQUEST.replace(
+        'log_glob = "logs/local-{job_id}.out"',
+        'log_glob = "logs/local-{job_id}-*.out"',
+    )
+    request_file = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    request_file.write_text(wildcard, encoding="utf-8")
+    with pytest.raises(ExpctlError, match="exact log file"):
+        load_request(repo, config, EXAMPLE_ID, check_git=False)
 
 
 def test_new_request_fills_git_identity_and_never_overwrites(
@@ -531,6 +608,7 @@ def test_doctor_reports_repository_and_cluster_readiness(
     (repo / "expctl" / "results").mkdir()
     monkeypatch.setattr(core.shutil, "which", lambda command: f"/bin/{command}")
     monkeypatch.setattr(core, "fcntl", object())
+    monkeypatch.setattr(core, "_process_start_token", lambda pid: "42")
 
     result = core.doctor_repo(repo)
 
@@ -539,9 +617,13 @@ def test_doctor_reports_repository_and_cluster_readiness(
     assert all(check["ok"] for check in result["checks"])
     rendered = core._render_doctor_result(result)
     assert "EXPCTL DOCTOR" in rendered
-    assert "AREA" in rendered and "STATUS" in rendered and "Cluster" in rendered
+    assert "AREA" in rendered and "STATUS" in rendered and "SLURM" in rendered
+    assert "Local" in rendered
     assert "READY" in rendered
     assert core._parser().parse_args(["doctor", "--json"]).json is True
+    assert core._parser().parse_args(["doctor", "--backend", "local"]).backend == (
+        "local"
+    )
 
 
 def test_doctor_json_returns_nonzero_when_cluster_is_not_ready(
@@ -571,8 +653,10 @@ def test_doctor_json_returns_nonzero_when_cluster_is_not_ready(
     assert json.loads(capsys.readouterr().out) == result
     assert core.main(["doctor", "--cluster", "--json"]) == 1
     assert json.loads(capsys.readouterr().out) == result
+    assert core.main(["doctor", "--backend", "local", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out) == result
     rendered = core._render_doctor_result(result)
-    assert "informational here" in rendered and "doctor --cluster" in rendered
+    assert "informational" in rendered and "--backend local|slurm" in rendered
     assert "INFO" in rendered and "FAIL" not in rendered
     strict = core._render_doctor_result(result, require_cluster=True)
     assert "informational" not in strict and "cluster host" in strict
@@ -935,6 +1019,123 @@ def test_cancel_records_an_audited_request_once(
         core.cancel_request(repo, config, EXAMPLE_ID)
 
 
+def test_local_status_and_cancel_use_the_recorded_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path, LOCAL_REQUEST)
+    config = load_config(repo)
+    receipt_dir = repo / "expctl" / "results" / EXAMPLE_ID
+    receipt_dir.mkdir(parents=True)
+    receipt_path = receipt_dir / "receipt.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "backend": "local",
+                "experiment_id": EXAMPLE_ID,
+                "job_id": "local-abc123",
+                "pid": 4321,
+                "process_start_token": "99",
+                "hostname": core.socket.gethostname(),
+                "status": "submitted",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(core, "_local_process_running", lambda *args: True)
+
+    running = status_request(repo, config, EXAMPLE_ID)
+
+    assert running["backend"] == "local"
+    assert running["pid"] == 4321
+    assert core._status_state(running) == "RUNNING"
+    assert core._status_is_terminal(running) is False
+
+    monkeypatch.setattr(
+        core,
+        "_local_accounting",
+        lambda *args: ({"state": "RUNNING", "jobs": []}, True),
+    )
+    monkeypatch.setattr(core, "_process_start_token", lambda pid: "99")
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        core.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        core, "_result_collection_guard", lambda *args: core.contextlib.nullcontext()
+    )
+
+    preview = core.cancel_request(repo, config, EXAMPLE_ID, dry_run=True)
+    assert preview["command"] == ["kill", "-TERM", "--", "-4321"]
+    result = core.cancel_request(repo, config, EXAMPLE_ID, reason="superseded")
+
+    assert signals == [(4321, core.signal.SIGTERM)]
+    assert result["backend"] == "local"
+    assert result["pid"] == 4321
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "cancel_requested"
+
+
+def test_local_operations_do_not_interpret_a_pid_from_another_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path, LOCAL_REQUEST)
+    config = load_config(repo)
+    receipt_dir = repo / "expctl" / "results" / EXAMPLE_ID
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "receipt.json").write_text(
+        json.dumps(
+            {
+                "backend": "local",
+                "experiment_id": EXAMPLE_ID,
+                "job_id": "local-remote",
+                "pid": 4321,
+                "process_start_token": "99",
+                "hostname": "another-compute-node",
+                "status": "submitted",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = status_request(repo, config, EXAMPLE_ID)
+
+    assert core._status_state(status) == "UNKNOWN"
+    assert "another-compute-node" in status["detail"]
+    # `status --watch` must not poll forever for a job this host cannot see.
+    assert core._status_is_terminal(status) is True
+    monkeypatch.setattr(
+        core, "_result_collection_guard", lambda *args: core.contextlib.nullcontext()
+    )
+    with pytest.raises(ExpctlError, match="another-compute-node"):
+        core.cancel_request(repo, config, EXAMPLE_ID)
+
+
+def test_local_completion_status_maps_exit_codes_to_terminal_states(
+    tmp_path: Path,
+) -> None:
+    status_path = tmp_path / "local-status.json"
+    receipt = {"job_id": "local-abc", "pid": 123}
+    status_path.write_text(
+        json.dumps(
+            {
+                "returncode": 7,
+                "started_at": "2026-08-29T00:00:00+00:00",
+                "finished_at": "2026-08-29T00:00:01+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accounting, running = core._local_accounting(receipt, status_path)
+
+    assert running is False
+    assert accounting["state"] == "FAILED"
+    assert accounting["jobs"][0]["exit_code"] == "7:0"
+
+
 def _stub_submit_preflight(
     monkeypatch: pytest.MonkeyPatch, repo: Path, request: dict[str, object]
 ) -> None:
@@ -993,6 +1194,70 @@ def test_submit_writes_confirmed_receipt_and_refuses_a_second_attempt(
             skip_node_check=True,
             worktree_root=worktree_root,
         )
+
+
+def test_local_submit_records_process_identity_without_calling_slurm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path, LOCAL_REQUEST)
+    config = load_config(repo)
+    request = tomllib.loads(LOCAL_REQUEST)
+    _stub_submit_preflight(monkeypatch, repo, request)
+    started: dict[str, object] = {}
+
+    def fake_start(
+        loaded_repo: Path,
+        loaded_config: Config,
+        experiment_id: str,
+        loaded_request: dict[str, object],
+        worktree: Path,
+        *,
+        job_id: str,
+    ) -> dict[str, object]:
+        started.update(
+            {
+                "repo": loaded_repo,
+                "config": loaded_config,
+                "experiment_id": experiment_id,
+                "request": loaded_request,
+                "worktree": worktree,
+                "job_id": job_id,
+            }
+        )
+        return {
+            "job_id": job_id,
+            "pid": 4321,
+            "process_start_token": "99",
+            "local_status_file": "expctl/results/example/local-status.json",
+            "log": f"logs/local-{job_id}.out",
+        }
+
+    monkeypatch.setattr(core, "_start_local_process", fake_start)
+    monkeypatch.setattr(
+        core,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("local submission called SLURM"),
+    )
+    worktree_root = tmp_path.parent / f"{tmp_path.name}-local-worktrees"
+
+    receipt = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=False,
+        skip_node_check=False,
+        worktree_root=worktree_root,
+    )
+
+    assert receipt["backend"] == "local"
+    assert receipt["status"] == "submitted"
+    assert receipt["job_id"].startswith("local-")
+    assert receipt["pid"] == 4321
+    assert receipt["command"] == [
+        "./scripts/run-local.py",
+        *request["local"]["args"],
+    ]
+    assert started["job_id"] == receipt["job_id"]
 
 
 def test_preflight_failure_removes_pending_receipt(
@@ -1563,6 +1828,7 @@ def test_rerun_copies_the_request_under_the_next_id(tmp_path: Path) -> None:
     assert result == {
         "experiment_id": f"{EXAMPLE_ID}-r2",
         "rerun_of": EXAMPLE_ID,
+        "backend": "slurm",
         "path": f"expctl/requests/{EXAMPLE_ID}-r2.toml",
         "commit": "0" * 40,
         "worktree": "myproject-example",
@@ -1633,7 +1899,7 @@ def test_receipt_summary_names_job_submitter_and_verdict(
     )
 
     assert _receipt_summary(tmp_path, receipt) == (
-        "job 123, submitted 2026-08-28T00:26:08+00:00 by peng, "
+        "slurm job 123, submitted 2026-08-28T00:26:08+00:00 by peng, "
         "receipt status submitted, sacct FAILED"
     )
 
@@ -1805,7 +2071,8 @@ def test_report_scaffolds_from_collected_results_and_marks_reviewed(
     assert text.startswith("# Example sweep\n")
     assert f"- Request: `expctl/requests/{EXAMPLE_ID}.toml`" in text
     assert "- Job: 123 submitted 2026-08-28T00:26:08+00:00 by peng" in text
-    assert "- Scheduler: COMPLETED (exit 0:0)" in text
+    assert "- Backend: slurm" in text
+    assert "- Execution: COMPLETED (exit 0:0)" in text
     assert "## Question\n\nDoes the framework parse a well-formed request?" in text
     assert "## Decision rule\n\nValidation passes." in text
     assert "| metric | `job-123.out` |" in text
@@ -1834,6 +2101,148 @@ def test_report_scaffolds_from_collected_results_and_marks_reviewed(
     assert f"expctl report {EXAMPLE_ID}" in core._render_status_result(
         status, result_path=f"expctl/results/{EXAMPLE_ID}"
     )
+
+
+def _local_e2e_repo(tmp_path: Path, script_body: str) -> tuple[Path, Config]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    config_text = EXAMPLE_CONFIG.replace(
+        'required_script_lines = ["#SBATCH -p example-partition"]',
+        "required_script_lines = []",
+    ).replace('root = ".."', 'root = "../worktrees"')
+    (repo / "expctl.toml").write_text(config_text, encoding="utf-8")
+    script = repo / "scripts" / "run-local.py"
+    script.parent.mkdir()
+    script.write_text(script_body, encoding="utf-8")
+    script.chmod(0o755)
+    _git(repo, "add", "expctl.toml", "scripts/run-local.py")
+    _git(
+        repo,
+        "-c",
+        "user.name=expctl tests",
+        "-c",
+        "user.email=expctl@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "local fixture",
+    )
+    commit = _git(repo, "rev-parse", "HEAD")
+    request_text = LOCAL_REQUEST.replace(ZERO_COMMIT, commit).replace(
+        "myproject-local-example", "local-e2e-worktree"
+    )
+    requests = repo / "expctl" / "requests"
+    requests.mkdir(parents=True)
+    (requests / f"{EXAMPLE_ID}.toml").write_text(request_text, encoding="utf-8")
+    return repo, load_config(repo)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="local execution is Linux-only")
+def test_local_backend_runs_collects_reports_and_cleans_end_to_end(
+    tmp_path: Path,
+) -> None:
+    repo, config = _local_e2e_repo(
+        tmp_path,
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "print(f\"score: {os.environ['LOCAL_VALUE']}\", flush=True)\n",
+    )
+
+    preview = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=True,
+        skip_node_check=False,
+        worktree_root=None,
+    )
+    assert preview["backend"] == "local"
+    assert preview["command"][0] == "./scripts/run-local.py"
+
+    receipt = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=False,
+        skip_node_check=False,
+        worktree_root=None,
+    )
+    assert receipt["backend"] == "local"
+    assert receipt["job_id"].startswith("local-")
+    assert receipt["pid"] > 0
+
+    deadline = time.monotonic() + 10
+    while True:
+        status = status_request(repo, config, EXAMPLE_ID)
+        if core._status_is_terminal(status):
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("local experiment did not finish")
+        time.sleep(0.05)
+    assert core._status_state(status) == "COMPLETED"
+    assert (
+        "score: 3.5"
+        in core.logs_request(repo, config, EXAMPLE_ID)["logs"][0]["content"]
+    )
+
+    collection = core.collect_request(repo, config, EXAMPLE_ID)
+    assert collection["backend"] == "local"
+    assert collection["scheduler"]["state"] == "COMPLETED"
+    assert collection["missing_metrics"] == []
+    report = core.report_request(repo, config, EXAMPLE_ID)
+    assert report["backend"] == "local"
+    assert core.list_requests(repo, config)[0]["status"] == "reviewed"
+    cleaned = core.clean_request(repo, config, EXAMPLE_ID)
+    assert cleaned["removed"] is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="local execution is Linux-only")
+def test_local_backend_cancels_and_collects_an_actual_process_group(
+    tmp_path: Path,
+) -> None:
+    repo, config = _local_e2e_repo(
+        tmp_path,
+        "#!/usr/bin/env python3\n"
+        "import time\n"
+        "print('started', flush=True)\n"
+        "time.sleep(30)\n",
+    )
+    receipt = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=False,
+        skip_node_check=False,
+        worktree_root=None,
+    )
+
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            log = core.logs_request(repo, config, EXAMPLE_ID)["logs"][0]["content"]
+        except ExpctlError:
+            log = ""
+        if log:
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("local experiment did not start")
+        time.sleep(0.05)
+    cancelled = core.cancel_request(repo, config, EXAMPLE_ID, reason="test")
+    assert cancelled["pid"] == receipt["pid"]
+
+    deadline = time.monotonic() + 5
+    while True:
+        status = status_request(repo, config, EXAMPLE_ID)
+        if core._status_is_terminal(status):
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("cancelled local experiment did not stop")
+        time.sleep(0.05)
+    assert core._status_state(status) == "CANCELLED"
+    collection = core.collect_request(repo, config, EXAMPLE_ID)
+    assert collection["scheduler"]["state"] == "CANCELLED"
+    assert collection["missing_metrics"] == ["score"]
 
 
 def test_version_matches_pyproject() -> None:

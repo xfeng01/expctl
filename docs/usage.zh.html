@@ -293,7 +293,7 @@
 
 <div class="page">
   <header>
-    <p class="eyebrow">expctl · v0.8.0 · 异步实验交接</p>
+    <p class="eyebrow">expctl · v0.9.0 · 异步实验交接</p>
     <h1>expctl 中文使用指南</h1>
     <p class="lede">
       expctl 用 Git 仓库中的请求、回执和结果文件交接异步实验。实验设计者与集群操作者不必同时在线，也能确认运行了哪一版代码、使用了哪些参数，并追溯结果来源。
@@ -306,7 +306,7 @@
       </div>
       <div class="step">
         <div class="who">跑实验的人</div>
-        <div class="what">验证请求并提交到 SLURM</div>
+        <div class="what">验证请求并启动执行后端</div>
         <div class="file">生成回执 <code>receipt.json</code></div>
       </div>
       <div class="step">
@@ -321,7 +321,7 @@
       </div>
     </div>
     <p class="muted" style="margin-top:18px;max-width:720px">
-      expctl 不替代 SLURM、工作流引擎或实验跟踪平台；它只负责让实验交接可验证、可审计。本文所称“发布请求”是指将请求推送到 Git，“提交作业”是指运行 <code>expctl submit</code>。回执生成后，请求文件不得再修改。
+      expctl 支持 SLURM 和在已分配 Linux 计算节点上的直接异步执行。它不替代调度器、工作流引擎或实验跟踪平台；只负责让实验交接可验证、可审计。回执生成后，请求文件不得再修改。
     </p>
   </header>
 
@@ -341,12 +341,12 @@
 
   <main>
     <h2 id="install"><span class="num">一</span>安装（每台机器一次）</h2>
-    <p>所有机器都需要 Git 和 Python 3.11 或更高版本。负责运行作业的集群环境还需要 <code>sbatch</code>、<code>squeue</code>、<code>sacct</code>、<code>scancel</code>；启用节点预算时还会使用 <code>scontrol</code>。推荐使用 <code>uv</code> 安装：</p>
+    <p>所有机器都需要 Git 和 Python 3.11 或更高版本。local 后端需要带 <code>/proc</code> 的 Linux 环境；SLURM 后端还需要 <code>sbatch</code>、<code>squeue</code>、<code>sacct</code>、<code>scancel</code>，启用节点预算时还会使用 <code>scontrol</code>。推荐使用 <code>uv</code> 安装：</p>
 <pre data-lang="bash"><code>uv tool install git+https://github.com/xfeng01/expctl</code></pre>
     <p>更新，以及查看当前安装的版本：</p>
 <pre data-lang="bash"><code>uv tool upgrade expctl
 expctl --version</code></pre>
-    <div class="note"><p><strong>零安装方式</strong>：只复制 <code>src/expctl/core.py</code>，运行 <code>python core.py &lt;command&gt;</code>。该文件仅依赖 Python 标准库；Git 和相应的 SLURM 命令仍须存在。所有命令都应在 Git 工作树内运行。</p></div>
+    <div class="note"><p><strong>零安装方式</strong>：只复制 <code>src/expctl/core.py</code>，运行 <code>python core.py &lt;command&gt;</code>。该文件仅依赖 Python 标准库；Git 和所选后端的系统能力仍须存在。所有命令都应在 Git 工作树内运行。</p></div>
 
     <h2 id="init"><span class="num">二</span>初始化项目</h2>
     <p>在项目仓库中运行：</p>
@@ -357,9 +357,9 @@ expctl/
 ├── requests/               <span class="c"># 实验请求</span>
 ├── results/                <span class="c"># 回执、日志、指标和报告</span>
 └── templates/request.toml  <span class="c"># 请求模板</span></code></pre>
-    <p>随后编辑 <code>expctl.toml</code>，至少确认允许的 SLURM 参数、节点上限、共享运行时目录和 worktree 位置（见“配置参考”）。</p>
+    <p>随后编辑 <code>expctl.toml</code>，确认共享运行时目录和 worktree 位置；使用 SLURM 时还要确认脚本策略和节点上限。</p>
     <p>若修改 <code>paths.root</code>，再次运行 <code>expctl init</code> 会在新位置补齐目录，但不会移动或删除旧目录。将配置、请求、模板和结果元数据纳入版本控制；不要提交数据集、模型权重、缓存或密钥。</p>
-    <p>可运行 <code>expctl doctor</code> 检查仓库结构、目录权限、POSIX 锁和 SLURM 命令。仓库检查失败时退出码为 <code>1</code>；SLURM 检查默认只作提示，在集群上使用 <code>expctl doctor --cluster</code> 才将其计入退出码。<code>--json</code> 可供脚本读取。</p>
+    <p><code>expctl doctor</code> 分别报告仓库、local 和 SLURM 是否可用。默认只有仓库检查影响退出码；<code>--backend local</code> 或 <code>--backend slurm</code> 会要求对应后端可用。旧的 <code>--cluster</code> 等价于 <code>--backend slurm</code>。</p>
     <div class="note"><p>expctl 只读写文件，不会自动执行 <code>git add</code>、<code>git commit</code> 或 <code>git push</code>。</p></div>
 
     <h2 id="author"><span class="num">三</span>创建并发布实验请求</h2>
@@ -367,42 +367,43 @@ expctl/
       <li>提交并推送本次实验所需的脚本、配置和评测代码。</li>
       <li>从模板创建请求；命令会自动填写 ID、当前 commit、branch 和 worktree 名称：
 <pre data-lang="bash"><code>expctl new 20260901-lr-sweep</code></pre></li>
-      <li>编辑生成的请求，填写实验问题、判定规则、SLURM 脚本、输出和指标，然后验证：
+      <li>编辑生成的请求，填写实验问题、判定规则、输出和指标，并且只保留 <code>[slurm]</code> 或 <code>[local]</code> 其中一种后端，然后验证：
 <pre data-lang="bash"><code>expctl validate 20260901-lr-sweep</code></pre></li>
       <li>将请求文件提交并推送到 Git 仓库。</li>
     </ol>
     <p>若工作树存在未提交改动，<code>new</code> 默认拒绝创建，因为这些内容不属于固定的 <code>HEAD</code>。应先提交或暂存；只有明确接受风险时才使用 <code>--allow-dirty</code>。</p>
-    <p><code>validate</code> 会检查请求格式、固定提交、作业脚本策略，以及显式 <code>#SBATCH --nodes</code> 和数组节流推导出的最坏节点数。模板中的标题、问题、判定规则、脚本、日志 glob、指标和依赖仍为占位值时会直接拒绝；Git 提交或脚本缺失时会给出对应的 fetch、提交和推送提示。交互终端还会显示本次固定的 commit、脚本、节点数、环境变量、日志、指标和依赖摘要。回执生成前可以修正并重新发布请求；回执生成后必须保持文件字节不变。</p>
+    <p><code>validate</code> 会检查请求格式、固定提交和脚本。SLURM 脚本必须满足仓库策略；local 脚本必须在固定提交中带可执行位。交互终端会显示后端、commit、脚本、环境变量、日志、指标和依赖摘要。</p>
 
     <h2 id="runner"><span class="num">四</span>提交、查看和收集</h2>
-    <p>在集群上的项目仓库里：</p>
+    <p>每个请求必须且只能选择一种后端。SLURM 使用 <code>[slurm]</code>、<code>script</code>、<code>max_concurrent_nodes</code> 和可选的 <code>[slurm.env]</code>；计算节点直跑使用 <code>[local]</code>、<code>script</code>、可选的 <code>args</code> 和 <code>[local.env]</code>。</p>
+    <div class="note"><p>local 脚本必须在 Git 中带可执行位；<code>outputs.log_glob</code> 必须是含 <code>{job_id}</code> 的精确路径，不能使用通配符。local 会捕获 stdout/stderr，固定启动节点主机名，并用 Linux <code>/proc</code> 核对 PID 身份；状态、取消和收集必须在同一节点执行。它不提供排队、资源隔离或主机重启恢复。</p></div>
+    <p>在执行主机上的项目仓库里：</p>
 <pre data-lang="bash"><code>git pull --ff-only
 expctl list
 expctl show &lt;id&gt;
 expctl submit &lt;id&gt; --dry-run
 expctl submit &lt;id&gt;</code></pre>
-    <p><code>expctl list</code> 在交互终端中自动显示按终端宽度对齐的表格，中文按实际宽度计算，长标题以省略号截断；管道或文件输出保持稳定 TSV。对于带有效作业号的 <code>submitted</code> 回执，它会把所有作业号合并为一次 <code>squeue</code> 查询，再把已离开队列的作业合并为一次 <code>sacct</code> 查询；数组任务有多种状态时显示 <code>MIXED</code>。查询只读且不修改回执；SLURM 命令缺失、查询失败或部分作业无状态时，受影响的行安全回退为 <code>submitted</code>，并且只在标准错误输出一条警告，因此 TSV 和 JSON 标准输出仍保持纯净。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式，并用 <code>--no-color</code> 关闭颜色。</p>
+    <p><code>expctl list</code> 在交互终端中显示对齐表格，管道输出保持稳定 TSV。它批量刷新 SLURM 状态，并从进程身份和退出状态文件刷新 local 状态；刷新只读且不修改回执。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式。</p>
     <p><code>list</code> 默认按 ID 从新到旧排列；<code>--sort oldest</code> 可反转。<code>--status running,failed</code> 按实时或回执状态筛选且不区分大小写，<code>--limit 20</code> 在筛选和排序后限制数量。相同 commit 和脚本的 Git 校验会在单次列表中复用。</p>
     <p>面向生命周期的命令在交互终端中使用对齐表格显示详情和建议的下一步；输出到管道或文件时保持 JSON，原始日志除外。需要在终端中获取 JSON 时使用命令支持的 <code>--json</code>。</p>
-    <p><code>--dry-run</code> 会验证请求并输出固定提交、worktree 路径、<code>sbatch</code> 命令、声明节点上限和推导节点上限。它不会创建 worktree、链接共享目录、检查运行时依赖或当前节点预算，也不会调用 <code>sbatch</code>。</p>
-    <p>正式提交时，expctl 会先独占 <code>preparing</code> 回执，再创建或验证属于当前仓库、位于固定提交且内容干净的 detached worktree，检查资源和节点预算，清除宿主 <code>SBATCH_*</code> 覆盖项，最后调用 <code>sbatch --parsable</code> 并原子完成回执。无法确认作业号时回执保留为 <code>submission_unknown</code>，必须人工对账，不能自动重试。</p>
+    <p><code>--dry-run</code> 会验证请求并输出后端、固定提交、worktree 和命令，但不会启动作业。正式提交会创建干净的 detached worktree，检查依赖，再通过所选后端启动并原子完成回执。SLURM 会额外检查资源和节点预算；local 会启动独立进程组并记录 PID、启动标识和退出状态文件。</p>
     <div class="note"><p>若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 <code>receipt.json</code>。</p></div>
 
     <h3>看进度</h3>
 <pre data-lang="bash"><code>expctl status &lt;id&gt;
 expctl status &lt;id&gt; --watch</code></pre>
-    <p><code>in_queue: true</code> 表示 <code>squeue</code> 仍能查到该作业或其数组任务。作业离开队列，或 <code>squeue</code> 暂时不可用时，expctl 改用 <code>sacct</code>；两者都不可用时返回 <code>UNKNOWN</code> 和错误详情。<code>--watch [SECONDS]</code> 默认每 5 秒刷新直到终态；管道或 <code>--json</code> 模式输出 JSON Lines。</p>
+    <p>SLURM 状态使用 <code>squeue</code> 和 <code>sacct</code>；local 状态会核对 PID 与进程启动标识，并在结束后读取退出码。<code>--watch [SECONDS]</code> 默认每 5 秒刷新直到终态。</p>
 
     <h3>查看日志与取消</h3>
 <pre data-lang="bash"><code>expctl logs &lt;id&gt; --tail 100
 expctl logs &lt;id&gt; --follow
 expctl cancel &lt;id&gt; --reason "superseded" --dry-run
 expctl cancel &lt;id&gt; --reason "superseded"</code></pre>
-    <p><code>logs</code> 在运行中读取回执核验的 worktree，收集后读取结果目录。<code>cancel</code> 只处理带确认作业号且尚未收集的回执；<code>scancel</code> 成功后记录操作者、时间和原因，并进入 <code>cancel_requested</code>。取消后的日志仍应收集。</p>
+    <p><code>logs</code> 在运行中读取回执核验的 worktree，收集后读取结果目录。取消时 SLURM 调用 <code>scancel</code>，local 向核验后的进程组发送 <code>SIGTERM</code>；两者都会记录审计信息。取消后的日志仍应收集。</p>
 
     <h3>收集结果</h3>
 <pre data-lang="bash"><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;]</code></pre>
-    <p><code>collect</code> 会先确认作业已离开 <code>squeue</code>，校验请求哈希，并根据请求重新计算 worktree 与回执核对。若 <code>submit</code> 使用了 <code>--worktree-root</code>，这里必须传入相同目录。匹配日志会先暂存，再发布到结果目录，并从暂存文件提取指标到 <code>metrics.json</code>，记录 <code>missing_metrics</code> 和 <code>sacct</code> 结果。</p>
+    <p><code>collect</code> 会先确认所选后端已经终止，校验请求和 worktree，再暂存并发布日志、提取 <code>metrics.json</code>，最后记录执行终态。</p>
     <p><code>collect</code> 不会等待作业，也不会覆盖已经收集或残留的结果；同一请求的收集过程使用互斥锁串行化。作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或目标文件名冲突时都会报错。</p>
 
     <h3>生成并填写报告</h3>
@@ -415,6 +416,7 @@ expctl clean &lt;id&gt;</code></pre>
     <p><code>clean</code> 只允许 <code>collected</code> 回执；它重新核对固定提交、仓库归属和工作树内容，并拒绝仍被未收集 rerun 使用的 worktree。结果证据和共享目录的符号链接目标不会被删除。</p>
 
     <h2 id="request"><span class="num">五</span>请求文件参考</h2>
+    <p>请求必须且只能包含 <code>[slurm]</code> 或 <code>[local]</code> 之一。</p>
     <div class="table-wrap">
     <table>
       <thead><tr><th>字段</th><th>约束与含义</th></tr></thead>
@@ -429,7 +431,10 @@ expctl clean &lt;id&gt;</code></pre>
         <tr><td><code>slurm.script</code></td><td>固定提交中的仓库相对路径，不得越出仓库</td></tr>
         <tr><td><code>slurm.max_concurrent_nodes</code></td><td>允许的最坏并发节点数；固定脚本必须显式声明数字形式的 <code>#SBATCH --nodes</code>，数组范围和 <code>%N</code> 节流也必须可静态解析，推导值不得超过这里的声明</td></tr>
         <tr><td><code>slurm.env</code></td><td>传给 <code>sbatch --export</code> 的环境变量；名称须匹配 <code>[A-Za-z_][A-Za-z0-9_]*</code> 且不能是 <code>GROUPS</code>，值必须是字符串且不能包含逗号或换行</td></tr>
-        <tr><td><code>outputs.log_glob</code></td><td>相对于实验 worktree 的 glob，不得越出 worktree；唯一支持的占位符是必须出现的 <code>{job_id}</code></td></tr>
+        <tr><td><code>local.script</code></td><td>固定提交中的仓库相对可执行文件；必须带 Git 可执行位</td></tr>
+        <tr><td><code>local.args</code></td><td>可选字符串数组，按顺序作为参数，不经过 shell 展开</td></tr>
+        <tr><td><code>local.env</code></td><td>传给本地进程的环境变量</td></tr>
+        <tr><td><code>outputs.log_glob</code></td><td>相对于 worktree 且必须包含 <code>{job_id}</code>；SLURM 可使用 glob，local 必须是精确路径</td></tr>
         <tr><td><code>outputs.metrics</code></td><td>非空指标名数组；可提取的名称须匹配 <code>[A-Za-z_][A-Za-z0-9_.-]*</code>，对应值必须是独占一行的数字</td></tr>
         <tr><td><code>notes.requirements</code></td><td>可选的 worktree 相对路径数组；正式提交前逐项检查是否存在</td></tr>
         <tr><td><code>notes.instructions</code></td><td>可选的操作说明；expctl 不解释其内容</td></tr>
@@ -456,14 +461,14 @@ create_missing = ["runs", "logs"]
 root = ".."</code></pre>
     <ul>
       <li><code>paths.root</code>：请求、结果和模板的仓库相对目录。</li>
-      <li><code>scheduler.required_script_lines</code>：必须出现在固定脚本可生效的头部区域；其中的 <code>#SBATCH</code> 选项还会作为命令行参数传给 <code>sbatch</code>，防止后续脚本选项覆盖策略。</li>
-      <li><code>scheduler.max_total_nodes</code>：当前用户的跨作业节点上限；<code>0</code> 表示禁用检查。</li>
+      <li><code>scheduler.required_script_lines</code>：仅用于 SLURM；必须出现在固定脚本可生效的头部区域。</li>
+      <li><code>scheduler.max_total_nodes</code>：仅用于 SLURM；当前用户的跨作业节点上限，<code>0</code> 表示禁用检查。</li>
       <li><code>runtime.shared_dirs</code>：从主工作树链接到实验 worktree 的顶层目录名。源目录不存在时跳过。</li>
       <li><code>runtime.create_missing</code>：提交前可自动创建的共享目录，必须是 <code>shared_dirs</code> 的子集。</li>
       <li><code>worktree.root</code>：实验 worktree 的父目录；相对路径以仓库根目录为基准。</li>
     </ul>
     <p>节点预算会统计所有占用或正在申请资源的相关状态，并加上请求中的 <code>slurm.max_concurrent_nodes</code>。数组任务使用 <code>squeue -r</code> 展开，因此检查有意偏保守。同一 Git checkout 内的查询—提交窗口会串行化；跨 clone 和人工提交的硬上限仍需 SLURM QOS/account 保证。</p>
-    <div class="warn"><p><code>--skip-node-check</code> 会跳过节点预算检查，只应在操作者明确授权后使用。</p></div>
+    <div class="warn"><p><code>--skip-node-check</code> 仅用于 SLURM，会跳过节点预算检查，只应在操作者明确授权后使用。</p></div>
 
     <h2 id="commands"><span class="num">七</span>命令与状态</h2>
     <div class="table-wrap">
@@ -471,17 +476,17 @@ root = ".."</code></pre>
       <thead><tr><th>命令</th><th>作用</th></tr></thead>
       <tbody>
         <tr><td><code>expctl init</code></td><td>补齐配置和 <code>paths.root</code> 指定的目录结构</td></tr>
-        <tr><td><code>expctl doctor [--cluster] [--json]</code></td><td>检查仓库结构、worktree 位置、POSIX 锁和 SLURM 命令；<code>--cluster</code> 时 SLURM 检查计入退出码</td></tr>
+        <tr><td><code>expctl doctor [--backend local|slurm] [--cluster] [--json]</code></td><td>检查仓库和两个后端；选择后端时对应检查计入退出码</td></tr>
         <tr><td><code>expctl new &lt;id&gt; [--allow-dirty] [--json]</code></td><td>从模板创建请求并填写 Git 元数据；默认拒绝未提交改动</td></tr>
         <tr><td><code>expctl list [--table|--tsv|--json] [--status &lt;states&gt;] [--sort newest|oldest] [--limit &lt;n&gt;] [--no-color]</code></td><td>列出请求及实时状态；默认从新到旧，终端表格，管道 TSV</td></tr>
         <tr><td><code>expctl validate &lt;id&gt;</code></td><td>验证请求、固定提交和作业脚本策略</td></tr>
         <tr><td><code>expctl show &lt;id&gt;</code></td><td>将验证后的请求输出为 JSON</td></tr>
-        <tr><td><code>expctl submit &lt;id&gt; [--json]</code></td><td>准备 worktree、检查依赖和预算，并提交 SLURM 作业</td></tr>
-        <tr><td><code>expctl submit &lt;id&gt; --dry-run</code></td><td>验证并预览提交，不创建资源或调用 SLURM</td></tr>
+        <tr><td><code>expctl submit &lt;id&gt; [--json]</code></td><td>准备 worktree，并通过请求声明的后端启动作业</td></tr>
+        <tr><td><code>expctl submit &lt;id&gt; --dry-run</code></td><td>验证并预览提交，不创建资源或启动作业</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; --worktree-root &lt;dir&gt;</code></td><td>本次提交使用指定的 worktree 父目录</td></tr>
-        <tr><td><code>expctl status &lt;id&gt; [--watch [SECONDS]] [--json]</code></td><td>查询一次状态，或定时刷新到终态；<code>squeue</code> 不可用时回退到 <code>sacct</code></td></tr>
+        <tr><td><code>expctl status &lt;id&gt; [--watch [SECONDS]] [--json]</code></td><td>查询一次状态，或按所选后端定时刷新到终态</td></tr>
         <tr><td><code>expctl logs &lt;id&gt; [--tail N] [--follow] [--worktree-root DIR]</code></td><td>查看运行中或已收集日志；默认显示末尾 100 行</td></tr>
-        <tr><td><code>expctl cancel &lt;id&gt; [--reason TEXT] [--dry-run] [--json]</code></td><td>预览或调用 <code>scancel</code>，并记录取消审计信息</td></tr>
+        <tr><td><code>expctl cancel &lt;id&gt; [--reason TEXT] [--dry-run] [--json]</code></td><td>预览或执行后端取消，并记录审计信息</td></tr>
         <tr><td><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;] [--json]</code></td><td>复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致</td></tr>
         <tr><td><code>expctl clean &lt;id&gt; [--dry-run] [--worktree-root DIR] [--json]</code></td><td>收集后验证并删除 detached worktree，不删除结果证据</td></tr>
         <tr><td><code>expctl report &lt;id&gt; [--json]</code></td><td>从请求、回执和指标生成 <code>results/&lt;id&gt;/report.md</code> 骨架；已存在时拒绝覆盖</td></tr>
@@ -493,10 +498,10 @@ root = ".."</code></pre>
     <p>标准状态：</p>
     <div class="states">
       <div>有效请求，无回执<br><span class="pill requested">requested</span></div>
-      <div>正在准备或调用 sbatch<br><code>preparing / submitting</code></div>
+      <div>正在准备或调用执行后端<br><code>preparing / submitting</code></div>
       <div>提交结果必须人工对账<br><code>submission_unknown</code></div>
-      <div>已生成回执；可查询时显示实时 SLURM 状态<br><span class="pill submitted">submitted → RUNNING / FAILED / …</span></div>
-      <div>已调用 scancel，等待调度器确认<br><code>cancel_requested</code></div>
+      <div>已生成回执；显示后端实时状态<br><span class="pill submitted">submitted → RUNNING / FAILED / …</span></div>
+      <div>已请求后端取消，等待确认<br><code>cancel_requested</code></div>
       <div>已执行 collect<br><span class="pill collected">collected</span></div>
       <div>已收集且报告存在<br><span class="pill collected">reviewed</span></div>
       <div>请求验证失败、仍含模板占位符或回执 JSON 无效<br><code>invalid</code></div>
@@ -507,9 +512,9 @@ root = ".."</code></pre>
     <h2 id="trouble"><span class="num">八</span>异常处理与自动化约定</h2>
     <ul>
       <li><strong>请求在提交作业后被修改</strong>：恢复与回执中 <code>request_sha256</code> 完全一致的文件；否则 <code>collect</code> 会拒绝执行。</li>
-      <li><strong>回执损坏、不可读或缺少有效 worktree</strong>：从 Git 或可靠备份恢复并与 SLURM 对账；恢复前，expctl 会保守阻止 worktree 复用和清理。</li>
-      <li><strong>提交结果不确定</strong>：保留 <code>submission_unknown</code> 回执并查询 SLURM；确认是否存在作业前不得删除回执、重跑或再次提交。</li>
-      <li><strong>节点预算不足</strong>：等待已有作业释放节点后重试。不要通过修改旧请求或静默重提绕过限制。</li>
+      <li><strong>回执损坏、不可读或缺少有效 worktree</strong>：从 Git 或可靠备份恢复并与请求所用后端对账；恢复前，expctl 会保守阻止 worktree 复用和清理。</li>
+      <li><strong>提交结果不确定</strong>：保留 <code>submission_unknown</code> 回执并与后端对账；确认是否存在作业前不得删除回执、重跑或再次提交。</li>
+      <li><strong>SLURM 节点预算不足</strong>：等待已有作业释放节点后重试。不要通过修改旧请求或静默重提绕过限制。</li>
       <li><strong>作业不再需要</strong>：先用 <code>expctl cancel &lt;id&gt; --dry-run</code> 核对作业号，再正式取消；作业离开队列后仍应收集证据。</li>
       <li><strong>作业失败、超时或被抢占</strong>：保留原回执和日志，在报告中记录失败原因；确认原作业离开队列后用 <code>expctl rerun</code> 创建新 ID，复用的 worktree 必须仍然干净。</li>
       <li><strong>日志未找到</strong>：核对作业是否结束、<code>outputs.log_glob</code> 是否包含正确的 <code>{job_id}</code> 位置，以及日志是否写在固定 worktree 中。</li>

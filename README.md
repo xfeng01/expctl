@@ -1,20 +1,19 @@
 # expctl
 
-`expctl` is a small Git-backed CLI for handing asynchronous experiments to a
-SLURM cluster. An author publishes an immutable request; a runner reviews,
-submits, monitors, and collects it. Git preserves the handoff and its audit
-trail.
+`expctl` is a small Git-backed CLI for handing off asynchronous experiments.
+An author publishes an immutable request; a runner reviews, submits, monitors,
+and collects it. Git preserves the handoff and its audit trail.
 
-> `expctl` currently supports SLURM only. It is not a scheduler, workflow
-> engine, or experiment tracker.
+It supports two execution backends: SLURM and direct execution on a Linux
+compute node. It is not a scheduler, workflow engine, or experiment tracker.
 
 [Changelog](CHANGELOG.md)
 
 ## Install
 
-Every machine needs Git and Python 3.11 or newer. The POSIX cluster host also
-needs `sbatch`, `squeue`, `sacct`, and `scancel`; node-budget checks use
-`scontrol`.
+Every machine needs Git and Python 3.11 or newer. Direct execution requires a
+Linux host with `/proc`. The SLURM backend also needs `sbatch`, `squeue`,
+`sacct`, and `scancel`; node-budget checks use `scontrol`.
 
 ```bash
 uv tool install git+https://github.com/xfeng01/expctl
@@ -34,8 +33,9 @@ Complete command reference:
 # Initialize expctl in the current repository.
 expctl init
 
-# Check repository configuration; --cluster also requires the SLURM tools.
-expctl doctor [--cluster] [--json]
+# Check repository and backend readiness. --cluster is an alias for
+# --backend slurm.
+expctl doctor [--backend slurm|local] [--cluster] [--json]
 
 # Create a request from the repository template and fill in Git metadata.
 expctl new <id> [--allow-dirty] [--json]
@@ -50,7 +50,7 @@ expctl show <id>
 # also gets a one-screen summary of what was pinned.
 expctl validate <id>
 
-# Preview or submit a request. Omit --dry-run to call sbatch.
+# Preview or submit through the backend declared by the request.
 expctl submit <id> [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
 
 # Show detailed state once, or refresh until the job finishes.
@@ -59,10 +59,10 @@ expctl status <id> [--watch [SECONDS]] [--json]
 # Show the last 100 log lines, or keep following new output.
 expctl logs <id> [--tail N] [--follow] [--worktree-root DIR]
 
-# Preview or request an audited SLURM cancellation.
+# Preview or request an audited cancellation.
 expctl cancel <id> [--reason TEXT] [--dry-run] [--json]
 
-# Copy logs, extract metrics, and record the scheduler verdict.
+# Copy logs, extract metrics, and record the execution verdict.
 expctl collect <id> [--worktree-root DIR] [--json]
 
 # Preview or remove the verified worktree after collection.
@@ -80,15 +80,55 @@ expctl --help
 expctl <command> --help
 ```
 
-`--skip-node-check` bypasses the cross-job node-budget check and requires
-explicit operator authorization.
+`--skip-node-check` applies only to SLURM. It bypasses the cross-job node-budget
+check and requires explicit operator authorization.
+
+## Execution backends
+
+A request must contain exactly one backend table.
+
+```toml
+[slurm]
+script = "scripts/train.slurm"
+max_concurrent_nodes = 1
+
+[slurm.env]
+CONFIG = "configs/run.toml"
+```
+
+SLURM submissions use `sbatch`; status, cancellation, and final accounting use
+`squeue`, `scancel`, and `sacct`.
+
+```toml
+[local]
+script = "scripts/train.py"
+args = ["--config", "configs/run.toml"]
+
+[local.env]
+MODE = "evaluation"
+```
+
+The local backend runs the pinned script asynchronously in its detached
+worktree, captures stdout and stderr in the requested log, and records the
+supervisor PID, Linux `/proc` start identity, and exit status. The script must
+be executable in Git (for example,
+`git update-index --chmod=+x scripts/train.py`), and
+`outputs.log_glob` must be one exact path containing `{job_id}`, not a wildcard.
+The receipt also pins the execution hostname: local status, cancellation, and
+collection must run on that same host. Cancellation sends `SIGTERM` to the
+recorded process group.
+
+Local mode is intended for a machine where compute resources are already
+allocated. It provides no queue, resource isolation, or restart after the host
+reboots.
 
 `new` refuses a dirty working tree because uncommitted changes are not part of
 the pinned `HEAD`; `--allow-dirty` is an explicit override. `validate` rejects
 a request that still carries starter-template placeholder values (title,
 question, decision rule, script, log glob, metrics, requirements). `doctor`
-exits nonzero when a repository check fails; on the cluster host add
-`--cluster` so the SLURM checks count too.
+exits nonzero when a repository check fails; on the execution host add
+`--backend local` or `--backend slurm` to require that backend's checks. The
+legacy `--cluster` flag is an alias for `--backend slurm`.
 
 In a terminal, `list` renders an aligned table. Redirected output defaults to
 TSV. For example:
@@ -101,17 +141,20 @@ EXPERIMENT ID                 STATUS     TITLE
 20260829-decoder-cross-probe  RUNNING    Decoder block-RoPE probe
 ```
 
-Mixed array-task states show `MIXED`. If SLURM is unavailable or returns no
-state, `list` warns once on stderr and keeps the affected rows as `submitted`.
-Receipts are never modified by a refresh.
+SLURM array tasks with mixed states show `MIXED`. If SLURM is unavailable or
+returns no state, `list` warns once on stderr and keeps affected SLURM rows as
+`submitted`. Local rows are refreshed from the recorded process and status
+file. Receipts are never modified by a refresh.
 
 `list` sorts newest IDs first by default. `--status` is case-insensitive, may
 contain comma-separated values, and may be repeated. Filtering uses refreshed
-SLURM states; repeated commit/script validation is cached within each listing.
+execution states; repeated commit/script validation is cached within each
+listing.
 
-`status` falls back to `sacct` when `squeue` is unavailable. With `--watch`, it
-stops at a terminal scheduler state; redirected or `--json` watch output is
-newline-delimited JSON.
+For SLURM, `status` falls back to `sacct` when `squeue` is unavailable. For
+local runs, it checks the recorded process identity and exit-status file. With
+`--watch`, it stops at a terminal state; redirected or `--json` watch output
+is newline-delimited JSON.
 
 `logs` reads the submitted worktree while a job is active and the collected
 result directory afterward. `clean` only removes a verified worktree after
@@ -122,8 +165,8 @@ a terminal. Redirected output stays JSON unless the command emits raw logs;
 use `--json` to force JSON where supported.
 
 `submit`, `status`, `logs --follow`, `cancel`, `collect`, and `clean` run on the
-cluster host. The other commands also work on Windows; non-following `logs`
-works wherever its log path is available.
+Linux execution host. The other commands also work on Windows; non-following
+`logs` works wherever its log path is available.
 
 ## Repository model
 
@@ -134,7 +177,7 @@ expctl.toml
 expctl/
 |-- requests/<id>.toml          immutable experiment request
 |-- results/<id>/receipt.json   submission identity and lifecycle state
-|-- results/<id>/logs/          collected scheduler output
+|-- results/<id>/logs/          collected execution output
 |-- results/<id>/metrics.json   extracted metrics
 |-- results/<id>/report.md      human conclusion
 |-- templates/request.toml      request template
@@ -148,16 +191,17 @@ requested -> preparing/submitting -> submitted -> [cancel_requested] -> collecte
 
 `reviewed` means `results/<id>/report.md` exists: `expctl report` scaffolds it
 from the request, receipt, and metrics, and `list`/`status` show the state,
-but no receipt field is written for it. `submission_unknown` means `sbatch` may have accepted the job but no job ID
-was safely recorded; reconcile it with SLURM manually.
+but no receipt field is written for it. For SLURM, `submission_unknown` means
+`sbatch` may have accepted the job but no job ID was safely recorded; reconcile
+it with SLURM manually.
 
 ## Safety rules
 
-- A request pins a full commit, SLURM script, resource envelope, expected
-  logs, and decision rule. Do not edit it after a receipt exists.
-- `submit` uses a clean detached worktree at the pinned commit, verifies node
-  and array limits, removes ambient `SBATCH_*` overrides, and records the job
-  ID atomically.
+- A request pins a full commit, backend script and settings, expected logs,
+  and decision rule. Do not edit it after a receipt exists.
+- `submit` uses a clean detached worktree at the pinned commit. SLURM requests
+  verify resource policy and record a scheduler job ID; local requests record
+  a process identity and exit-status file.
 - Each request gets at most one submission attempt. Never delete a receipt to
   resubmit; use `rerun` to create a new ID.
 - An unreadable or structurally invalid receipt blocks worktree reuse and
@@ -165,7 +209,7 @@ was safely recorded; reconcile it with SLURM manually.
   corrupt receipt is unrelated.
 - `collect` verifies the submitted worktree and publishes results once. If
   `submit` used `--worktree-root`, pass the same directory to `collect`.
-- `cancel` records the operator, time, and optional reason after `scancel`
+- `cancel` records the operator, time, and optional reason after the backend
   accepts the request. `clean` never removes an uncollected worktree.
 - `expctl.toml` defines repository policy and should be committed.
 - `expctl` never runs `git add`, `git commit`, or `git push`.
