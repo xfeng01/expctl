@@ -11,3 +11,5 @@ wheels/
 
 # Test caches
 .pytest_cache/
+CLAUDE.md
+.gitignore
