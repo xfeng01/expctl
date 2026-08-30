@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.1 — 2026-08-30
 
 - Limited `list` calls now avoid validating and refreshing requests that cannot
   appear in the output. Status-filtered calls scan in bounded batches and stop
