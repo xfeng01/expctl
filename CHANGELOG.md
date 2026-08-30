@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.2 — 2026-08-30
 
 - `list` now verifies pinned commits and scripts with two batched
   `git cat-file` queries per scan instead of two Git processes per request,
