@@ -127,9 +127,15 @@ max_concurrent_nodes = 1
 [slurm.env]
 EXAMPLE_OPTION = "value"
 
-# To run directly on the current compute node, replace [slurm] and [slurm.env]
-# with [local] and [local.env]. A local script must be executable in Git and may
-# also define `args = ["..."]`.
+# To run directly on the current compute node, delete the [slurm] tables above
+# and uncomment this block instead. A local script must be executable in Git;
+# `args` is optional.
+# [local]
+# script = "scripts/example.sh"
+# args = ["--example"]
+#
+# [local.env]
+# EXAMPLE_OPTION = "value"
 
 [outputs]
 log_glob = "logs/example-{job_id}.out"

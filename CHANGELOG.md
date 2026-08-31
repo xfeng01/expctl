@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.1 — 2026-08-31
+
+- The starter request template now includes a commented-out `[local]` /
+  `[local.env]` block next to the active `[slurm]` tables, so switching a
+  request to local execution is an uncomment-and-delete edit instead of
+  writing the tables from scratch.
+
 ## 0.11.0 — 2026-08-30
 
 - `list` now orders same-day requests by the commit time that first added
