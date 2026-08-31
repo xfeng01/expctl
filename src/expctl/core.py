@@ -4497,6 +4497,54 @@ def _list_request_batch(
     return rows, warning
 
 
+def _request_creation_times(repo: Path, config: Config) -> dict[str, int]:
+    """Map request IDs to the committer time that first added their file.
+
+    Returns an empty mapping when Git cannot answer (for example in an
+    uninitialized repository); callers then fall back to lexical ordering.
+    """
+    pathspec = str(PurePosixPath(config.root) / "requests" / "*.toml")
+    try:
+        output = _git_text(
+            repo,
+            "log",
+            "--diff-filter=A",
+            "--format=%ct",
+            "--name-only",
+            "--",
+            pathspec,
+        )
+    except ExpctlError:
+        return {}
+    times: dict[str, int] = {}
+    timestamp: int | None = None
+    for line in output.splitlines():
+        if not line:
+            continue
+        if line.isdigit():
+            timestamp = int(line)
+        elif timestamp is not None:
+            # The log is newest-first, so the last value seen for a path is
+            # the earliest commit that added it.
+            times[PurePosixPath(line).stem] = timestamp
+    return times
+
+
+def _list_sort_key(
+    experiment_id: str, creation_times: dict[str, int]
+) -> tuple[str, float, str]:
+    """Order by ID date, then Git creation time, then the full ID.
+
+    An uncommitted request file has no Git time and counts as the newest of
+    its day.
+    """
+    return (
+        experiment_id[:8],
+        creation_times.get(experiment_id, float("inf")),
+        experiment_id,
+    )
+
+
 def list_requests(
     repo: Path,
     config: Config,
@@ -4507,16 +4555,23 @@ def list_requests(
 ) -> list[dict[str, str]]:
     """List requests while avoiding work for rows that cannot be displayed.
 
-    Unfiltered limited listings process exactly the requested paths. A limited
-    status-filtered listing scans in bounded batches and stops once enough
-    matching rows have been resolved. Unlimited listings retain one full batch
-    so SLURM status refreshes stay consolidated.
+    Rows are ordered by the ID's date part; same-day requests are ordered by
+    the commit time that first added their file. Unfiltered limited listings
+    process exactly the requested paths. A limited status-filtered listing
+    scans in bounded batches and stops once enough matching rows have been
+    resolved. Unlimited listings retain one full batch so SLURM status
+    refreshes stay consolidated.
     """
     statuses = set() if statuses is None else statuses
     requests_dir = repo / config.root / "requests"
-    paths = sorted(
-        requests_dir.glob("*.toml"),
-        key=lambda path: path.stem,
+    paths = list(requests_dir.glob("*.toml"))
+    creation_times = (
+        _request_creation_times(repo, config)
+        if len({path.stem[:8] for path in paths}) < len(paths)
+        else {}
+    )
+    paths.sort(
+        key=lambda path: _list_sort_key(path.stem, creation_times),
         reverse=sort_order == "newest",
     )
     if limit is not None and not statuses:
@@ -4598,11 +4653,15 @@ def _select_list_rows(
     statuses: set[str],
     sort_order: str,
     limit: int | None,
+    creation_times: dict[str, int] | None = None,
 ) -> list[dict[str, str]]:
     selected = [
         row for row in rows if not statuses or row["status"].casefold() in statuses
     ]
-    selected.sort(key=lambda row: row["id"], reverse=sort_order == "newest")
+    selected.sort(
+        key=lambda row: _list_sort_key(row["id"], creation_times or {}),
+        reverse=sort_order == "newest",
+    )
     return selected[:limit] if limit is not None else selected
 
 
@@ -4690,7 +4749,7 @@ def _parser() -> argparse.ArgumentParser:
         "--sort",
         choices=("newest", "oldest"),
         default="newest",
-        help="sort by experiment ID (default: newest)",
+        help="sort by ID date, then by Git creation time (default: newest)",
     )
     list_count = listing.add_mutually_exclusive_group()
     list_count.add_argument(

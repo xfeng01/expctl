@@ -1073,6 +1073,63 @@ def test_status_filtered_limit_scans_in_order_until_enough_rows_match(
     assert loaded == ["20260104-new", "20260103-third", "20260102-match"]
 
 
+def test_list_orders_same_day_requests_by_git_creation_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _pinned_repo(tmp_path)
+    config = load_config(repo)
+    requests = repo / "expctl" / "requests"
+
+    def committed(experiment_id: str, committer_date: str) -> None:
+        (requests / f"{experiment_id}.toml").write_text(
+            EXAMPLE_REQUEST.replace(EXAMPLE_ID, experiment_id), encoding="utf-8"
+        )
+        _git(repo, "add", "-A")
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=expctl tests",
+                "-c",
+                "user.email=expctl@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                experiment_id,
+            ],
+            cwd=repo,
+            check=True,
+            text=True,
+            capture_output=True,
+            env={**os.environ, "GIT_COMMITTER_DATE": committer_date},
+        )
+
+    # Reverse-alphabetical within the day would put banana before apple, and
+    # elder's late commit must not outrank its earlier ID date.
+    committed("20260107-banana", "1700000100 +0000")
+    committed("20260107-apple", "1700000200 +0000")
+    committed("20260106-elder", "1700000300 +0000")
+    (requests / "20260107-canary.toml").write_text(
+        EXAMPLE_REQUEST.replace(EXAMPLE_ID, "20260107-canary"), encoding="utf-8"
+    )
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: None)
+
+    newest = [
+        row["id"] for row in core.list_requests(repo, config, sort_order="newest")
+    ]
+
+    assert newest == [
+        "20260107-canary",
+        "20260107-apple",
+        "20260107-banana",
+        "20260106-elder",
+    ]
+    oldest = [
+        row["id"] for row in core.list_requests(repo, config, sort_order="oldest")
+    ]
+    assert oldest == list(reversed(newest))
+
+
 def test_doctor_reports_repository_and_cluster_readiness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

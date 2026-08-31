@@ -2,6 +2,10 @@
 
 ## 0.11.0 — 2026-08-30
 
+- `list` now orders same-day requests by the commit time that first added
+  each request file instead of alphabetically, so listings follow creation
+  order; an uncommitted request file counts as the newest of its day. The
+  extra `git log` query only runs when a listing contains same-day IDs.
 - `slurm.max_concurrent_nodes` is now optional. Omitting it leaves a request's
   node envelope unlimited, and the pinned script no longer needs a parseable
   `#SBATCH --nodes` unless `scheduler.max_total_nodes` is enabled, in which

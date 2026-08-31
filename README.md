@@ -168,7 +168,10 @@ returns no state, `list` warns once on stderr and keeps affected SLURM rows as
 `submitted`. Local rows are refreshed from the recorded process and status
 file. Receipts are never modified by a refresh.
 
-`list` sorts newest IDs first by default. `--status` is case-insensitive, may
+`list` sorts newest requests first by default: rows are ordered by the ID's
+date, and same-day requests by the commit time that first added their file
+(an uncommitted request file counts as the newest of its day). `--sort
+oldest` reverses the order. `--status` is case-insensitive, may
 contain comma-separated values, and may be repeated. Filtering uses refreshed
 execution states. Each listing verifies pinned commits and scripts with a
 couple of batched `git cat-file` queries rather than one Git process per
