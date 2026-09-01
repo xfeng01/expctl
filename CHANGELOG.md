@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.2 — 2026-09-01
+
+- Receipt updates, staged metrics, and local status files are now written
+  with the umask-derived mode instead of the owner-only mode `mkstemp` gives
+  temporary files. Previously every receipt rewritten after creation (job
+  confirmed, collected, cancelled) ended up `-rw-------`, so collaborators
+  sharing a repository saw those requests as `invalid` in `list`.
+- `list` now titles a receipt it cannot load briefly, such as
+  `unreadable receipt: permission denied` or `unreadable receipt: not valid
+  JSON`, instead of the full path and raw error that the table truncated
+  before the reason was visible.
+
 ## 0.11.1 — 2026-08-31
 
 - The starter request template now includes a commented-out `[local]` /

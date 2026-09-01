@@ -1,6 +1,8 @@
 import json
 import os
+import stat
 import subprocess
+import sys
 import time
 import tomllib
 from pathlib import Path
@@ -1900,6 +1902,84 @@ def test_status_wraps_a_corrupt_receipt(
 
     with pytest.raises(ExpctlError, match="unreadable submission receipt"):
         status_request(repo, config, EXAMPLE_ID)
+
+
+def test_list_titles_unreadable_receipts_briefly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    receipt = _fake_receipt(repo, EXAMPLE_ID)
+    receipt.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: None)
+
+    assert core.list_requests(repo, config) == [
+        {
+            "id": EXAMPLE_ID,
+            "status": "invalid",
+            "title": "unreadable receipt: not valid JSON",
+        }
+    ]
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or getattr(os, "geteuid", lambda: 0)() == 0,
+    reason="needs POSIX file modes enforced against a non-root user",
+)
+def test_list_titles_permission_denied_receipts_briefly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    receipt = _fake_receipt(repo, EXAMPLE_ID)
+    receipt.chmod(0)
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: None)
+
+    try:
+        rows = core.list_requests(repo, config)
+    finally:
+        receipt.chmod(0o644)
+    assert rows == [
+        {
+            "id": EXAMPLE_ID,
+            "status": "invalid",
+            "title": "unreadable receipt: permission denied",
+        }
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX file modes")
+def test_atomic_writes_follow_the_umask_instead_of_mkstemp(tmp_path: Path) -> None:
+    previous = os.umask(0o022)
+    try:
+        receipt = tmp_path / "receipt.json"
+        receipt.write_text("{}", encoding="utf-8")
+        receipt.chmod(0o600)
+        core._atomic_write_json(receipt, {"status": "collected"})
+        assert stat.S_IMODE(receipt.stat().st_mode) == 0o644
+
+        os.umask(0o077)
+        private = tmp_path / "private.json"
+        core._atomic_write_json(private, {"status": "collected"})
+        assert stat.S_IMODE(private.stat().st_mode) == 0o600
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX file modes")
+def test_local_runner_status_file_follows_the_umask(tmp_path: Path) -> None:
+    status_path = tmp_path / "local-status.json"
+    previous = os.umask(0o022)
+    try:
+        subprocess.run(
+            [sys.executable, "-c", core._LOCAL_RUNNER_CODE, str(status_path), "true"],
+            check=False,
+        )
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(status_path.stat().st_mode) == 0o644
+    assert json.loads(status_path.read_text(encoding="utf-8"))["returncode"] == 0
 
 
 def _collectable_receipt(repo: Path, worktree: Path) -> Path:

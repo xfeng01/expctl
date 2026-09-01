@@ -188,6 +188,9 @@ try:
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
+    mask = os.umask(0)
+    os.umask(mask)
+    os.chmod(temporary, 0o666 & ~mask)
     os.replace(temporary, status_path)
 finally:
     if temporary is not None:
@@ -259,8 +262,20 @@ def _plain_name(value: str, field: str) -> str:
     return value
 
 
+def _created_file_mode() -> int:
+    """Permission bits a plain ``open(path, "x")`` would give a new file."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Replace a text file atomically after flushing its complete contents."""
+    """Replace a text file atomically after flushing its complete contents.
+
+    ``mkstemp`` creates the temporary file owner-only, so its mode is reset to
+    the umask-derived default before the rename; otherwise every receipt
+    update would silently become unreadable to collaborators.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
@@ -277,6 +292,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temporary, _created_file_mode())
         os.replace(temporary, path)
     except OSError as exc:
         raise ExpctlError(f"could not atomically write {path}: {exc}") from exc
@@ -4403,6 +4419,22 @@ def _list_color_enabled() -> bool:
 LIST_STATUS_SCAN_BATCH_SIZE = 50
 
 
+def _brief_receipt_error(error: ExpctlError) -> str:
+    """Short list-row title for a receipt that could not be loaded.
+
+    The row already names the request, so the receipt path and the raw
+    exception text only push the useful part off the end of the table.
+    """
+    cause = error.__cause__
+    if isinstance(cause, PermissionError):
+        return "unreadable receipt: permission denied"
+    if isinstance(cause, OSError):
+        return f"unreadable receipt: {cause.strerror or cause}"
+    if isinstance(cause, (UnicodeError, json.JSONDecodeError)):
+        return "unreadable receipt: not valid JSON"
+    return "invalid receipt: expected a JSON object"
+
+
 def _list_row_status(
     repo: Path, config: Config, experiment_id: str
 ) -> tuple[str, str | None]:
@@ -4414,7 +4446,10 @@ def _list_row_status(
     receipt = result_dir(repo, config, experiment_id) / "receipt.json"
     if not receipt.is_file():
         return "requested", None
-    receipt_data = _load_receipt(receipt)
+    try:
+        receipt_data = _load_receipt(receipt)
+    except ExpctlError as exc:
+        raise ExpctlError(_brief_receipt_error(exc)) from exc
     stored_status = receipt_data.get("status")
     status = (
         stored_status if isinstance(stored_status, str) and stored_status else "invalid"
