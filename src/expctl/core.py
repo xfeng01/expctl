@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.11.1"
+__version__ = "0.11.2"
 
 CONFIG_NAME = "expctl.toml"
 DEFAULT_ROOT = "expctl"
