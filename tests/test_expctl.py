@@ -2290,8 +2290,162 @@ def test_collect_refuses_a_job_that_is_still_queued(
         lambda *args: [{"job": "123", "state": "RUNNING", "reason": "None"}],
     )
 
-    with pytest.raises(ExpctlError, match="still in the queue"):
+    with pytest.raises(core.ExpctlNotReady, match="still in the queue"):
         core.collect_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
+
+
+def _submitted_receipt(
+    repo: Path, experiment_id: str, *, worktree: Path, job_id: str | None
+) -> Path:
+    request = repo / "expctl" / "requests" / f"{experiment_id}.toml"
+    directory = repo / "expctl" / "results" / experiment_id
+    directory.mkdir(parents=True)
+    receipt = directory / "receipt.json"
+    payload: dict[str, Any] = {
+        "status": "submitted" if job_id else "submission_unknown",
+        "request_sha256": core._request_hash(request),
+        "worktree": str(worktree),
+    }
+    if job_id:
+        payload["job_id"] = job_id
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+    return receipt
+
+
+def test_collect_all_collects_finished_jobs_and_reports_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree_root, worktree = _collect_worktree(tmp_path)
+    logs = worktree / "logs"
+    logs.mkdir(parents=True)
+    (logs / "example-123_0.out").write_text("gen_ppl: 1\n", encoding="utf-8")
+    finished = _collectable_receipt(repo, worktree)
+    _write_pinned_request(repo, "20251231-done", ZERO_COMMIT)
+    _collected_receipt(repo, "20251231-done")
+    _write_pinned_request(repo, "20260102-running", ZERO_COMMIT)
+    running = _submitted_receipt(
+        repo, "20260102-running", worktree=worktree, job_id="124"
+    )
+    _write_pinned_request(repo, "20260103-broken", ZERO_COMMIT)
+    _submitted_receipt(repo, "20260103-broken", worktree=worktree, job_id=None)
+    _write_pinned_request(repo, "20260104-requested", ZERO_COMMIT)
+    _disable_collection_lock(monkeypatch)
+    monkeypatch.setattr(
+        core,
+        "_queue_status",
+        lambda _repo, job_id: (
+            [{"job": job_id, "state": "RUNNING", "reason": "None"}]
+            if job_id == "124"
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        core, "_scheduler_status", lambda *args: {"state": "COMPLETED", "jobs": []}
+    )
+
+    assert core.uncollected_experiment_ids(repo, config) == [
+        EXAMPLE_ID,
+        "20260102-running",
+        "20260103-broken",
+    ]
+    result = core.collect_submitted(repo, config, worktree_root=worktree_root)
+
+    assert result["uncollected"] == [EXAMPLE_ID, "20260102-running", "20260103-broken"]
+    assert [item["experiment_id"] for item in result["results"]] == [EXAMPLE_ID]
+    assert result["results"][0]["logs"] == [
+        f"expctl/results/{EXAMPLE_ID}/logs/example-123_0.out"
+    ]
+    assert result["pending"] == [
+        {
+            "experiment_id": "20260102-running",
+            "detail": "job 124 is still in the queue (RUNNING=1); "
+            "collect after it leaves",
+        }
+    ]
+    assert [item["experiment_id"] for item in result["failed"]] == ["20260103-broken"]
+    assert "no confirmed job ID" in result["failed"][0]["error"]
+    assert json.loads(finished.read_text(encoding="utf-8"))["status"] == "collected"
+    assert json.loads(running.read_text(encoding="utf-8"))["status"] == "submitted"
+
+    text = core._render_collect_batch_result(result, worktree_root=worktree_root)
+    assert "RESULTS COLLECTED" in text
+    assert "COLLECTED 1 OF 3 SUBMITTED" in text
+    assert "NOT FINISHED" in text and "20260102-running" in text
+    assert "ERROR" in text and "20260103-broken" in text
+    assert "expctl collect --all --worktree-root" in text
+    assert "expctl list" in text
+    assert core._render_collect_batch_result(
+        {"uncollected": [], "results": [], "pending": [], "failed": []},
+        worktree_root=None,
+    ).startswith("No submitted experiments")
+
+    again = core.collect_submitted(repo, config, worktree_root=worktree_root)
+    assert again["uncollected"] == ["20260102-running", "20260103-broken"]
+    assert again["results"] == []
+    assert again["pending"] == result["pending"]
+
+
+def test_collect_all_cli_reports_failures_with_a_nonzero_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _example_repo(tmp_path)
+    monkeypatch.setattr(core, "find_repo_root", lambda: repo)
+    _write_pinned_request(repo, "20260102-running", ZERO_COMMIT)
+    _write_pinned_request(repo, "20260103-broken", ZERO_COMMIT)
+    for experiment_id in (EXAMPLE_ID, "20260102-running", "20260103-broken"):
+        _fake_receipt(repo, experiment_id)
+    attempted: list[tuple[str, Path | None]] = []
+
+    def fake_collect(
+        _repo: Path, _config: Config, experiment_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        attempted.append((experiment_id, kwargs["worktree_root"]))
+        if experiment_id == "20260102-running":
+            raise core.ExpctlNotReady("local job 7 is still running")
+        if experiment_id == "20260103-broken":
+            raise ExpctlError("no log files match logs/example-123_*.out")
+        return {"backend": "slurm", "logs": [], "missing_metrics": []}
+
+    monkeypatch.setattr(core, "collect_request", fake_collect)
+
+    assert core.main(["collect", "--all", "--worktree-root", "wt", "--json"]) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert attempted == [
+        (EXAMPLE_ID, Path("wt")),
+        ("20260102-running", Path("wt")),
+        ("20260103-broken", Path("wt")),
+    ]
+    assert payload["uncollected"] == [
+        EXAMPLE_ID,
+        "20260102-running",
+        "20260103-broken",
+    ]
+    assert [item["experiment_id"] for item in payload["results"]] == [EXAMPLE_ID]
+    assert payload["pending"] == [
+        {"experiment_id": "20260102-running", "detail": "local job 7 is still running"}
+    ]
+    assert payload["failed"][0]["experiment_id"] == "20260103-broken"
+    assert "1 of 3 submitted experiments failed" in captured.err
+
+    (repo / "expctl" / "requests" / "20260103-broken.toml").unlink()
+    assert core.main(["collect", "--all", "--json"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["failed"] == []
+    assert [item["experiment_id"] for item in payload["pending"]] == [
+        "20260102-running"
+    ]
+    assert captured.err == ""
+
+    assert core.main(["collect", "--json"]) == 2
+    assert "exactly one of" in capsys.readouterr().err
+    assert core.main(["collect", EXAMPLE_ID, "--all", "--json"]) == 2
+    assert "exactly one of" in capsys.readouterr().err
 
 
 def test_collect_rejects_colliding_log_basenames(

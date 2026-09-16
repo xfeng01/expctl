@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Added `expctl collect --all`, which collects every submitted request
+  that is not collected yet, oldest ID first. Each request is collected
+  on its own: a job that is still queued or running is reported as not
+  finished and skipped, so the command can be repeated until every job
+  is in, while any other failure is reported without blocking the rest
+  and makes the command exit non-zero.
+
 ## 0.11.2 — 2026-09-01
 
 - Receipt updates, staged metrics, and local status files are now written

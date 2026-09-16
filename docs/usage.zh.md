@@ -186,6 +186,7 @@ expctl cancel <id> --reason "superseded"
 
 ```bash
 expctl collect <id> [--worktree-root <dir>]
+expctl collect --all [--worktree-root <dir>]
 ```
 
 `collect` 会：
@@ -197,6 +198,8 @@ expctl collect <id> [--worktree-root <dir>]
 - 将后端终态写入回执，并把回执状态改为 `collected`。
 
 `collect` 不会等待作业，也不会覆盖已经收集或残留的日志和指标。同一请求的收集过程使用互斥锁串行化；作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或不同来源日志会使用同一目标文件名时都会报错。指标缺失不会阻止失败作业的证据收集，但会明确记录。
+
+`expctl collect --all` 会按 ID 从旧到新处理所有已有回执但尚未收集的请求。每个请求单独收集：作业仍在队列或仍在运行的请求只标记为未完成并跳过，待作业结束后再次运行该命令即可；其他错误（如请求被修改、worktree 不一致、没有匹配日志）只跳过该请求并记录，其余继续；有任何失败时退出码为非零。`--worktree-root` 同样适用于每个请求。
 
 收集之后生成报告骨架并写结论：
 
@@ -296,6 +299,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl logs <id> [--tail <n>] [--follow] [--worktree-root <dir>]` | 查看运行中或已收集的日志；默认显示末尾 100 行 |
 | `expctl cancel <id> [--reason <text>] [--dry-run] [--json]` | 预览或执行后端取消，并在回执中记录审计信息 |
 | `expctl collect <id> [--worktree-root <dir>] [--json]` | 复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致 |
+| `expctl collect --all [--worktree-root <dir>] [--json]` | 按 ID 从旧到新收集所有尚未收集的回执；未结束的作业跳过，单个失败不影响其余请求 |
 | `expctl clean <id> [--dry-run] [--worktree-root <dir>] [--json]` | 结果收集后验证并删除 detached worktree，不删除结果证据 |
 | `expctl report <id> [--json]` | 从请求、回执和指标生成 `results/<id>/report.md` 骨架；已存在时拒绝覆盖 |
 | `expctl rerun <id> [--as <new-id>] [--reason <text>] [--json]` | 把已提交的请求复制为新 ID（默认 `<id>-r2`、`-r3`……），写入 `rerun_of`，供再次提交；commit 和 worktree 不变 |

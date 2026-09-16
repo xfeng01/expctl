@@ -70,6 +70,11 @@ expctl cancel <id> [--reason TEXT] [--dry-run] [--json]
 # Copy logs, extract metrics, and record the execution verdict.
 expctl collect <id> [--worktree-root DIR] [--json]
 
+# Collect every submitted request that is not collected yet, oldest ID
+# first. Jobs still queued or running are reported and skipped; any other
+# failure is reported, the rest continue, and the exit status is non-zero.
+expctl collect --all [--worktree-root DIR] [--json]
+
 # Preview or remove the verified worktree after collection.
 expctl clean <id> [--dry-run] [--worktree-root DIR] [--json]
 
@@ -238,6 +243,8 @@ it with SLURM manually.
   corrupt receipt is unrelated.
 - `collect` verifies the submitted worktree and publishes results once. If
   `submit` used `--worktree-root`, pass the same directory to `collect`.
+  `collect --all` does this for every uncollected receipt and skips jobs
+  that have not finished.
 - `cancel` records the operator, time, and optional reason after the backend
   accepts the request. `clean` never removes an uncollected worktree.
 - `expctl.toml` defines repository policy and should be committed.

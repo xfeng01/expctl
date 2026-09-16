@@ -218,6 +218,10 @@ class ExpctlError(RuntimeError):
     """A user-correctable experiment-control error."""
 
 
+class ExpctlNotReady(ExpctlError):
+    """The job has not finished yet, so its results cannot be collected."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     root: str
@@ -3289,7 +3293,7 @@ def collect_request(
                 receipt, _local_status_path(repo, config, experiment_id)
             )
             if running:
-                raise ExpctlError(
+                raise ExpctlNotReady(
                     f"local job {job_id} is still running; collect after it finishes"
                 )
         else:
@@ -3304,7 +3308,7 @@ def collect_request(
                         }.items()
                     )
                 )
-                raise ExpctlError(
+                raise ExpctlNotReady(
                     f"job {job_id} is still in the queue ({states}); "
                     "collect after it leaves"
                 )
@@ -3424,6 +3428,64 @@ def collect_request(
             raise
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def uncollected_experiment_ids(repo: Path, config: Config) -> list[str]:
+    """IDs of requests with a receipt that is not collected yet, oldest ID first.
+
+    A receipt that cannot be read is included so that `collect` reports why.
+    """
+    requests_dir = repo / config.root / "requests"
+    uncollected: list[str] = []
+    for path in sorted(requests_dir.glob("*.toml")):
+        receipt_path = result_dir(repo, config, path.stem) / "receipt.json"
+        if not receipt_path.is_file():
+            continue
+        try:
+            receipt = _load_receipt(receipt_path)
+        except ExpctlError:
+            uncollected.append(path.stem)
+            continue
+        if receipt.get("status") != "collected":
+            uncollected.append(path.stem)
+    return uncollected
+
+
+def collect_submitted(
+    repo: Path,
+    config: Config,
+    *,
+    worktree_root: Path | None,
+) -> dict[str, Any]:
+    """Collect every submitted request that is not collected yet.
+
+    Requests are handled oldest first and each one on its own, so a problem
+    with one request only skips that request. A job that is still queued or
+    running is reported as pending rather than as a failure, so the command
+    can be repeated until every job has finished; other errors are reported
+    in the result.
+    """
+    uncollected = uncollected_experiment_ids(repo, config)
+    results: list[dict[str, Any]] = []
+    pending: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = []
+    for experiment_id in uncollected:
+        try:
+            collection = collect_request(
+                repo, config, experiment_id, worktree_root=worktree_root
+            )
+        except ExpctlNotReady as exc:
+            pending.append({"experiment_id": experiment_id, "detail": str(exc)})
+        except ExpctlError as exc:
+            failed.append({"experiment_id": experiment_id, "error": str(exc)})
+        else:
+            results.append({"experiment_id": experiment_id, **collection})
+    return {
+        "uncollected": uncollected,
+        "results": results,
+        "pending": pending,
+        "failed": failed,
+    }
 
 
 def report_path(repo: Path, config: Config, experiment_id: str) -> Path:
@@ -4156,6 +4218,45 @@ def _render_collect_result(result: dict[str, Any], *, experiment_id: str) -> str
         ],
         next_steps=[shlex.join(["expctl", "report", experiment_id])],
     )
+
+
+def _render_collect_batch_result(
+    result: dict[str, Any], *, worktree_root: Path | None
+) -> str:
+    uncollected = list(result.get("uncollected", []))
+    if not uncollected:
+        return "No submitted experiments awaiting collection; nothing to collect."
+    sections = [
+        _render_collect_result(item, experiment_id=str(item.get("experiment_id")))
+        for item in result.get("results", [])
+    ]
+    pending = [
+        (str(item.get("experiment_id")), str(item.get("detail")))
+        for item in result.get("pending", [])
+    ]
+    failed = [
+        (str(item.get("experiment_id")), str(item.get("error")))
+        for item in result.get("failed", [])
+    ]
+    done = len(sections)
+    summary = [f"COLLECTED {done} OF {len(uncollected)} SUBMITTED"]
+    if pending:
+        summary.append(_render_table(("EXPERIMENT ID", "NOT FINISHED"), pending))
+    if failed:
+        if pending:
+            summary.append("")
+        summary.append(_render_table(("EXPERIMENT ID", "ERROR"), failed))
+    next_steps: list[str] = []
+    if pending:
+        collect_command = ["expctl", "collect", "--all"]
+        if worktree_root is not None:
+            collect_command.extend(["--worktree-root", str(worktree_root)])
+        next_steps.append(shlex.join(collect_command))
+    if done:
+        next_steps.append("expctl list")
+    if next_steps:
+        summary.extend(["", _render_next_steps(next_steps)])
+    return "\n\n".join(sections + ["\n".join(summary)])
 
 
 def _render_report_result(result: dict[str, Any]) -> str:
@@ -4891,8 +4992,21 @@ def _parser() -> argparse.ArgumentParser:
         help="parent directory used for the submitted experiment worktree",
     )
 
-    collect = subparsers.add_parser("collect", help="copy logs and extract metrics")
-    collect.add_argument("experiment_id", metavar="ID")
+    collect = subparsers.add_parser(
+        "collect",
+        help="copy logs and extract metrics for one request, or every finished one",
+    )
+    collect.add_argument(
+        "experiment_id", metavar="ID", nargs="?", help="request to collect"
+    )
+    collect.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "collect every submitted request that is not collected yet, oldest ID "
+            "first; jobs still queued or running are reported and skipped"
+        ),
+    )
     collect.add_argument(
         "--worktree-root",
         type=Path,
@@ -5170,6 +5284,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 sys.stdout.write(_stdout_safe(_render_logs(result)))
         elif args.command == "collect":
+            if args.all == (args.experiment_id is not None):
+                raise ExpctlError(
+                    "collect needs exactly one of an experiment ID or --all"
+                )
+            if args.all:
+                batch = collect_submitted(
+                    repo, config, worktree_root=args.worktree_root
+                )
+                _print_command_result(
+                    batch,
+                    _render_collect_batch_result(
+                        batch, worktree_root=args.worktree_root
+                    ),
+                    force_json=args.json,
+                )
+                if batch["failed"]:
+                    print(
+                        f"error: {len(batch['failed'])} of "
+                        f"{len(batch['uncollected'])} submitted experiments failed",
+                        file=sys.stderr,
+                    )
+                    return 2
+                return 0
             result = collect_request(
                 repo,
                 config,

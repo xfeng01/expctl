@@ -404,9 +404,11 @@ expctl cancel &lt;id&gt; --reason "superseded"</code></pre>
     <p><code>logs</code> 在运行中读取回执核验的 worktree，收集后读取结果目录。取消时 SLURM 调用 <code>scancel</code>，local 向核验后的进程组发送 <code>SIGTERM</code>；两者都会记录审计信息。取消后的日志仍应收集。</p>
 
     <h3>收集结果</h3>
-<pre data-lang="bash"><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;]</code></pre>
+<pre data-lang="bash"><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;]
+expctl collect --all [--worktree-root &lt;dir&gt;]</code></pre>
     <p><code>collect</code> 会先确认所选后端已经终止，校验请求和 worktree，再暂存并发布日志、提取 <code>metrics.json</code>，最后记录执行终态。</p>
     <p><code>collect</code> 不会等待作业，也不会覆盖已经收集或残留的结果；同一请求的收集过程使用互斥锁串行化。作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或目标文件名冲突时都会报错。</p>
+    <p><code>expctl collect --all</code> 会按 ID 从旧到新处理所有已有回执但尚未收集的请求。每个请求单独收集：作业仍在队列或仍在运行的请求只标记为未完成并跳过，待作业结束后再次运行该命令即可；其他错误（如请求被修改、worktree 不一致、没有匹配日志）只跳过该请求并记录，其余继续；有任何失败时退出码为非零。<code>--worktree-root</code> 同样适用于每个请求。</p>
 
     <h3>生成并填写报告</h3>
 <pre data-lang="bash"><code>expctl report &lt;id&gt;</code></pre>
@@ -495,6 +497,7 @@ root = ".."</code></pre>
         <tr><td><code>expctl logs &lt;id&gt; [--tail N] [--follow] [--worktree-root DIR]</code></td><td>查看运行中或已收集日志；默认显示末尾 100 行</td></tr>
         <tr><td><code>expctl cancel &lt;id&gt; [--reason TEXT] [--dry-run] [--json]</code></td><td>预览或执行后端取消，并记录审计信息</td></tr>
         <tr><td><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;] [--json]</code></td><td>复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致</td></tr>
+        <tr><td><code>expctl collect --all [--worktree-root &lt;dir&gt;] [--json]</code></td><td>按 ID 从旧到新收集所有尚未收集的回执；未结束的作业跳过，单个失败不影响其余请求</td></tr>
         <tr><td><code>expctl clean &lt;id&gt; [--dry-run] [--worktree-root DIR] [--json]</code></td><td>收集后验证并删除 detached worktree，不删除结果证据</td></tr>
         <tr><td><code>expctl report &lt;id&gt; [--json]</code></td><td>从请求、回执和指标生成 <code>results/&lt;id&gt;/report.md</code> 骨架；已存在时拒绝覆盖</td></tr>
         <tr><td><code>expctl rerun &lt;id&gt; [--as &lt;new-id&gt;] [--reason &lt;text&gt;] [--json]</code></td><td>把已提交请求复制为新 ID，保留 commit 和 worktree，供再次提交</td></tr>
