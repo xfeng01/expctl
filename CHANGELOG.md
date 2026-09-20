@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 — 2026-09-19
 
 - Added `expctl submit --backend local`, which runs a `[slurm]` request's
   pinned script on the current host instead of calling `sbatch`. The same
