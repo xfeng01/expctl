@@ -20,6 +20,7 @@ import argparse
 import contextlib
 import dataclasses
 import datetime as dt
+import fnmatch
 import getpass
 import hashlib
 import json
@@ -145,33 +146,9 @@ metrics = ["metric_name"]
 requirements = ["runs/example/ckpt.pt"]
 instructions = "Any non-obvious recovery or rerun instructions."
 """
-_LOCAL_RUNNER_CODE = r"""
-import datetime as dt
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-import tempfile
-
-status_path = Path(sys.argv[1])
-command = sys.argv[2:]
-started_at = dt.datetime.now(dt.timezone.utc).isoformat()
-try:
-    completed = subprocess.run(command, check=False)
-    returncode = completed.returncode
-    error = None
-except BaseException as exc:
-    returncode = 127
-    error = f"{type(exc).__name__}: {exc}"
-payload = {
-    "command": command,
-    "started_at": started_at,
-    "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-    "returncode": returncode,
-}
-if error is not None:
-    payload["error"] = error
+# Both runners end by publishing `payload` to `status_path`, which is the only
+# record `status`, `cancel`, and `collect` read back from a finished local job.
+_LOCAL_STATUS_WRITER_CODE = r"""
 temporary = None
 try:
     with tempfile.NamedTemporaryFile(
@@ -200,6 +177,111 @@ finally:
             pass
 raise SystemExit(returncode)
 """
+
+# Supervises one `[local]` request: a single command, logged by the parent.
+_LOCAL_RUNNER_CODE = (
+    r"""
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+status_path = Path(sys.argv[1])
+command = sys.argv[2:]
+started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+try:
+    completed = subprocess.run(command, check=False)
+    returncode = completed.returncode
+    error = None
+except BaseException as exc:
+    returncode = 127
+    error = f"{type(exc).__name__}: {exc}"
+payload = {
+    "command": command,
+    "started_at": started_at,
+    "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "returncode": returncode,
+}
+if error is not None:
+    payload["error"] = error
+"""
+    + _LOCAL_STATUS_WRITER_CODE
+)
+
+# Supervises a [slurm] request submitted with --backend local: the pinned
+# script runs under bash once per array task, one task at a time, each with
+# its own SLURM identity and its own #SBATCH --output/--error files.
+_LOCAL_SLURM_RUNNER_CODE = (
+    r"""
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+status_path = Path(sys.argv[1])
+plan = json.loads(sys.argv[2])
+started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+tasks = []
+returncode = 0
+error = None
+try:
+    for task in plan["tasks"]:
+        environment = dict(os.environ)
+        environment.update(plan["env"])
+        environment.update(task["env"])
+        record = {
+            "job_id": task["job_id"],
+            "task_id": task["task_id"],
+            "output": task["output"],
+            "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        try:
+            with open(task["output"], "ab") as out:
+                errors = out if task["error"] is None else open(task["error"], "ab")
+                try:
+                    completed = subprocess.run(
+                        plan["argv"],
+                        check=False,
+                        cwd=plan["cwd"],
+                        env=environment,
+                        stdin=subprocess.DEVNULL,
+                        stdout=out,
+                        stderr=errors,
+                    )
+                    record["returncode"] = completed.returncode
+                finally:
+                    if errors is not out:
+                        errors.close()
+        except Exception as exc:
+            record["returncode"] = 127
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        record["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        tasks.append(record)
+        if record["returncode"] and not returncode:
+            returncode = record["returncode"]
+except BaseException as exc:
+    returncode = 127
+    error = f"{type(exc).__name__}: {exc}"
+payload = {
+    "command": plan["argv"],
+    "job_id": plan["job_id"],
+    "started_at": started_at,
+    "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "returncode": returncode,
+    "tasks": tasks,
+}
+if error is not None:
+    payload["error"] = error
+"""
+    + _LOCAL_STATUS_WRITER_CODE
+)
+
 _BUILTIN_TEMPLATE = tomllib.loads(STARTER_TEMPLATE)
 # Fields whose starter-template defaults must be replaced before a request is
 # usable; `validate` rejects a request that still carries any of them.
@@ -644,15 +726,15 @@ def _sbatch_option(
     return value
 
 
-def _array_task_count(specification: str) -> tuple[int, int]:
-    """Return (number of tasks, maximum simultaneously runnable tasks)."""
+def _array_indexes(specification: str) -> tuple[list[int], int]:
+    """Return an ``#SBATCH --array`` value's task indexes and its throttle."""
     expression, separator, throttle_text = specification.rpartition("%")
     if not separator:
         expression, throttle_text = specification, ""
     elif not throttle_text.isdigit() or int(throttle_text) < 1:
         raise ExpctlError(f"invalid #SBATCH --array throttle: {specification}")
 
-    count = 0
+    indexes: list[int] = []
     for item in expression.split(","):
         match = re.fullmatch(r"(\d+)(?:-(\d+)(?::(\d+))?)?", item)
         if not match:
@@ -662,17 +744,23 @@ def _array_task_count(specification: str) -> tuple[int, int]:
             )
         start = int(match.group(1))
         if match.group(2) is None:
-            count += 1
+            indexes.append(start)
             continue
         stop = int(match.group(2))
         step = int(match.group(3) or "1")
         if stop < start or step < 1:
             raise ExpctlError(f"invalid #SBATCH --array range: {item}")
-        count += (stop - start) // step + 1
-    if count < 1:
+        indexes.extend(range(start, stop + 1, step))
+    if not indexes:
         raise ExpctlError("#SBATCH --array must contain at least one task")
-    throttle = int(throttle_text) if throttle_text else count
-    return count, min(count, throttle)
+    throttle = int(throttle_text) if throttle_text else len(indexes)
+    return indexes, throttle
+
+
+def _array_task_count(specification: str) -> tuple[int, int]:
+    """Return (number of tasks, maximum simultaneously runnable tasks)."""
+    indexes, throttle = _array_indexes(specification)
+    return len(indexes), min(len(indexes), throttle)
 
 
 def _script_max_concurrent_nodes(script_lines: list[str], script: str) -> int:
@@ -1450,6 +1538,15 @@ def doctor_repo(repo: Path) -> dict[str, Any]:
             scope="execution",
         )
     )
+    bash_path = shutil.which("bash")
+    checks.append(
+        _doctor_entry(
+            "bash",
+            bash_path is not None,
+            bash_path or "not found on PATH",
+            scope="local",
+        )
+    )
     process_identity = _process_start_token(os.getpid())
     checks.append(
         _doctor_entry(
@@ -1929,12 +2026,52 @@ def _local_process_running(receipt: dict[str, Any], status_path: Path) -> bool:
     return True
 
 
+def _local_task_accounting(
+    completion: dict[str, Any], tasks: list[Any], job_id: str
+) -> dict[str, Any]:
+    """Summarize a locally emulated array job the way sacct reports one."""
+    jobs: list[dict[str, str]] = []
+    details: list[str] = []
+    for position, task in enumerate(tasks):
+        returncode = task.get("returncode") if isinstance(task, dict) else None
+        if not isinstance(returncode, int) or isinstance(returncode, bool):
+            return {
+                "state": "FAILED",
+                "detail": f"invalid task record {position} in local completion status",
+                "jobs": [],
+            }
+        task_job_id = str(task.get("job_id") or f"{job_id}_{position}")
+        jobs.append(
+            {
+                "job_id": task_job_id,
+                "state": "COMPLETED" if returncode == 0 else "FAILED",
+                "exit_code": f"{returncode}:0",
+            }
+        )
+        if task.get("error"):
+            details.append(f"{task_job_id}: {task['error']}")
+    if completion.get("error"):
+        details.append(str(completion["error"]))
+    accounting: dict[str, Any] = {
+        "state": _summarize_slurm_states(row["state"] for row in jobs) or "UNKNOWN",
+        "jobs": jobs,
+        "started_at": completion.get("started_at"),
+        "finished_at": completion.get("finished_at"),
+    }
+    if details:
+        accounting["detail"] = "; ".join(details)
+    return accounting
+
+
 def _local_accounting(
     receipt: dict[str, Any], status_path: Path
 ) -> tuple[dict[str, Any], bool]:
     job_id = str(receipt.get("job_id", "unknown"))
     if status_path.is_file():
         completion = _load_json_object(status_path, "local completion status")
+        tasks = completion.get("tasks")
+        if isinstance(tasks, list) and tasks:
+            return _local_task_accounting(completion, tasks, job_id), False
         returncode = completion.get("returncode")
         if not isinstance(returncode, int) or isinstance(returncode, bool):
             return (
@@ -2110,6 +2247,274 @@ def _start_local_process(
     }
 
 
+# #SBATCH options worth re-exporting so a pinned script reads the same
+# resource numbers locally as it would under SLURM: (long, short, env names).
+_LOCAL_SLURM_PASSTHROUGH: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("--partition", "-p", ("SLURM_JOB_PARTITION",)),
+    ("--account", "-A", ("SLURM_JOB_ACCOUNT",)),
+    ("--cpus-per-task", "-c", ("SLURM_CPUS_PER_TASK",)),
+    ("--ntasks", "-n", ("SLURM_NTASKS", "SLURM_NPROCS")),
+    ("--gpus-per-node", "--gpus-per-node", ("SLURM_GPUS_PER_NODE",)),
+)
+# `%j`, `%A`, and friends in an #SBATCH --output/--error value, with SLURM's
+# optional zero-padding width (`%4a`).
+SLURM_FILENAME_SPEC_RE = re.compile(r"%(\d*)([A-Za-z%])")
+# What SLURM expands `%a` to outside an array job.
+_NOT_AN_ARRAY_TASK = "4294967294"
+
+
+def _local_job_id() -> str:
+    """An eight-digit job ID for a SLURM script that expctl runs locally.
+
+    Nothing allocates job IDs on a single host, so one is drawn at random.
+    Collisions only matter for readability: log paths live inside the
+    experiment's own worktree and each request is submitted once.
+    """
+    return str(10_000_000 + uuid.uuid4().int % 90_000_000)
+
+
+def _expand_slurm_filename(pattern: str, fields: dict[str, str]) -> str:
+    """Expand an #SBATCH --output/--error value the way SLURM names files."""
+
+    def expand(match: re.Match[str]) -> str:
+        width, specifier = match.group(1), match.group(2)
+        if specifier == "%":
+            return "%"
+        value = fields.get(specifier)
+        if value is None:  # Leave an unknown specifier visible instead of empty.
+            return match.group(0)
+        return value.zfill(int(width)) if width and value.isdigit() else value
+
+    return SLURM_FILENAME_SPEC_RE.sub(expand, pattern)
+
+
+def build_local_slurm_plan(
+    request: dict[str, Any],
+    script_lines: list[str],
+    *,
+    worktree: Path,
+    experiment_id: str,
+    job_id: str,
+) -> dict[str, Any]:
+    """Describe how a pinned SLURM script runs on this host.
+
+    The #SBATCH preamble stays a block of comments in the script; it is read
+    here to reproduce what the scheduler would have done with it: the job
+    name, the array task list, the per-task log files, and the SLURM
+    environment each task is started with. Array tasks are listed in index
+    order and run one at a time, because a single host has no queue to
+    spread them over.
+    """
+    slurm = _table(request, "slurm")
+    script = str(slurm["script"]).replace("\\", "/")
+    host = socket.gethostname()
+    user = getpass.getuser()
+    job_name = (
+        _sbatch_option(script_lines, "--job-name", "-J") or PurePosixPath(script).name
+    )
+
+    environment: dict[str, str] = dict(slurm.get("env", {}))
+    environment.update(
+        {
+            "EXPCTL_BACKEND": "local",
+            "EXPCTL_EXPERIMENT_ID": experiment_id,
+            "EXPCTL_JOB_ID": job_id,
+            "SLURM_CLUSTER_NAME": "local",
+            "SLURM_SUBMIT_DIR": str(worktree),
+            "SLURM_SUBMIT_HOST": host,
+            "SLURM_JOB_NAME": job_name,
+            "SLURM_JOB_USER": user,
+            "SLURM_JOB_NUM_NODES": "1",
+            "SLURM_NNODES": "1",
+            "SLURM_JOB_NODELIST": host,
+            "SLURM_NODELIST": host,
+            "SLURM_NODEID": "0",
+            "SLURM_PROCID": "0",
+            "SLURM_LOCALID": "0",
+        }
+    )
+    for long_name, short_name, names in _LOCAL_SLURM_PASSTHROUGH:
+        value = _sbatch_option(script_lines, long_name, short_name)
+        if value is not None:
+            environment.update(dict.fromkeys(names, value))
+
+    array = _sbatch_option(script_lines, "--array", "-a")
+    task_ids = sorted(set(_array_indexes(array)[0])) if array is not None else []
+    output_pattern = _sbatch_option(script_lines, "--output", "-o")
+    if output_pattern is None:
+        output_pattern = "slurm-%A_%a.out" if task_ids else "slurm-%j.out"
+    error_pattern = _sbatch_option(script_lines, "--error", "-e")
+
+    tasks: list[dict[str, Any]] = []
+    for task_id in task_ids or [None]:
+        task_job_id = job_id if task_id is None else f"{job_id}_{task_id}"
+        fields = {
+            "A": job_id,
+            "a": _NOT_AN_ARRAY_TASK if task_id is None else str(task_id),
+            "j": task_job_id,
+            "J": task_job_id,
+            "N": host,
+            "n": "0",
+            "s": "0",
+            "t": "0",
+            "u": user,
+            "x": job_name,
+        }
+        output = _relative_path(
+            _expand_slurm_filename(output_pattern, fields), "#SBATCH --output"
+        )
+        error = (
+            None
+            if error_pattern is None
+            else _relative_path(
+                _expand_slurm_filename(error_pattern, fields), "#SBATCH --error"
+            )
+        )
+        task_environment = {"SLURM_JOB_ID": task_job_id, "SLURM_JOBID": task_job_id}
+        if task_id is not None:
+            task_environment.update(
+                {
+                    "SLURM_ARRAY_JOB_ID": job_id,
+                    "SLURM_ARRAY_TASK_ID": str(task_id),
+                    "SLURM_ARRAY_TASK_COUNT": str(len(task_ids)),
+                    "SLURM_ARRAY_TASK_MIN": str(task_ids[0]),
+                    "SLURM_ARRAY_TASK_MAX": str(task_ids[-1]),
+                }
+            )
+        tasks.append(
+            {
+                "task_id": task_id,
+                "job_id": task_job_id,
+                "output": str(output),
+                "error": None if error is None or error == output else str(error),
+                "env": task_environment,
+            }
+        )
+    return {
+        "job_id": job_id,
+        "argv": ["bash", script],
+        "cwd": str(worktree),
+        "env": environment,
+        "tasks": tasks,
+        "array": array,
+    }
+
+
+def _local_slurm_logs(plan: dict[str, Any]) -> list[str]:
+    """Every log file the plan's tasks write, in task order."""
+    logs: list[str] = []
+    for task in plan["tasks"]:
+        logs.extend(path for path in (task["output"], task["error"]) if path)
+    return list(dict.fromkeys(logs))
+
+
+def _local_slurm_warnings(
+    request: dict[str, Any],
+    plan: dict[str, Any],
+    *,
+    verified_nodes: int | None,
+    job_id: str,
+) -> list[str]:
+    """Flag what a single host cannot reproduce about a SLURM submission."""
+    warnings: list[str] = []
+    if verified_nodes is not None and verified_nodes > 1:
+        warnings.append(
+            f"the script can occupy {verified_nodes} concurrent nodes under SLURM; "
+            "this host runs it one task at a time"
+        )
+    pattern = request["outputs"]["log_glob"].format(job_id=job_id)
+    unmatched = [
+        log for log in _local_slurm_logs(plan) if not fnmatch.fnmatchcase(log, pattern)
+    ]
+    if unmatched:
+        warnings.append(
+            f"outputs.log_glob ({pattern}) does not match "
+            + ", ".join(unmatched)
+            + "; collect only copies logs the glob matches"
+        )
+    return warnings
+
+
+def _start_local_slurm_process(
+    repo: Path,
+    config: Config,
+    experiment_id: str,
+    worktree: Path,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Start the supervisor that runs a pinned SLURM script on this host.
+
+    Every log the plan names is created here, before anything runs, so a
+    submission fails outright instead of part-way through an array when one
+    of its log files is already there.
+    """
+    if fcntl is None or os.name != "posix":
+        raise ExpctlError("local execution requires a Linux compute node")
+    if _process_start_token(os.getpid()) is None:
+        raise ExpctlError(
+            "local execution requires Linux /proc process identity support"
+        )
+    if shutil.which("bash") is None:
+        raise ExpctlError("running a SLURM script locally requires bash on PATH")
+    script = worktree.joinpath(*_relative_path(plan["argv"][1], "slurm.script").parts)
+    if not script.is_file():
+        raise ExpctlError(f"pinned script is missing from the worktree: {script}")
+    status_path = _local_status_path(repo, config, experiment_id)
+    if status_path.exists():
+        raise ExpctlError(f"local completion status already exists: {status_path}")
+
+    created: list[Path] = []
+    started = False
+    try:
+        tasks: list[dict[str, Any]] = []
+        for task in plan["tasks"]:
+            resolved: dict[str, Any] = dict(task)
+            for key in ("output", "error"):
+                if task[key] is None:
+                    continue
+                log_path = worktree.joinpath(*PurePosixPath(task[key]).parts)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    log_path.touch(exist_ok=False)
+                except FileExistsError as exc:
+                    raise ExpctlError(f"local log already exists: {log_path}") from exc
+                created.append(log_path)
+                resolved[key] = str(log_path)
+            tasks.append(resolved)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _LOCAL_SLURM_RUNNER_CODE,
+                str(status_path),
+                json.dumps({**plan, "cwd": str(worktree), "tasks": tasks}),
+            ],
+            cwd=worktree,
+            env=dict(os.environ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        started = True
+    except OSError as exc:
+        raise ExpctlError(f"could not start local experiment: {exc}") from exc
+    finally:
+        if not started:
+            for log_path in created:
+                with contextlib.suppress(OSError):
+                    log_path.unlink(missing_ok=True)
+    return {
+        "job_id": plan["job_id"],
+        "pid": process.pid,
+        "process_start_token": _process_start_token(process.pid),
+        "hostname": socket.gethostname(),
+        "local_status_file": str(status_path.relative_to(repo)).replace("\\", "/"),
+        "logs": _local_slurm_logs(plan),
+    }
+
+
 def submit_request(
     repo: Path,
     config: Config,
@@ -2118,6 +2523,7 @@ def submit_request(
     dry_run: bool,
     skip_node_check: bool,
     worktree_root: Path | None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     path = request_path(repo, config, experiment_id)
     if not path.is_file():
@@ -2134,12 +2540,22 @@ def submit_request(
             f"once; to run it again: expctl rerun {experiment_id}"
         )
 
-    backend, execution = _execution_table(request)
+    request_backend, execution = _execution_table(request)
+    if backend == "slurm" and request_backend == "local":
+        raise ExpctlError("--backend slurm cannot run a request that declares [local]")
+    backend = backend or request_backend
+    # A [slurm] request submitted with --backend local keeps its request,
+    # worktree, and receipt; only the scheduler is replaced by this host.
+    emulate_slurm = backend == "local" and request_backend == "slurm"
     if backend == "local" and skip_node_check:
-        raise ExpctlError("--skip-node-check applies only to SLURM requests")
+        raise ExpctlError("--skip-node-check applies only to SLURM submissions")
     code = _table(request, "code")
     worktree = _worktree_path(repo, config, request, worktree_root)
-    if backend == "slurm":
+    verified_nodes = None
+    plan: dict[str, Any] = {}
+    warnings: list[str] = []
+    job_id = ""
+    if request_backend == "slurm":
         script_lines = _git_text(
             repo, "show", f"{code['commit']}:{execution['script']}"
         ).splitlines()
@@ -2147,11 +2563,26 @@ def submit_request(
             script_lines, execution["script"]
         )
         _check_node_envelope(config, execution, verified_nodes, envelope_error)
+    if emulate_slurm:
+        job_id = _local_job_id()
+        plan = build_local_slurm_plan(
+            request,
+            script_lines,
+            worktree=worktree,
+            experiment_id=experiment_id,
+            job_id=job_id,
+        )
+        warnings = _local_slurm_warnings(
+            request, plan, verified_nodes=verified_nodes, job_id=job_id
+        )
+        command = plan["argv"]
+        execution_environment = None
+        cleared_environment = []
+    elif backend == "slurm":
         policy_options = tuple(_required_sbatch_options(config.required_script_lines))
         command = build_sbatch_command(request, policy_options)
         execution_environment, cleared_environment = _sbatch_environment()
     else:
-        verified_nodes = None
         command = build_local_command(request)
         execution_environment = None
         cleared_environment = []
@@ -2162,14 +2593,26 @@ def submit_request(
         "worktree": str(worktree),
         "command": command,
     }
-    if backend == "slurm":
+    if request_backend == "slurm":
         preview.update(
             {
                 "declared_max_concurrent_nodes": execution.get("max_concurrent_nodes"),
                 "verified_max_concurrent_nodes": verified_nodes,
-                "cleared_sbatch_environment": cleared_environment,
             }
         )
+    if emulate_slurm:
+        preview.update(
+            {
+                "emulated_backend": "slurm",
+                "job_id": job_id,
+                "array": plan["array"],
+                "log": request["outputs"]["log_glob"].format(job_id=job_id),
+                "logs": _local_slurm_logs(plan),
+                "warnings": warnings,
+            }
+        )
+    elif backend == "slurm":
+        preview["cleared_sbatch_environment"] = cleared_environment
     else:
         preview["log"] = request["outputs"]["log_glob"]
     if dry_run:
@@ -2190,17 +2633,31 @@ def submit_request(
         "status": "preparing",
         "command": command,
     }
-    if backend == "slurm":
+    if request_backend == "slurm":
         pending.update(
             {
                 "declared_max_concurrent_nodes": execution.get("max_concurrent_nodes"),
                 "verified_max_concurrent_nodes": verified_nodes,
+            }
+        )
+    if backend == "slurm":
+        pending.update(
+            {
                 "cleared_sbatch_environment": cleared_environment,
                 "sbatch_command": command,
             }
         )
     else:
         pending["hostname"] = socket.gethostname()
+    if emulate_slurm:
+        pending.update(
+            {
+                "emulated_backend": "slurm",
+                "script": execution["script"],
+                "array": plan["array"],
+                "warnings": warnings,
+            }
+        )
     try:
         _exclusive_write_text(
             receipt_path, json.dumps(pending, indent=2, sort_keys=True) + "\n"
@@ -2280,6 +2737,14 @@ def submit_request(
                             f"outcome is unknown and this request is locked. Inspect "
                             f"{receipt_path} and SLURM before taking further action"
                         )
+                elif emulate_slurm:
+                    local_details = _start_local_slurm_process(
+                        repo, config, experiment_id, worktree, plan
+                    )
+                    local_details["log"] = request["outputs"]["log_glob"].format(
+                        job_id=job_id
+                    )
+                    submission_started = True
                 else:
                     job_id = f"local-{attempt_id[:12]}"
                     local_details = _start_local_process(
@@ -2335,6 +2800,7 @@ def submit_requested(
     dry_run: bool,
     skip_node_check: bool,
     worktree_root: Path | None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     """Submit every request without a receipt, continuing past failures.
 
@@ -2355,6 +2821,7 @@ def submit_requested(
                     dry_run=dry_run,
                     skip_node_check=skip_node_check,
                     worktree_root=worktree_root,
+                    backend=backend,
                 )
             )
         except ExpctlError as exc:
@@ -3995,29 +4462,39 @@ def _render_submit_result(
     dry_run: bool,
     worktree_root: Path | None,
     skip_node_check: bool,
+    backend: str | None = None,
 ) -> str:
     experiment_id = str(result["experiment_id"])
-    backend = str(result.get("backend", "slurm"))
+    result_backend = str(result.get("backend", "slurm"))
+    emulated = result.get("emulated_backend")
     nodes = None
-    if backend == "slurm":
+    if "verified_max_concurrent_nodes" in result:
         nodes = _format_node_envelope(
             result.get("verified_max_concurrent_nodes"),
             result.get("declared_max_concurrent_nodes"),
         )
+    warnings = [str(warning) for warning in result.get("warnings", [])]
     fields: list[tuple[str, object]] = [
         ("Experiment", experiment_id),
-        ("Backend", backend),
+        (
+            "Backend",
+            f"{result_backend} ({emulated} script)" if emulated else result_backend,
+        ),
         ("Job", result.get("job_id")),
+        ("Array", result.get("array")),
         ("PID", result.get("pid")),
         ("Host", result.get("hostname")),
         ("Commit", result.get("commit")),
         ("Worktree", result.get("worktree")),
         ("Log", result.get("log")),
         ("Nodes", nodes),
+        ("Warning", "; ".join(warnings) if warnings else None),
     ]
     if dry_run:
         fields.append(("Command", shlex.join(result["command"])))
         submit_command = ["expctl", "submit", experiment_id]
+        if backend is not None:
+            submit_command.extend(["--backend", backend])
         if worktree_root is not None:
             submit_command.extend(["--worktree-root", str(worktree_root)])
         if skip_node_check:
@@ -4040,6 +4517,7 @@ def _render_submit_batch_result(
     dry_run: bool,
     worktree_root: Path | None,
     skip_node_check: bool,
+    backend: str | None = None,
 ) -> str:
     requested = list(result.get("requested", []))
     if not requested:
@@ -4050,6 +4528,7 @@ def _render_submit_batch_result(
             dry_run=dry_run,
             worktree_root=worktree_root,
             skip_node_check=skip_node_check,
+            backend=backend,
         )
         for item in result.get("results", [])
     ]
@@ -4064,6 +4543,8 @@ def _render_submit_batch_result(
         summary.append(_render_table(("EXPERIMENT ID", "ERROR"), list(failed)))
     if dry_run and done:
         submit_command = ["expctl", "submit", "--all"]
+        if backend is not None:
+            submit_command.extend(["--backend", backend])
         if worktree_root is not None:
             submit_command.extend(["--worktree-root", str(worktree_root)])
         if skip_node_check:
@@ -4924,6 +5405,14 @@ def _parser() -> argparse.ArgumentParser:
         help="submit every request that has no receipt yet, oldest ID first",
     )
     submit.add_argument(
+        "--backend",
+        choices=("slurm", "local"),
+        help=(
+            "override the backend a [slurm] request runs on; --backend local "
+            "runs its pinned script on this host instead of calling sbatch"
+        ),
+    )
+    submit.add_argument(
         "--dry-run",
         action="store_true",
         help="validate and preview without creating a worktree or starting the job",
@@ -5189,6 +5678,7 @@ def main(argv: list[str] | None = None) -> int:
                     dry_run=args.dry_run,
                     skip_node_check=args.skip_node_check,
                     worktree_root=args.worktree_root,
+                    backend=args.backend,
                 )
                 _print_command_result(
                     batch,
@@ -5197,6 +5687,7 @@ def main(argv: list[str] | None = None) -> int:
                         dry_run=args.dry_run,
                         worktree_root=args.worktree_root,
                         skip_node_check=args.skip_node_check,
+                        backend=args.backend,
                     ),
                     force_json=args.json,
                 )
@@ -5215,6 +5706,7 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 skip_node_check=args.skip_node_check,
                 worktree_root=args.worktree_root,
+                backend=args.backend,
             )
             _print_command_result(
                 result,
@@ -5223,6 +5715,7 @@ def main(argv: list[str] | None = None) -> int:
                     dry_run=args.dry_run,
                     worktree_root=args.worktree_root,
                     skip_node_check=args.skip_node_check,
+                    backend=args.backend,
                 ),
                 force_json=args.json,
             )

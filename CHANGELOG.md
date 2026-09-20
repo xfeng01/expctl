@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Added `expctl submit --backend local`, which runs a `[slurm]` request's
+  pinned script on the current host instead of calling `sbatch`. The same
+  request file now works both ways: the request, worktree, receipt, and
+  collected evidence are unchanged, so a colleague can submit it to the
+  cluster while you run it on one machine. The `#SBATCH` preamble stays a
+  block of comments and is read to reproduce what the scheduler would have
+  done: the script runs under `bash` in a detached process group with
+  `SLURM_SUBMIT_DIR`, `SLURM_JOB_ID`, `SLURM_JOB_NAME`, the resource
+  variables derived from `#SBATCH`, and `[slurm.env]` exported; `--array`
+  tasks run one at a time in index order with the `SLURM_ARRAY_*` variables
+  set; and `--output`/`--error` are expanded like SLURM expands them. `status`
+  reads the recorded process and its exit status instead of `squeue` and
+  `sacct`, `cancel` signals the process group instead of calling `scancel`,
+  and `collect` records the same per-task `job_id`, `state`, and `exit_code`
+  rows `sacct` would have produced. `submit` warns about what one host cannot
+  reproduce — a multi-node envelope, or `#SBATCH --output` names that
+  `outputs.log_glob` does not match. `--backend slurm` refuses a `[local]`
+  request, `--backend local` is a no-op for one, and `doctor --backend local`
+  now also checks for `bash`.
+
 - Added `expctl collect --all`, which collects every submitted request
   that is not collected yet, oldest ID first. Each request is collected
   on its own: a job that is still queued or running is reported as not

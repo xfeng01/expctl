@@ -621,6 +621,155 @@ def test_script_node_envelope_includes_array_throttle() -> None:
     )
 
 
+SLURM_ARRAY_SCRIPT = """\
+#!/bin/bash
+#SBATCH -p example-partition
+#SBATCH --job-name=sweep
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=8
+#SBATCH --array=0-2
+#SBATCH --output=logs/example-%A_%a.out
+echo running
+"""
+
+
+def test_array_indexes_list_every_task_with_its_throttle() -> None:
+    assert core._array_indexes("0-3") == ([0, 1, 2, 3], 4)
+    assert core._array_indexes("1,4-8:2%2") == ([1, 4, 6, 8], 2)
+    assert core._array_task_count("0-9%3") == (10, 3)
+    with pytest.raises(ExpctlError, match="throttle"):
+        core._array_indexes("0-3%0")
+
+
+def test_slurm_output_patterns_expand_like_the_scheduler() -> None:
+    fields = {"A": "42", "a": "7", "j": "42_7", "u": "ada", "x": "sweep"}
+
+    assert (
+        core._expand_slurm_filename("logs/%x-%A_%a.out", fields)
+        == "logs/sweep-42_7.out"
+    )
+    assert core._expand_slurm_filename("logs/%j-%3a.out", fields) == "logs/42_7-007.out"
+    assert core._expand_slurm_filename("100%% -%u-%Q", fields) == "100% -ada-%Q"
+
+
+def test_local_slurm_plan_maps_array_tasks_onto_one_host(tmp_path: Path) -> None:
+    request = tomllib.loads(EXAMPLE_REQUEST)
+    worktree = tmp_path / "worktree"
+
+    plan = core.build_local_slurm_plan(
+        request,
+        SLURM_ARRAY_SCRIPT.splitlines(),
+        worktree=worktree,
+        experiment_id=EXAMPLE_ID,
+        job_id="90000001",
+    )
+
+    assert plan["argv"] == ["bash", "scripts/sweep.slurm"]
+    assert plan["array"] == "0-2"
+    assert plan["env"]["SLURM_SUBMIT_DIR"] == str(worktree)
+    assert plan["env"]["SLURM_JOB_NAME"] == "sweep"
+    assert plan["env"]["SLURM_JOB_PARTITION"] == "example-partition"
+    assert plan["env"]["SLURM_CPUS_PER_TASK"] == "8"
+    assert plan["env"]["NUM_SAMPLES"] == "256"
+    assert [task["task_id"] for task in plan["tasks"]] == [0, 1, 2]
+    assert [task["output"] for task in plan["tasks"]] == [
+        f"logs/example-90000001_{index}.out" for index in range(3)
+    ]
+    assert plan["tasks"][0]["env"] == {
+        "SLURM_JOB_ID": "90000001_0",
+        "SLURM_JOBID": "90000001_0",
+        "SLURM_ARRAY_JOB_ID": "90000001",
+        "SLURM_ARRAY_TASK_ID": "0",
+        "SLURM_ARRAY_TASK_COUNT": "3",
+        "SLURM_ARRAY_TASK_MIN": "0",
+        "SLURM_ARRAY_TASK_MAX": "2",
+    }
+    assert core._local_slurm_warnings(
+        request, plan, verified_nodes=3, job_id="90000001"
+    ) == [
+        (
+            "the script can occupy 3 concurrent nodes under SLURM; "
+            "this host runs it one task at a time"
+        )
+    ]
+
+
+def test_local_slurm_plan_falls_back_to_slurm_default_log_names(
+    tmp_path: Path,
+) -> None:
+    request = tomllib.loads(EXAMPLE_REQUEST)
+
+    plan = core.build_local_slurm_plan(
+        request,
+        ["#!/bin/bash", "#SBATCH --nodes=1"],
+        worktree=tmp_path / "worktree",
+        experiment_id=EXAMPLE_ID,
+        job_id="90000002",
+    )
+
+    assert plan["array"] is None
+    assert plan["tasks"][0]["task_id"] is None
+    assert plan["tasks"][0]["output"] == "slurm-90000002.out"
+    assert plan["tasks"][0]["env"]["SLURM_JOB_ID"] == "90000002"
+    assert core._local_slurm_warnings(
+        request, plan, verified_nodes=1, job_id="90000002"
+    ) == [
+        (
+            "outputs.log_glob (logs/example-90000002_*.out) does not match "
+            "slurm-90000002.out; collect only copies logs the glob matches"
+        )
+    ]
+
+
+def test_local_slurm_plan_separates_a_distinct_error_file(tmp_path: Path) -> None:
+    def plan_for(*directives: str) -> dict[str, Any]:
+        return core.build_local_slurm_plan(
+            tomllib.loads(EXAMPLE_REQUEST),
+            ["#SBATCH --nodes=1", *directives],
+            worktree=tmp_path / "worktree",
+            experiment_id=EXAMPLE_ID,
+            job_id="90000003",
+        )
+
+    separate = plan_for("#SBATCH -o logs/a-%j.out", "#SBATCH -e logs/a-%j.err")
+    assert separate["tasks"][0]["output"] == "logs/a-90000003.out"
+    assert separate["tasks"][0]["error"] == "logs/a-90000003.err"
+
+    merged = plan_for("#SBATCH -o logs/a-%j.out", "#SBATCH -e logs/a-%j.out")
+    assert merged["tasks"][0]["error"] is None
+
+    with pytest.raises(ExpctlError, match="must stay inside the repository"):
+        plan_for("#SBATCH --output=/var/log/%j.out")
+
+
+def test_local_task_accounting_reports_each_array_task(tmp_path: Path) -> None:
+    status_path = tmp_path / "local-status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "returncode": 1,
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": "2026-01-01T00:01:00+00:00",
+                "tasks": [
+                    {"job_id": "7_0", "task_id": 0, "returncode": 0},
+                    {"job_id": "7_1", "task_id": 1, "returncode": 1, "error": "boom"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accounting, running = core._local_accounting({"job_id": "7"}, status_path)
+
+    assert running is False
+    assert accounting["state"] == "MIXED"
+    assert accounting["jobs"] == [
+        {"job_id": "7_0", "state": "COMPLETED", "exit_code": "0:0"},
+        {"job_id": "7_1", "state": "FAILED", "exit_code": "1:0"},
+    ]
+    assert accounting["detail"] == "7_1: boom"
+
+
 def test_required_scheduler_line_after_code_is_not_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3026,6 +3175,244 @@ def test_local_backend_cancels_and_collects_an_actual_process_group(
     collection = core.collect_request(repo, config, EXAMPLE_ID)
     assert collection["scheduler"]["state"] == "CANCELLED"
     assert collection["missing_metrics"] == ["score"]
+
+
+def test_parser_exposes_the_submit_backend_override() -> None:
+    parser = core._parser()
+
+    assert parser.parse_args(["submit", EXAMPLE_ID, "--backend", "local"]).backend == (
+        "local"
+    )
+    assert parser.parse_args(["submit", "--all"]).backend is None
+
+
+def test_backend_local_previews_a_slurm_request_without_calling_sbatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    _stub_submit_preflight(monkeypatch, repo, tomllib.loads(EXAMPLE_REQUEST))
+    monkeypatch.setattr(core, "_git_text", lambda *args: SLURM_ARRAY_SCRIPT)
+    monkeypatch.setattr(
+        core,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("submit must not shell out to SLURM"),
+    )
+
+    preview = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=True,
+        skip_node_check=False,
+        worktree_root=None,
+        backend="local",
+    )
+
+    assert preview["backend"] == "local"
+    assert preview["emulated_backend"] == "slurm"
+    assert preview["command"] == ["bash", "scripts/sweep.slurm"]
+    assert preview["array"] == "0-2"
+    assert preview["verified_max_concurrent_nodes"] == 3
+    assert preview["logs"] == [
+        f"logs/example-{preview['job_id']}_{index}.out" for index in range(3)
+    ]
+    assert "sbatch_command" not in preview
+    rendered = core._render_submit_result(
+        preview,
+        dry_run=True,
+        worktree_root=None,
+        skip_node_check=False,
+        backend="local",
+    )
+    assert "local (slurm script)" in rendered
+    assert f"expctl submit {EXAMPLE_ID} --backend local" in rendered
+
+
+def test_backend_overrides_reject_impossible_combinations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    _stub_submit_preflight(monkeypatch, repo, tomllib.loads(EXAMPLE_REQUEST))
+
+    with pytest.raises(ExpctlError, match="only to SLURM submissions"):
+        submit_request(
+            repo,
+            config,
+            EXAMPLE_ID,
+            dry_run=True,
+            skip_node_check=True,
+            worktree_root=None,
+            backend="local",
+        )
+
+
+def test_backend_slurm_cannot_run_a_local_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path, LOCAL_REQUEST)
+    config = load_config(repo)
+    _stub_submit_preflight(monkeypatch, repo, tomllib.loads(LOCAL_REQUEST))
+
+    with pytest.raises(ExpctlError, match=r"request that declares \[local\]"):
+        submit_request(
+            repo,
+            config,
+            EXAMPLE_ID,
+            dry_run=True,
+            skip_node_check=False,
+            worktree_root=None,
+            backend="slurm",
+        )
+
+
+def _local_slurm_e2e_repo(tmp_path: Path, script_body: str) -> tuple[Path, Config]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "expctl.toml").write_text(
+        EXAMPLE_CONFIG.replace('root = ".."', 'root = "../worktrees"'),
+        encoding="utf-8",
+    )
+    script = repo / "scripts" / "sweep.slurm"
+    script.parent.mkdir()
+    script.write_text(script_body, encoding="utf-8")
+    commit = _commit_all(repo, "slurm fixture")
+    (repo / "expctl" / "requests").mkdir(parents=True)
+    _write_pinned_request(repo, EXAMPLE_ID, commit)
+    return repo, load_config(repo)
+
+
+def _await_terminal_status(
+    repo: Path, config: Config, timeout: float
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while True:
+        status = status_request(repo, config, EXAMPLE_ID)
+        if core._status_is_terminal(status):
+            return status
+        if time.monotonic() >= deadline:
+            pytest.fail(f"local experiment did not finish: {status}")
+        time.sleep(0.05)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="local execution is Linux-only")
+def test_backend_local_runs_a_pinned_slurm_array_end_to_end(tmp_path: Path) -> None:
+    repo, config = _local_slurm_e2e_repo(
+        tmp_path,
+        "#!/bin/bash\n"
+        "#SBATCH -p example-partition\n"
+        "#SBATCH --job-name=sweep\n"
+        "#SBATCH --nodes=1\n"
+        "#SBATCH --array=0-2\n"
+        "#SBATCH --output=logs/example-%A_%a.out\n"
+        "set -eu\n"
+        'echo "submit_dir $SLURM_SUBMIT_DIR"\n'
+        'echo "job $SLURM_JOB_ID of $SLURM_ARRAY_TASK_COUNT"\n'
+        'echo "samples $NUM_SAMPLES"\n'
+        'echo "gen_ppl: 1${SLURM_ARRAY_TASK_ID}.5"\n',
+    )
+
+    receipt = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=False,
+        skip_node_check=False,
+        worktree_root=None,
+        backend="local",
+    )
+
+    assert receipt["backend"] == "local"
+    assert receipt["emulated_backend"] == "slurm"
+    assert receipt["job_id"].isdigit()
+    assert receipt["array"] == "0-2"
+    assert receipt["command"] == ["bash", "scripts/sweep.slurm"]
+    assert receipt["warnings"] == [
+        (
+            "the script can occupy 3 concurrent nodes under SLURM; "
+            "this host runs it one task at a time"
+        )
+    ]
+
+    status = _await_terminal_status(repo, config, timeout=30)
+    assert core._status_state(status) == "COMPLETED"
+
+    collection = core.collect_request(repo, config, EXAMPLE_ID)
+    assert collection["scheduler"]["state"] == "COMPLETED"
+    assert [row["job_id"] for row in collection["scheduler"]["jobs"]] == [
+        f"{receipt['job_id']}_{index}" for index in range(3)
+    ]
+    assert collection["missing_metrics"] == []
+
+    results = repo / "expctl" / "results" / EXAMPLE_ID
+    metrics = json.loads((results / "metrics.json").read_text(encoding="utf-8"))
+    assert sorted(value["gen_ppl"] for value in metrics.values()) == [10.5, 11.5, 12.5]
+    first = (results / "logs" / f"example-{receipt['job_id']}_0.out").read_text(
+        encoding="utf-8"
+    )
+    assert f"submit_dir {receipt['worktree']}" in first
+    assert f"job {receipt['job_id']}_0 of 3" in first
+    assert "samples 256" in first
+
+    completion = json.loads((results / "local-status.json").read_text(encoding="utf-8"))
+    boundaries = [
+        (task["started_at"], task["finished_at"]) for task in completion["tasks"]
+    ]
+    assert all(
+        finished <= boundaries[index + 1][0]
+        for index, (_, finished) in enumerate(boundaries[:-1])
+    ), f"array tasks overlapped: {boundaries}"
+
+    assert core.report_request(repo, config, EXAMPLE_ID)["backend"] == "local"
+    assert core.list_requests(repo, config)[0]["status"] == "reviewed"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="local execution is Linux-only")
+def test_cancelling_a_local_slurm_array_stops_its_remaining_tasks(
+    tmp_path: Path,
+) -> None:
+    repo, config = _local_slurm_e2e_repo(
+        tmp_path,
+        "#!/bin/bash\n"
+        "#SBATCH -p example-partition\n"
+        "#SBATCH --nodes=1\n"
+        "#SBATCH --array=0-1\n"
+        "#SBATCH --output=logs/example-%A_%a.out\n"
+        'echo "started $SLURM_ARRAY_TASK_ID"\n'
+        "sleep 30\n",
+    )
+    receipt = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=False,
+        skip_node_check=False,
+        worktree_root=None,
+        backend="local",
+    )
+    worktree = Path(receipt["worktree"])
+    logs = [
+        worktree / "logs" / f"example-{receipt['job_id']}_{index}.out"
+        for index in range(2)
+    ]
+
+    deadline = time.monotonic() + 10
+    while not logs[0].read_text(encoding="utf-8"):
+        if time.monotonic() >= deadline:
+            pytest.fail("the first array task never started")
+        time.sleep(0.05)
+
+    core.cancel_request(repo, config, EXAMPLE_ID, reason="test")
+    status = _await_terminal_status(repo, config, timeout=10)
+
+    assert core._status_state(status) == "CANCELLED"
+    assert logs[0].read_text(encoding="utf-8") == "started 0\n"
+    assert logs[1].read_text(encoding="utf-8") == ""
+    collection = core.collect_request(repo, config, EXAMPLE_ID)
+    assert collection["scheduler"]["state"] == "CANCELLED"
+    assert len(collection["logs"]) == 2
 
 
 def test_version_matches_pyproject() -> None:

@@ -5,15 +5,19 @@ An author publishes an immutable request; a runner reviews, submits, monitors,
 and collects it. Git preserves the handoff and its audit trail.
 
 It supports two execution backends: SLURM and direct execution on a Linux
-compute node. It is not a scheduler, workflow engine, or experiment tracker.
+compute node. A request pinned to SLURM can also be run on a single host with
+`expctl submit --backend local`, which leaves the request, the receipt, and the
+collected evidence identical. It is not a scheduler, workflow engine, or
+experiment tracker.
 
 [Changelog](CHANGELOG.md)
 
 ## Install
 
 Every machine needs Git and Python 3.11 or newer. Direct execution requires a
-Linux host with `/proc`. The SLURM backend also needs `sbatch`, `squeue`,
-`sacct`, and `scancel`; node-budget checks use `scontrol`.
+Linux host with `/proc`, plus `bash` to run a SLURM script locally. The SLURM
+backend also needs `sbatch`, `squeue`, `sacct`, and `scancel`; node-budget
+checks use `scontrol`.
 
 ```bash
 uv tool install git+https://github.com/xfeng01/expctl
@@ -51,12 +55,13 @@ expctl show <id>
 expctl validate <id>
 
 # Preview or submit through the backend declared by the request.
-expctl submit <id> [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
+# --backend local runs a [slurm] request's pinned script on this host.
+expctl submit <id> [--backend slurm|local] [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
 
 # Submit every request that has no receipt yet, oldest ID first. Each request
 # is validated and submitted on its own; failures are reported and the rest
 # continue, and the exit status is non-zero if any failed.
-expctl submit --all [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
+expctl submit --all [--backend slurm|local] [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
 
 # Show detailed state once, or refresh until the job finishes.
 expctl status <id> [--watch [SECONDS]] [--json]
@@ -90,8 +95,8 @@ expctl --help
 expctl <command> --help
 ```
 
-`--skip-node-check` applies only to SLURM. It bypasses the cross-job node-budget
-check and requires explicit operator authorization.
+`--skip-node-check` applies only to SLURM submissions. It bypasses the
+cross-job node-budget check and requires explicit operator authorization.
 
 Set a repository-wide default row count in `expctl.toml`:
 
@@ -148,6 +153,57 @@ recorded process group.
 Local mode is intended for a machine where compute resources are already
 allocated. It provides no queue, resource isolation, or restart after the host
 reboots.
+
+### Running a SLURM request locally
+
+```bash
+expctl submit <id> --backend local
+```
+
+`--backend local` runs a `[slurm]` request's pinned script on the current host
+instead of calling `sbatch`. Nothing else about the request changes: the same
+file, worktree, receipt, and collected evidence work whether a colleague sends
+it to the cluster or you run it on one machine.
+
+The `#SBATCH` preamble stays a block of comments in the script. expctl reads it
+to reproduce what the scheduler would have done with it:
+
+- the script runs under `bash` in its detached worktree, supervised by a
+  detached process group, with `SLURM_SUBMIT_DIR`, `SLURM_SUBMIT_HOST`,
+  `SLURM_JOB_ID`, `SLURM_JOB_NAME`, `SLURM_JOB_USER`, the single-node
+  variables, and `[slurm.env]` exported to every task;
+- `#SBATCH --partition`, `--account`, `--cpus-per-task`, `--ntasks`, and
+  `--gpus-per-node` are re-exported as `SLURM_JOB_PARTITION`,
+  `SLURM_JOB_ACCOUNT`, `SLURM_CPUS_PER_TASK`, `SLURM_NTASKS`/`SLURM_NPROCS`,
+  and `SLURM_GPUS_PER_NODE`;
+- `#SBATCH --array` runs its tasks one at a time, in index order, each with
+  `SLURM_ARRAY_JOB_ID`, `SLURM_ARRAY_TASK_ID`, `SLURM_ARRAY_TASK_COUNT`,
+  `SLURM_ARRAY_TASK_MIN`, and `SLURM_ARRAY_TASK_MAX`. A `%N` throttle is
+  recorded but not honoured: one host has no queue to spread tasks over;
+- `#SBATCH --output` and `--error` are expanded the way SLURM expands them
+  (`%j`, `%A`, `%a`, `%x`, `%N`, `%u`, `%%`, and widths such as `%4a`), and
+  default to `slurm-%j.out`, or `slurm-%A_%a.out` for an array. Every log is
+  created before anything runs, so a submission fails outright instead of
+  part-way through an array.
+
+The job ID is an eight-digit number drawn on this host; an array task's
+`SLURM_JOB_ID` is `<job id>_<task id>`. The receipt records `backend = "local"`
+with `emulated_backend = "slurm"`, and `collect` writes the same per-task
+`job_id`, `state`, and `exit_code` rows `sacct` would have produced, so reports
+and metrics come out in the cluster's format. `status` reads the recorded
+process and exit-status file instead of `squeue` and `sacct`; `cancel` sends
+`SIGTERM` to the process group instead of calling `scancel`, which stops the
+running task and every array task after it.
+
+`submit` warns when a single host cannot reproduce the submission: a script
+that could occupy several nodes under SLURM, or `#SBATCH --output` names that
+`outputs.log_glob` does not match. Nothing enforces the rest of the `#SBATCH`
+resource request — there is no partition, node isolation, or time limit.
+
+`--backend local` on a request that already declares `[local]` changes nothing,
+so `submit --all --backend local` stays usable in a mixed repository.
+`--backend slurm` refuses a `[local]` request, and `--skip-node-check` is
+refused with `--backend local`.
 
 `new` refuses a dirty working tree because uncommitted changes are not part of
 the pinned `HEAD`; `--allow-dirty` is an explicit override. `validate` rejects
@@ -234,8 +290,10 @@ it with SLURM manually.
 - A request pins a full commit, backend script and settings, expected logs,
   and decision rule. Do not edit it after a receipt exists.
 - `submit` uses a clean detached worktree at the pinned commit. SLURM requests
-  verify resource policy and record a scheduler job ID; local requests record
-  a process identity and exit-status file.
+  verify resource policy and record a scheduler job ID; local runs record a
+  process identity and exit-status file. A `[slurm]` request run with
+  `--backend local` still verifies its node envelope, but no node budget is
+  reserved: this host is not the cluster.
 - Each request gets at most one submission attempt. Never delete a receipt to
   resubmit; use `rerun` to create a new ID.
 - An unreadable or structurally invalid receipt blocks worktree reuse and

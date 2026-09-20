@@ -22,7 +22,9 @@ weaken the repository's own cluster and branch rules here.
   the operator the pinned commit, script, runtime requirements, backend
   settings, and `--dry-run` output. An explicit request to consume compute
   resources is required before the real `expctl submit <id>`; never substitute
-  an ad hoc `sbatch` or direct script invocation.
+  an ad hoc `sbatch` or direct script invocation. Only pass `--backend local`
+  when the operator asks for a `[slurm]` request to run on this host instead
+  of the cluster, and report its warnings before starting.
 - To check a submitted run, use `expctl status <id>` or `--watch`; use
   `expctl logs <id> --tail 100` for evidence and `--follow` only when ongoing
   monitoring is requested. Report execution state factually; do not collect

@@ -321,7 +321,7 @@
       </div>
     </div>
     <p class="muted" style="margin-top:18px;max-width:720px">
-      expctl 支持 SLURM 和在已分配 Linux 计算节点上的直接异步执行。它不替代调度器、工作流引擎或实验跟踪平台；只负责让实验交接可验证、可审计。回执生成后，请求文件不得再修改。
+      expctl 支持 SLURM 和在已分配 Linux 计算节点上的直接异步执行；固定到 SLURM 的请求也可以用 <code>submit --backend local</code> 在单台机器上跑，账本格式一致。它不替代调度器、工作流引擎或实验跟踪平台；只负责让实验交接可验证、可审计。回执生成后，请求文件不得再修改。
     </p>
   </header>
 
@@ -341,7 +341,7 @@
 
   <main>
     <h2 id="install"><span class="num">一</span>安装（每台机器一次）</h2>
-    <p>所有机器都需要 Git 和 Python 3.11 或更高版本。local 后端需要带 <code>/proc</code> 的 Linux 环境；SLURM 后端还需要 <code>sbatch</code>、<code>squeue</code>、<code>sacct</code>、<code>scancel</code>，启用节点预算时还会使用 <code>scontrol</code>。推荐使用 <code>uv</code> 安装：</p>
+    <p>所有机器都需要 Git 和 Python 3.11 或更高版本。local 后端需要带 <code>/proc</code> 的 Linux 环境，在本机运行 SLURM 脚本还需要 <code>bash</code>；SLURM 后端还需要 <code>sbatch</code>、<code>squeue</code>、<code>sacct</code>、<code>scancel</code>，启用节点预算时还会使用 <code>scontrol</code>。推荐使用 <code>uv</code> 安装：</p>
 <pre data-lang="bash"><code>uv tool install git+https://github.com/xfeng01/expctl</code></pre>
     <p>更新，以及查看当前安装的版本：</p>
 <pre data-lang="bash"><code>uv tool upgrade expctl
@@ -377,6 +377,13 @@ expctl/
     <h2 id="runner"><span class="num">四</span>提交、查看和收集</h2>
     <p>每个请求必须且只能选择一种后端。SLURM 使用 <code>[slurm]</code>、<code>script</code>、可选的 <code>max_concurrent_nodes</code> 和可选的 <code>[slurm.env]</code>；计算节点直跑使用 <code>[local]</code>、<code>script</code>、可选的 <code>args</code> 和 <code>[local.env]</code>。</p>
     <div class="note"><p>local 脚本必须在 Git 中带可执行位；<code>outputs.log_glob</code> 必须是含 <code>{job_id}</code> 的精确路径，不能使用通配符。local 会捕获 stdout/stderr，固定启动节点主机名，并用 Linux <code>/proc</code> 核对 PID 身份；状态、取消和收集必须在同一节点执行。它不提供排队、资源隔离或主机重启恢复。</p></div>
+
+    <h3>在本机运行 SLURM 请求</h3>
+<pre data-lang="bash"><code>expctl submit &lt;id&gt; --backend local</code></pre>
+    <p><code>--backend local</code> 不调用 <code>sbatch</code>，而是把 <code>[slurm]</code> 请求固定的脚本放在当前主机上跑；请求、worktree、回执和收集到的证据都不变。脚本里的 <code>#SBATCH</code> 行仍然只是注释，expctl 读它来复现调度器本会做的事：脚本在自己的 worktree 中由 <code>bash</code> 执行、进程组独立，并导出 <code>SLURM_SUBMIT_DIR</code>、<code>SLURM_JOB_ID</code>、<code>SLURM_JOB_NAME</code> 以及由 <code>--partition</code>、<code>--account</code>、<code>--cpus-per-task</code>、<code>--ntasks</code>、<code>--gpus-per-node</code> 推出的资源变量；<code>--array</code> 的任务按下标顺序一个接一个地跑，各自带齐 <code>SLURM_ARRAY_*</code>；<code>--output</code> 和 <code>--error</code> 按 <code>%j</code>、<code>%A</code>、<code>%a</code> 等规则展开，所有日志在任何任务开始前创建。</p>
+    <p>作业号是本机生成的八位数字，数组任务为 <code>&lt;作业号&gt;_&lt;任务号&gt;</code>。回执记录 <code>backend = "local"</code> 与 <code>emulated_backend = "slurm"</code>；<code>status</code> 改看进程和退出状态文件，<code>cancel</code> 改向进程组发 <code>SIGTERM</code>，<code>collect</code> 写入与 <code>sacct</code> 同形状的逐任务终态。</p>
+    <div class="note"><p>单机不执行 <code>#SBATCH</code> 的资源申请：没有分区、节点隔离或时间上限。<code>submit</code> 会对可能占用多节点的脚本，以及与 <code>outputs.log_glob</code> 对不上的 <code>--output</code> 文件名给出警告。<code>--skip-node-check</code> 属于 SLURM，不能与 <code>--backend local</code> 同用；<code>--backend slurm</code> 会拒绝 <code>[local]</code> 请求。</p></div>
+
     <p>在执行主机上的项目仓库里：</p>
 <pre data-lang="bash"><code>git pull --ff-only
 expctl list
@@ -388,7 +395,7 @@ expctl submit --all</code></pre>
     <p><code>expctl list</code> 在交互终端中显示对齐表格，管道输出保持稳定 TSV。它批量刷新 SLURM 状态，并从进程身份和退出状态文件刷新 local 状态；刷新只读且不修改回执。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式。</p>
     <p><code>list</code> 默认从新到旧排列：先按 ID 中的日期，同一天的请求再按其文件首次提交的 Git 时间排序（尚未提交的文件视为当天最新）；<code>--sort oldest</code> 可反转。<code>--status running,failed</code> 按实时或回执状态筛选。<code>display.list_limit</code> 设置仓库默认显示数量，<code>--limit 20</code> 可临时覆盖，<code>--all</code> 显示全部。没有状态筛选时只处理最终可能显示的 N 个请求；带状态筛选时分批扫描，找到 N 个匹配项后停止；<code>--all</code> 才完整扫描。未配置该字段的旧仓库仍显示所有请求。</p>
     <p>面向生命周期的命令在交互终端中使用对齐表格显示详情和建议的下一步；输出到管道或文件时保持 JSON，原始日志除外。需要在终端中获取 JSON 时使用命令支持的 <code>--json</code>。</p>
-    <p><code>--dry-run</code> 会验证请求并输出后端、固定提交、worktree 和命令，但不会启动作业。正式提交会创建干净的 detached worktree，检查依赖，再通过所选后端启动并原子完成回执。SLURM 会额外检查资源和节点预算；local 会启动独立进程组并记录 PID、启动标识和退出状态文件。</p>
+    <p><code>--dry-run</code> 会验证请求并输出后端、固定提交、worktree 和命令，但不会启动作业。正式提交会创建干净的 detached worktree，检查依赖，再通过所选后端启动并原子完成回执。SLURM 会额外检查资源和节点预算；local 会启动独立进程组并记录 PID、启动标识和退出状态文件。用 <code>--backend local</code> 跑的 <code>[slurm]</code> 请求仍然核验节点上限，但不占用节点预算。</p>
     <div class="note"><p>若需要让请求方立即看到作业号，应在提交成功后单独提交并推送 <code>receipt.json</code>。</p></div>
 
     <h3>看进度</h3>
@@ -490,6 +497,7 @@ root = ".."</code></pre>
         <tr><td><code>expctl validate &lt;id&gt;</code></td><td>验证请求、固定提交和作业脚本策略</td></tr>
         <tr><td><code>expctl show &lt;id&gt;</code></td><td>将验证后的请求输出为 JSON</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; [--json]</code></td><td>准备 worktree，并通过请求声明的后端启动作业</td></tr>
+        <tr><td><code>expctl submit &lt;id&gt; --backend local|slurm</code></td><td>覆盖请求声明的后端；<code>--backend local</code> 在本机运行 <code>[slurm]</code> 请求的脚本</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; --dry-run</code></td><td>验证并预览提交，不创建资源或启动作业</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; --worktree-root &lt;dir&gt;</code></td><td>本次提交使用指定的 worktree 父目录</td></tr>
         <tr><td><code>expctl submit --all [--dry-run] [--json]</code></td><td>按 ID 从旧到新提交所有还没有回执的请求；单个失败不影响其余请求</td></tr>

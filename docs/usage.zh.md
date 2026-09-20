@@ -2,7 +2,7 @@
 
 expctl 用 Git 仓库中的请求、回执和结果文件交接异步实验：实验设计者不必与集群操作者同时在线，也能确认运行了哪一版代码、使用了哪些参数，并追溯结果来源。
 
-expctl 支持两种执行后端：提交到 SLURM，或在已经分配好的 Linux 计算节点上直接异步运行。它不替代调度器、工作流引擎或实验跟踪平台，只负责让实验交接可验证、可审计：
+expctl 支持两种执行后端：提交到 SLURM，或在已经分配好的 Linux 计算节点上直接异步运行。固定到 SLURM 的请求也可以用 `expctl submit --backend local` 在单台机器上跑，请求文件、回执和收集到的证据都不变。它不替代调度器、工作流引擎或实验跟踪平台，只负责让实验交接可验证、可审计：
 
 ```text
 发布请求 → 提交作业并生成回执 → 收集日志和指标 → 人工审阅并记录结论
@@ -11,14 +11,14 @@ expctl 支持两种执行后端：提交到 SLURM，或在已经分配好的 Lin
 本文约定：
 
 - **发布请求**：将请求文件提交并推送到 Git 仓库。
-- **提交作业**：运行 `expctl submit`，按请求中的 `[slurm]` 或 `[local]` 后端启动实验。
+- **提交作业**：运行 `expctl submit`，按请求中的 `[slurm]` 或 `[local]` 后端启动实验；`--backend local` 可以把 `[slurm]` 请求改在本机运行。
 - **回执**：`<root>/results/<id>/receipt.json`。回执生成后，请求文件不得再修改；重跑或修改参数必须使用新 ID。
 
 `<root>` 默认为 `expctl/`，可通过 `expctl.toml` 中的 `paths.root` 修改。
 
 ## 一、安装
 
-所有机器都需要 Git 和 Python 3.11 或更高版本。`local` 后端需要带 `/proc` 的 Linux 运行环境；`slurm` 后端还需要可用的 `sbatch`、`squeue`、`sacct`、`scancel`，启用节点预算时还会使用 `scontrol`。
+所有机器都需要 Git 和 Python 3.11 或更高版本。`local` 后端需要带 `/proc` 的 Linux 运行环境，在本机运行 SLURM 脚本还需要 `bash`；`slurm` 后端还需要可用的 `sbatch`、`squeue`、`sacct`、`scancel`，启用节点预算时还会使用 `scontrol`。
 
 推荐使用 `uv` 安装：
 
@@ -124,6 +124,27 @@ MODE = "evaluation"
 
 local 脚本必须在固定提交中带可执行位，例如先运行 `git update-index --chmod=+x scripts/train.py` 并提交。local 的 `outputs.log_glob` 必须是包含 `{job_id}` 的单个精确路径，不能包含通配符；expctl 会把 stdout 和 stderr 都写入该文件。回执会固定启动节点的主机名，local 的状态、取消和收集必须在同一节点执行，并用 `/proc` 防止 PID 复用误判。local 不提供排队、资源隔离或机器重启后的自动恢复。
 
+### 在本机运行 SLURM 请求
+
+```bash
+expctl submit <id> --backend local
+```
+
+`--backend local` 不调用 `sbatch`，而是把 `[slurm]` 请求固定的脚本放在当前主机上跑。请求文件、worktree、回执和收集到的证据都不变：同一份申请单，集群上的人用 SLURM 提交，你在一台机器上加这个参数就能跑，账本格式一致。
+
+脚本里的 `#SBATCH` 行仍然只是注释，expctl 读它来复现调度器本会做的事：
+
+- 脚本在自己的 detached worktree 里由 `bash` 执行，进程组独立，并导出 `SLURM_SUBMIT_DIR`、`SLURM_SUBMIT_HOST`、`SLURM_JOB_ID`、`SLURM_JOB_NAME`、`SLURM_JOB_USER`、单节点相关变量以及 `[slurm.env]`；
+- `#SBATCH --partition`、`--account`、`--cpus-per-task`、`--ntasks`、`--gpus-per-node` 会按 `SLURM_JOB_PARTITION`、`SLURM_JOB_ACCOUNT`、`SLURM_CPUS_PER_TASK`、`SLURM_NTASKS`/`SLURM_NPROCS`、`SLURM_GPUS_PER_NODE` 重新导出；
+- `#SBATCH --array` 的任务按下标顺序一个接一个地跑，每个任务都带 `SLURM_ARRAY_JOB_ID`、`SLURM_ARRAY_TASK_ID`、`SLURM_ARRAY_TASK_COUNT`、`SLURM_ARRAY_TASK_MIN`、`SLURM_ARRAY_TASK_MAX`。`%N` 并发上限会被记录但不生效：单机没有队列可以铺开；
+- `#SBATCH --output` 和 `--error` 按 SLURM 的规则展开（`%j`、`%A`、`%a`、`%x`、`%N`、`%u`、`%%`，以及 `%4a` 这类补零宽度），没有声明时用 `slurm-%j.out`，数组作业用 `slurm-%A_%a.out`。所有日志文件在任何任务开始前就创建好，避免数组跑到一半才因为日志已存在而失败。
+
+作业号是本机生成的八位数字；数组任务的 `SLURM_JOB_ID` 形如 `<作业号>_<任务号>`。回执记录 `backend = "local"` 和 `emulated_backend = "slurm"`，`collect` 写入的每个任务的 `job_id`、`state`、`exit_code` 与 `sacct` 的形状一致，因此报告和指标仍是集群那套格式。`status` 改为核对记录的进程和退出状态文件，不再调用 `squeue` 和 `sacct`；`cancel` 改为向进程组发送 `SIGTERM`，不再调用 `scancel`，正在跑的任务和后面尚未开始的数组任务都会停下。
+
+`submit` 会对单机无法复现的地方给出警告：脚本在 SLURM 上可能占用多个节点，或 `#SBATCH --output` 的文件名与 `outputs.log_glob` 对不上。`#SBATCH` 里其余的资源申请不会被强制执行——没有分区、没有节点隔离、没有时间上限。
+
+对已经声明 `[local]` 的请求，`--backend local` 不产生任何变化，因此混合仓库里 `submit --all --backend local` 依然可用；`--backend slurm` 会拒绝 `[local]` 请求；`--skip-node-check` 属于 SLURM，与 `--backend local` 同时使用会报错。
+
 ## 五、提交、查看和收集
 
 在执行主机上的项目仓库中运行：
@@ -136,7 +157,7 @@ expctl submit <id> --dry-run
 expctl submit <id>
 ```
 
-`expctl submit --all` 会按 ID 从旧到新提交所有还没有回执的请求（即 `list` 中状态为 `requested` 的请求）。每个请求单独验证和提交：某个请求无效或节点预算不足时只跳过该请求并记录错误，其余请求继续；有任何失败时退出码为非零。`--dry-run`、`--worktree-root` 和 `--skip-node-check` 同样适用于每个请求。
+`expctl submit --all` 会按 ID 从旧到新提交所有还没有回执的请求（即 `list` 中状态为 `requested` 的请求）。每个请求单独验证和提交：某个请求无效或节点预算不足时只跳过该请求并记录错误，其余请求继续；有任何失败时退出码为非零。`--backend`、`--dry-run`、`--worktree-root` 和 `--skip-node-check` 同样适用于每个请求。
 
 `expctl list` 在交互终端中显示对齐表格，管道或文件输出默认使用稳定 TSV。它批量刷新 SLURM 作业状态，并从记录的进程身份和退出状态文件刷新 local 状态；刷新是只读的，不修改回执。SLURM 查询失败时，受影响的行回退为 `submitted` 并只在标准错误输出一条警告。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color` 关闭颜色。
 
@@ -153,7 +174,7 @@ expctl submit <id>
 3. 链接 `runtime.shared_dirs`，并检查 `notes.requirements`；
 4. 启动后端并原子完成回执。
 
-SLURM 还会核验脚本资源、节点预算并调用 `sbatch --parsable`。local 会启动独立进程组，记录 PID、进程启动标识和 `local-status.json`，其 job ID 形如 `local-...`。已有回执的请求不能再次提交；需要重跑时使用 `expctl rerun <id>`。SLURM 无法确认作业号时会保留 `submission_unknown`，必须人工与调度器对账，不能自动重试。
+SLURM 还会核验脚本资源、节点预算并调用 `sbatch --parsable`。local 会启动独立进程组，记录 PID、进程启动标识和 `local-status.json`；`[local]` 请求的 job ID 形如 `local-...`，用 `--backend local` 跑的 `[slurm]` 请求则是本机生成的八位数字。`[slurm]` 请求即使在本机运行也仍然核验节点上限，但不占用节点预算：本机不是集群。已有回执的请求不能再次提交；需要重跑时使用 `expctl rerun <id>`。SLURM 无法确认作业号时会保留 `submission_unknown`，必须人工与调度器对账，不能自动重试。
 
 查看状态：
 
@@ -292,6 +313,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl validate <id>` | 验证请求、固定提交和作业脚本策略 |
 | `expctl show <id>` | 将验证后的请求输出为 JSON |
 | `expctl submit <id> [--json]` | 准备 worktree，并通过请求声明的后端启动作业 |
+| `expctl submit <id> --backend local\|slurm` | 覆盖请求声明的后端；`--backend local` 在本机运行 `[slurm]` 请求的脚本 |
 | `expctl submit <id> --dry-run` | 验证并预览提交，不创建资源或启动作业 |
 | `expctl submit <id> --worktree-root <dir>` | 本次提交使用指定的 worktree 父目录 |
 | `expctl submit --all [--dry-run] [--json]` | 按 ID 从旧到新提交所有还没有回执的请求；单个失败不影响其余请求 |
