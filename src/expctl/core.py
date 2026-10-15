@@ -1349,6 +1349,64 @@ def _prefill_git_caches(
             script_cache[key] = (verified_nodes, envelope_error, None)
 
 
+def validate_requests(repo: Path, config: Config) -> dict[str, Any]:
+    """Validate every request file, oldest ID first, collecting each failure.
+
+    Pinned commits and scripts are verified with the same batched Git queries
+    `list` uses, so checking a whole repository stays cheap.
+    """
+    requests_dir = repo / config.root / "requests"
+    checked = sorted(path.stem for path in requests_dir.glob("*.toml"))
+    loaded: list[tuple[str, dict[str, Any]]] = []
+    failures: dict[str, str] = {}
+    for experiment_id in checked:
+        try:
+            data, _ = load_request(repo, config, experiment_id, check_git=False)
+        except ExpctlError as exc:
+            failures[experiment_id] = str(exc)
+        else:
+            loaded.append((experiment_id, data))
+
+    commit_cache: dict[str, str | None] = {}
+    script_cache: dict[tuple[str, str, str], _ScriptCacheEntry] = {}
+    _prefill_git_caches(
+        repo,
+        config,
+        [data for _, data in loaded],
+        commit_cache=commit_cache,
+        script_cache=script_cache,
+    )
+    valid: list[dict[str, Any]] = []
+    for experiment_id, data in loaded:
+        try:
+            verified_nodes = _validate_request_git(
+                repo,
+                config,
+                data,
+                commit_cache=commit_cache,
+                script_cache=script_cache,
+            )
+        except ExpctlError as exc:
+            failures[experiment_id] = str(exc)
+        else:
+            valid.append(
+                {
+                    "experiment_id": experiment_id,
+                    "backend": _execution_table(data)[0],
+                    "verified_max_concurrent_nodes": verified_nodes,
+                }
+            )
+    return {
+        "checked": checked,
+        "valid": valid,
+        "invalid": [
+            {"experiment_id": experiment_id, "error": failures[experiment_id]}
+            for experiment_id in checked
+            if experiment_id in failures
+        ],
+    }
+
+
 def _request_hash(path: Path) -> str:
     try:
         content = path.read_bytes()
@@ -4473,6 +4531,34 @@ def _render_validate_summary(
     )
 
 
+def _render_validate_batch_result(result: dict[str, Any]) -> str:
+    checked = list(result.get("checked", []))
+    if not checked:
+        return "No experiment requests."
+    outcomes = {
+        str(item["experiment_id"]): ("valid", str(item.get("backend", "")))
+        for item in result.get("valid", [])
+    }
+    outcomes.update(
+        (str(item["experiment_id"]), ("invalid", str(item.get("error", ""))))
+        for item in result.get("invalid", [])
+    )
+    invalid = len(result.get("invalid", []))
+    valid = len(checked) - invalid
+    return "\n".join(
+        [
+            f"VALIDATED {len(checked)} REQUESTS: {valid} VALID, {invalid} INVALID",
+            _render_table(
+                ("EXPERIMENT ID", "RESULT", "DETAIL"),
+                [
+                    (experiment_id, *outcomes[experiment_id])
+                    for experiment_id in checked
+                ],
+            ),
+        ]
+    )
+
+
 def _render_doctor_result(
     result: dict[str, Any],
     *,
@@ -5499,8 +5585,20 @@ def _parser() -> argparse.ArgumentParser:
         help="show all matching experiments, ignoring display.list_limit",
     )
 
-    validate = subparsers.add_parser("validate", help="validate one request")
-    validate.add_argument("experiment_id", metavar="ID")
+    validate = subparsers.add_parser(
+        "validate", help="validate one request, or every request"
+    )
+    validate.add_argument(
+        "experiment_id", metavar="ID", nargs="?", help="request to validate"
+    )
+    validate.add_argument(
+        "--all",
+        action="store_true",
+        help="validate every request, oldest ID first; exit non-zero if any fails",
+    )
+    validate.add_argument(
+        "--json", action="store_true", help="emit JSON even in an interactive terminal"
+    )
 
     show = subparsers.add_parser("show", help="print one validated request as JSON")
     show.add_argument("experiment_id", metavar="ID")
@@ -5787,9 +5885,38 @@ def main(argv: list[str] | None = None) -> int:
             if output:
                 print(_stdout_safe(output))
         elif args.command == "validate":
+            if args.all == (args.experiment_id is not None):
+                raise ExpctlError(
+                    "validate needs exactly one of an experiment ID or --all"
+                )
+            if args.all:
+                batch = validate_requests(repo, config)
+                _print_command_result(
+                    batch, _render_validate_batch_result(batch), force_json=args.json
+                )
+                if batch["invalid"]:
+                    print(
+                        f"error: {len(batch['invalid'])} of {len(batch['checked'])} "
+                        "requests are invalid",
+                        file=sys.stderr,
+                    )
+                    return 2
+                return 0
             request, _ = load_request(repo, config, args.experiment_id, check_git=False)
             verified_nodes = _validate_request_git(repo, config, request)
-            if sys.stdout.isatty():
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "experiment_id": args.experiment_id,
+                            "backend": _execution_table(request)[0],
+                            "verified_max_concurrent_nodes": verified_nodes,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            elif sys.stdout.isatty():
                 print(
                     _stdout_safe(
                         _render_validate_summary(

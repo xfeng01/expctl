@@ -105,6 +105,8 @@ expctl doctor --backend slurm
 
 `validate` 会检查请求格式、固定提交和脚本。SLURM 脚本必须满足 `scheduler.required_script_lines`；local 脚本必须在固定提交中带有可执行位。模板占位符没有改掉、提交不在本地或脚本不在固定提交里时都会直接拒绝并给出提示。在终端中还会打印一屏后端、commit、脚本、环境、日志、指标和依赖摘要。回执生成前可以修正并重新发布请求；回执生成后必须保持文件字节不变。
 
+`expctl validate --all` 按 ID 从旧到新一次校验全部请求文件（与 `list` 一样使用批量 Git 查询），逐个列出无效请求及原因，有任何无效请求时退出码为非零，适合放进 CI 或 pre-commit 钩子。
+
 ## 四、选择执行后端
 
 每个请求必须且只能包含一种后端。
@@ -321,7 +323,8 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl doctor [--backend local\|slurm] [--cluster] [--json]` | 检查仓库和两个后端；选择 `--backend` 后对应检查计入退出码，`--cluster` 是 SLURM 别名 |
 | `expctl new <id> [--from <id>] [--title <text>] [--allow-dirty] [--json]` | 从模板（或用 `--from` 从已有请求）创建请求并固定当前 `HEAD`；只写短名时自动加当天日期；默认拒绝未提交改动 |
 | `expctl list [--table\|--tsv\|--json] [--status <states>] [--sort newest\|oldest] [--limit <n>\|--all] [--no-color]` | 列出请求及实时状态；默认数量可由 `display.list_limit` 配置，`--all` 显示全部 |
-| `expctl validate <id>` | 验证请求、固定提交和作业脚本策略 |
+| `expctl validate <id> [--json]` | 验证请求、固定提交和作业脚本策略 |
+| `expctl validate --all [--json]` | 校验全部请求并列出无效项；有无效请求时退出码非零，适合 CI |
 | `expctl show <id>` | 将验证后的请求输出为 JSON |
 | `expctl submit <id> [--json]` | 准备 worktree，并通过请求声明的后端启动作业 |
 | `expctl submit <id> --backend local\|slurm` | 覆盖请求声明的后端；`--backend local` 在本机运行 `[slurm]` 请求的脚本 |

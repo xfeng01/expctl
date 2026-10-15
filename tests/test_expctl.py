@@ -3140,6 +3140,62 @@ def test_cli_resolves_shortened_ids_and_says_so(
     assert "no experiment request matches 'nothing'" in capsys.readouterr().err
 
 
+def test_validate_all_reports_every_invalid_request_and_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _pinned_repo(tmp_path)
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "sweep.slurm").write_text(
+        "#!/bin/bash\n#SBATCH -p example-partition\n#SBATCH --nodes=2\n",
+        encoding="utf-8",
+    )
+    commit = _commit_all(repo, "add sweep script")
+    _write_pinned_request(repo, "20260101-good", commit)
+    _write_pinned_request(repo, "20260102-missing-script", commit, script="nope.slurm")
+    _write_pinned_request(
+        repo,
+        "20260103-placeholder",
+        commit,
+        template=EXAMPLE_REQUEST.replace("Example sweep", "Short experiment title"),
+    )
+    (repo / "expctl" / "requests" / "notes.toml").write_text("", encoding="utf-8")
+    config = load_config(repo)
+
+    result = core.validate_requests(repo, config)
+
+    assert result["checked"] == [
+        "20260101-good",
+        "20260102-missing-script",
+        "20260103-placeholder",
+        "notes",
+    ]
+    assert result["valid"] == [
+        {
+            "experiment_id": "20260101-good",
+            "backend": "slurm",
+            "verified_max_concurrent_nodes": 2,
+        }
+    ]
+    errors = {item["experiment_id"]: item["error"] for item in result["invalid"]}
+    assert "nope.slurm" in errors["20260102-missing-script"]
+    assert "placeholder" in errors["20260103-placeholder"]
+    assert "must look like YYYYMMDD" in errors["notes"]
+    rendered = core._render_validate_batch_result(result)
+    assert rendered.startswith("VALIDATED 4 REQUESTS: 1 VALID, 3 INVALID\n")
+
+    monkeypatch.setattr(core, "find_repo_root", lambda: repo)
+    assert core.main(["validate", "--all", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == result
+    assert captured.err == "error: 3 of 4 requests are invalid\n"
+    assert core.main(["validate", "good", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["verified_max_concurrent_nodes"] == 2
+    assert core.main(["validate"]) == 2
+    assert "exactly one of an experiment ID or --all" in capsys.readouterr().err
+
+
 def _collected_receipt(repo: Path, experiment_id: str) -> Path:
     directory = repo / "expctl" / "results" / experiment_id
     directory.mkdir(parents=True)

@@ -378,6 +378,7 @@ expctl new lr-sweep --title "Learning-rate sweep"   # 自动补上当天日期</
     </ol>
     <p>若工作树存在未提交改动，<code>new</code> 默认拒绝创建，因为这些内容不属于固定的 <code>HEAD</code>。应先提交或暂存；只有明确接受风险时才使用 <code>--allow-dirty</code>。</p>
     <p><code>validate</code> 会检查请求格式、固定提交和脚本。SLURM 脚本必须满足仓库策略；local 脚本必须在固定提交中带可执行位。交互终端会显示后端、commit、脚本、环境变量、日志、指标和依赖摘要。</p>
+    <p><code>expctl validate --all</code> 按 ID 从旧到新一次校验全部请求文件（与 <code>list</code> 一样使用批量 Git 查询），逐个列出无效请求及原因，有任何无效请求时退出码为非零，适合放进 CI 或 pre-commit 钩子。</p>
 
     <h2 id="runner"><span class="num">四</span>提交、查看和收集</h2>
     <p>每个请求必须且只能选择一种后端。SLURM 使用 <code>[slurm]</code>、<code>script</code>、可选的 <code>max_concurrent_nodes</code> 和可选的 <code>[slurm.env]</code>；计算节点直跑使用 <code>[local]</code>、<code>script</code>、可选的 <code>args</code> 和 <code>[local.env]</code>。</p>
@@ -499,7 +500,8 @@ root = ".."</code></pre>
         <tr><td><code>expctl doctor [--backend local|slurm] [--cluster] [--json]</code></td><td>检查仓库和两个后端；选择后端时对应检查计入退出码</td></tr>
         <tr><td><code>expctl new &lt;id&gt; [--from &lt;id&gt;] [--title &lt;text&gt;] [--allow-dirty] [--json]</code></td><td>从模板（或用 <code>--from</code> 从已有请求）创建请求并固定当前 <code>HEAD</code>；只写短名时自动加当天日期；默认拒绝未提交改动</td></tr>
         <tr><td><code>expctl list [--table|--tsv|--json] [--status &lt;states&gt;] [--sort newest|oldest] [--limit &lt;n&gt;|--all] [--no-color]</code></td><td>列出请求及实时状态；默认数量可由 <code>display.list_limit</code> 配置，<code>--all</code> 显示全部</td></tr>
-        <tr><td><code>expctl validate &lt;id&gt;</code></td><td>验证请求、固定提交和作业脚本策略</td></tr>
+        <tr><td><code>expctl validate &lt;id&gt; [--json]</code></td><td>验证请求、固定提交和作业脚本策略</td></tr>
+        <tr><td><code>expctl validate --all [--json]</code></td><td>校验全部请求并列出无效项；有无效请求时退出码非零，适合 CI</td></tr>
         <tr><td><code>expctl show &lt;id&gt;</code></td><td>将验证后的请求输出为 JSON</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; [--json]</code></td><td>准备 worktree，并通过请求声明的后端启动作业</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; --backend local|slurm</code></td><td>覆盖请求声明的后端；<code>--backend local</code> 在本机运行 <code>[slurm]</code> 请求的脚本</td></tr>

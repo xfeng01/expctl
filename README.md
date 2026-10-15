@@ -54,7 +54,11 @@ expctl show <id>
 
 # Validate the request, pinned commit, script, and resource policy; a terminal
 # also gets a one-screen summary of what was pinned.
-expctl validate <id>
+expctl validate <id> [--json]
+
+# Validate every request, oldest ID first, and exit non-zero if any is
+# invalid; suitable for CI or a pre-commit hook.
+expctl validate --all [--json]
 
 # Preview or submit through the backend declared by the request.
 # --backend local runs a [slurm] request's pinned script on this host.
@@ -225,7 +229,9 @@ refused with `--backend local`.
 `new` refuses a dirty working tree because uncommitted changes are not part of
 the pinned `HEAD`; `--allow-dirty` is an explicit override. `validate` rejects
 a request that still carries starter-template placeholder values (title,
-question, decision rule, script, log glob, metrics, requirements). `doctor`
+question, decision rule, script, log glob, metrics, requirements).
+`validate --all` checks every request file in one pass, with the same batched
+Git queries as `list`, and lists each invalid one with its reason. `doctor`
 exits nonzero when a repository check fails; on the execution host add
 `--backend local` or `--backend slurm` to require that backend's checks. The
 legacy `--cluster` flag is an alias for `--backend slurm`.

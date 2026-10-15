@@ -25,6 +25,10 @@
 - The `EXPCTL_WORKTREE_ROOT` environment variable overrides `worktree.root`
   on one machine without editing the shared `expctl.toml`; `doctor` reports
   when it is in effect.
+- Added `expctl validate --all`, which validates every request file, oldest
+  ID first, with the same batched Git queries as `list`, lists each invalid
+  request with its reason, and exits non-zero if any is invalid, so it can
+  gate CI or a pre-commit hook. `validate` also gained `--json`.
 
 ## 0.12.0 — 2026-09-19
 
