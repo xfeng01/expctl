@@ -4273,6 +4273,18 @@ def test_overview_orders_open_experiments_by_stage_with_their_next_action(
     broken = tmp_path / "expctl" / "results" / "20261001-broken-receipt"
     broken.mkdir(parents=True)
     (broken / "receipt.json").write_text("{not json", encoding="utf-8")
+    receipts = {
+        "20261008-decoder": {"backend": "local", "hostname": "workstation"},
+        "20261009-quiet": {"backend": "slurm"},
+        "20261010-elsewhere": {"backend": "local", "hostname": "gpu-server"},
+    }
+    for experiment_id, receipt in receipts.items():
+        receipt_dir = tmp_path / "expctl" / "results" / experiment_id
+        receipt_dir.mkdir(parents=True)
+        (receipt_dir / "receipt.json").write_text(
+            json.dumps({**receipt, "status": "submitted", "job_id": "42"}),
+            encoding="utf-8",
+        )
     seen: dict[str, Any] = {}
 
     def fake_list_requests(repo: Path, config: Config, **options: Any) -> list:
@@ -4280,6 +4292,8 @@ def test_overview_orders_open_experiments_by_stage_with_their_next_action(
         return rows
 
     monkeypatch.setattr(core, "list_requests", fake_list_requests)
+    monkeypatch.setattr(core.socket, "gethostname", lambda: "workstation")
+    monkeypatch.setattr(core.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     result = core.overview(tmp_path, _overview_config())
 
@@ -4292,9 +4306,13 @@ def test_overview_orders_open_experiments_by_stage_with_their_next_action(
         ("20261007-array", "running", "expctl status array --watch"),
         ("20261008-decoder", "running", "expctl status decoder --watch"),
         ("20261009-quiet", "running", "expctl status quiet"),
-        ("20261010-elsewhere", "running", "expctl status elsewhere"),
         ("20261005-stagger", "collect", "expctl collect stagger"),
         ("20261006-cancelled", "collect", "expctl collect cancelled"),
+        (
+            "20261010-elsewhere",
+            "elsewhere",
+            "On gpu-server: expctl status elsewhere",
+        ),
         ("20261004-metric", "report", "expctl report metric"),
         (
             "20261001-broken-receipt",
@@ -4314,6 +4332,36 @@ def test_overview_orders_open_experiments_by_stage_with_their_next_action(
     assert "All at once: expctl submit --all, expctl collect --all" in human
     assert "1 reviewed experiment not shown" in human
     assert human.endswith("expctl --help")
+
+
+def test_overview_sends_slurm_jobs_to_the_cluster_from_a_host_without_slurm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = [
+        {"id": "20261001-sweep", "status": "submitted", "title": "sweep"},
+        {"id": "20261002-probe", "status": "cancel_requested", "title": "probe"},
+        {"id": "20261003-lost", "status": "submission_unknown", "title": "lost"},
+    ]
+    for row in rows:
+        receipt_dir = tmp_path / "expctl" / "results" / row["id"]
+        receipt_dir.mkdir(parents=True)
+        # Receipts written before the local backend existed carry no backend.
+        (receipt_dir / "receipt.json").write_text(
+            json.dumps({"status": row["status"], "job_id": "42"}), encoding="utf-8"
+        )
+    monkeypatch.setattr(core, "list_requests", lambda *args, **options: rows)
+    monkeypatch.setattr(core.shutil, "which", lambda name: None)
+
+    result = core.overview(tmp_path, _overview_config())
+
+    assert [
+        (row["id"], row["stage"], row["next"]) for row in result["experiments"]
+    ] == [
+        ("20261001-sweep", "elsewhere", "On the cluster: expctl status sweep"),
+        ("20261002-probe", "elsewhere", "On the cluster: expctl status probe"),
+        # A submission without a job ID needs a person wherever it is.
+        ("20261003-lost", "attention", "expctl status lost"),
+    ]
 
 
 def test_overview_points_to_new_when_nothing_is_open() -> None:

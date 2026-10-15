@@ -189,7 +189,7 @@ EXPERIMENT ID      STATUS     NEXT
 Every command, by workflow stage: expctl --help
 ```
 
-各行按阶段排列：待提交、排队或运行中、已结束待收集、已收集待写报告，最后是需要人工处理的（请求无效、回执无法读取、提交没有确认的作业号）。命令里用短名指代请求，只有和其他请求重名时才写完整 ID；同一阶段有多个请求时，还会给出 `expctl submit --all` 或 `expctl collect --all`。输出到管道或文件时是 JSON，每行带 `stage` 和 `next` 字段。`expctl --help` 按工作流阶段分组列出全部命令。
+各行按阶段排列：待提交、排队或运行中、已结束待收集、只能在别的机器上查看的作业、已收集待写报告，最后是需要人工处理的（请求无效、回执无法读取、提交没有确认的作业号）。在另一台主机上运行的 local 作业会写出那台主机（`On gpu-server: expctl status decoder`）；在没有 `squeue` 和 `sacct` 的机器上看到的 SLURM 作业则指向集群（`On the cluster: ...`）。命令里用短名指代请求，只有和其他请求重名时才写完整 ID；同一阶段有多个请求时，还会给出 `expctl submit --all` 或 `expctl collect --all`。输出到管道或文件时是 JSON，每行带 `stage` 和 `next` 字段，阶段依次为 `submit`、`running`、`collect`、`elsewhere`、`report`、`attention`。`expctl --help` 按工作流阶段分组列出全部命令。
 
 在执行主机上的项目仓库中运行：
 
@@ -200,6 +200,14 @@ expctl show <id>
 expctl submit <id> --dry-run
 expctl submit <id>
 ```
+
+同一个仓库在多台机器上跑实验时（例如有时在集群上、有时在自己的工作站上），`submit` 返回后立刻提交并推送回执：
+
+```bash
+git add expctl/results && git commit -m "Submit <id>" && git push
+```
+
+expctl 只凭 `results/<id>/receipt.json` 判断请求是否已经提交过。另一台机器如果还没拉到这份回执，会把请求当成 `requested`，`expctl` 会建议提交，`submit --all` 也会把它再跑一遍。作业的状态、取消和收集都要在运行它的机器上执行；在别的机器上，`expctl` 会写明该去哪里，例如 `On gpu-server: expctl status <id>`。
 
 `expctl submit --all` 会按 ID 从旧到新提交所有还没有回执的请求（即 `list` 中状态为 `requested` 的请求）。每个请求单独验证和提交：某个请求无效、节点预算不足或空闲 GPU 不够时只跳过该请求并记录错误，其余请求继续；有任何失败时退出码为非零。`--backend`、`--dry-run`、`--worktree-root`、`--skip-node-check` 和 `--allow-login-node` 同样适用于每个请求。
 

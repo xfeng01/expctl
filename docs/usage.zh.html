@@ -412,7 +412,7 @@ EXPERIMENT ID      STATUS     NEXT
 
 3 reviewed experiments not shown: expctl list --status reviewed
 Every command, by workflow stage: expctl --help</code></pre>
-    <p>各行按阶段排列：待提交、排队或运行中、已结束待收集、已收集待写报告，最后是需要人工处理的（请求无效、回执无法读取、提交没有确认的作业号）。命令里用短名指代请求，只有和其他请求重名时才写完整 ID；同一阶段有多个请求时，还会给出 <code>expctl submit --all</code> 或 <code>expctl collect --all</code>。输出到管道或文件时是 JSON，每行带 <code>stage</code> 和 <code>next</code> 字段。<code>expctl --help</code> 按工作流阶段分组列出全部命令。</p>
+    <p>各行按阶段排列：待提交、排队或运行中、已结束待收集、只能在别的机器上查看的作业、已收集待写报告，最后是需要人工处理的（请求无效、回执无法读取、提交没有确认的作业号）。在另一台主机上运行的 local 作业会写出那台主机（<code>On gpu-server: expctl status decoder</code>）；在没有 <code>squeue</code> 和 <code>sacct</code> 的机器上看到的 SLURM 作业则指向集群（<code>On the cluster: ...</code>）。命令里用短名指代请求，只有和其他请求重名时才写完整 ID；同一阶段有多个请求时，还会给出 <code>expctl submit --all</code> 或 <code>expctl collect --all</code>。输出到管道或文件时是 JSON，每行带 <code>stage</code> 和 <code>next</code> 字段，阶段依次为 <code>submit</code>、<code>running</code>、<code>collect</code>、<code>elsewhere</code>、<code>report</code>、<code>attention</code>。<code>expctl --help</code> 按工作流阶段分组列出全部命令。</p>
 
     <p>在执行主机上的项目仓库里：</p>
 <pre data-lang="bash"><code>git pull --ff-only
@@ -422,6 +422,7 @@ expctl submit &lt;id&gt; --dry-run
 expctl submit &lt;id&gt;
 expctl submit --all</code></pre>
     <p><code>expctl submit --all</code> 会按 ID 从旧到新提交所有还没有回执的请求。每个请求单独验证和提交，某个请求无效、节点预算不足或空闲 GPU 不够时只跳过它并记录错误，其余继续；有任何失败时退出码为非零。</p>
+    <div class="warn"><p><strong>多台机器共用一个仓库</strong>（例如有时在集群上、有时在自己的工作站上）：<code>submit</code> 返回后立刻运行 <code>git add expctl/results &amp;&amp; git commit -m "Submit &lt;id&gt;" &amp;&amp; git push</code>。expctl 只凭 <code>results/&lt;id&gt;/receipt.json</code> 判断请求是否已经提交过；另一台机器如果还没拉到这份回执，会把请求当成 <code>requested</code>，<code>submit --all</code> 也会把它再跑一遍。作业的状态、取消和收集都要在运行它的机器上执行；在别的机器上，<code>expctl</code> 会写明该去哪里，例如 <code>On gpu-server: expctl status &lt;id&gt;</code>。</p></div>
     <p><code>expctl list</code> 在交互终端中显示对齐表格，管道输出保持稳定 TSV。它批量刷新 SLURM 状态，并从进程身份和退出状态文件刷新 local 状态；刷新只读且不修改回执。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式。</p>
     <p><code>list</code> 默认从新到旧排列：先按 ID 中的日期，同一天的请求再按其文件首次提交的 Git 时间排序（尚未提交的文件视为当天最新）；<code>--sort oldest</code> 可反转。<code>--status running,failed</code> 按实时或回执状态筛选。<code>display.list_limit</code> 设置仓库默认显示数量，<code>--limit 20</code> 可临时覆盖，<code>--all</code> 显示全部。没有状态筛选时只处理最终可能显示的 N 个请求；带状态筛选时分批扫描，找到 N 个匹配项后停止；<code>--all</code> 才完整扫描。未配置该字段的旧仓库仍显示所有请求。</p>
     <p><code>list --long</code>（或 <code>-l</code>）额外显示回执记录的后端、作业号、提交时间和执行主机；用 <code>--backend local</code> 运行的 <code>[slurm]</code> 请求显示为 <code>local (slurm)</code>。表格中提交时间换算为本地时间，并省略所有行都为空的详情列；TSV 和 JSON 始终包含全部列。</p>

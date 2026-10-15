@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- The bare `expctl` overview has a new `elsewhere` stage for jobs this host
+  cannot check: a local job that runs on another host, and a SLURM job seen
+  from a host without `squeue` or `sacct`. Their next step names where to
+  run it, such as `On gpu-server: expctl status decoder` or
+  `On the cluster: expctl status sweep`, instead of an `expctl status` that
+  fails here. Submissions without a job ID stay under `attention`.
+- The README and the Chinese guide now say to commit and push the receipt
+  right after `submit` when several machines run requests from one
+  repository, since a machine without the receipt would submit the request
+  again.
+
 ## 0.13.0 — 2026-10-14
 
 - Every command that takes the ID of an existing request now accepts a

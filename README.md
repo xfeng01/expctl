@@ -64,6 +64,19 @@ expctl logs lr-sweep --follow      # optional: stream the log
 expctl collect lr-sweep            # copy logs, extract metrics, record the verdict
 ```
 
+When several machines run requests from one repository, push each receipt as
+soon as `submit` returns:
+
+```bash
+git add expctl/results && git commit -m "Submit lr-sweep" && git push
+```
+
+A request counts as submitted only once its `results/<id>/receipt.json`
+exists, so a machine that has not pulled the receipt would submit the request
+a second time. A job is checked, cancelled, and collected on the machine that
+runs it; anywhere else, `expctl` says where to go, for example
+`On gpu-server: expctl status lr-sweep`.
+
 Conclude:
 
 ```bash
@@ -192,12 +205,17 @@ use `--json` to force JSON where supported.
 
 The bare `expctl` overview refreshes states exactly as `list` does and orders
 open experiments by stage: requests to submit, jobs queued or running,
-finished jobs to collect, collected results awaiting a report, and anything
-that needs attention (an invalid request, an unreadable receipt, or a
-submission without a confirmed job ID). Commands name each request by its
-short name when no other request shares it. Redirected output is a JSON object
-whose `experiments` rows carry `stage` and `next`. Outside an initialized
-repository, `expctl` prints the grouped help and the reason.
+finished jobs to collect, jobs only another machine can check, collected
+results awaiting a report, and anything that needs attention (an invalid
+request, an unreadable receipt, or a submission without a confirmed job ID).
+A local job that runs on another host names that host
+(`On gpu-server: expctl status decoder`), and a SLURM job seen from a host
+without `squeue` or `sacct` names the cluster. Commands name each request by
+its short name when no other request shares it. Redirected output is a JSON
+object whose `experiments` rows carry `stage` and `next`; the stages are
+`submit`, `running`, `collect`, `elsewhere`, `report`, and `attention`.
+Outside an initialized repository, `expctl` prints the grouped help and the
+reason.
 
 In a terminal, `list` renders an aligned table. Redirected output defaults to
 TSV. For example:

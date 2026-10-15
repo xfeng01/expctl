@@ -5981,7 +5981,7 @@ def list_requests(
 
 
 # Lifecycle stages of an open experiment, in the order the overview lists them.
-OVERVIEW_STAGES = ("submit", "running", "collect", "report", "attention")
+OVERVIEW_STAGES = ("submit", "running", "collect", "elsewhere", "report", "attention")
 OVERVIEW_HEADERS = ("EXPERIMENT ID", "STATUS", "NEXT")
 
 
@@ -6010,6 +6010,23 @@ def _short_references(experiment_ids: list[str]) -> dict[str, str]:
     }
 
 
+def _job_elsewhere(repo: Path, config: Config, experiment_id: str) -> str | None:
+    """Where a submitted job has to be checked, when that is not this host.
+
+    A local job can only be checked on the host its receipt records, and a
+    SLURM job only where the scheduler answers.
+    """
+    state = _stored_request_state(repo, config, experiment_id)
+    if state["status"] in {"requested", "invalid"}:
+        return None
+    if state.get("backend", "slurm") == "local":
+        host = state.get("hostname")
+        return host if host and host != socket.gethostname() else None
+    if shutil.which("squeue") is None and shutil.which("sacct") is None:
+        return "the cluster"
+    return None
+
+
 def _overview_step(
     repo: Path, config: Config, row: dict[str, str], reference: str
 ) -> tuple[str, str] | None:
@@ -6032,9 +6049,15 @@ def _overview_step(
         return "attention", f"Inspect {receipt.relative_to(repo).as_posix()}"
     if folded in {"preparing", "submitting", "submission_unknown"}:
         return "attention", shlex.join(["expctl", "status", reference])
+    if place := _job_elsewhere(repo, config, experiment_id):
+        # This host cannot tell whether the job has finished, so point to
+        # where `status` can, and where `collect` will have to run.
+        return "elsewhere", f"On {place}: " + shlex.join(
+            ["expctl", "status", reference]
+        )
     states = {_slurm_state_name(part) for part in status.split(",")}
     if None in states or folded in {"submitted", "cancel_requested"}:
-        # No live state: the scheduler did not answer or the job ran elsewhere.
+        # No live state, typically because the scheduler did not answer.
         return "running", shlex.join(["expctl", "status", reference])
     if states <= TERMINAL_SLURM_STATES:
         return "collect", shlex.join(["expctl", "collect", reference])
