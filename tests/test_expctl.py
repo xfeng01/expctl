@@ -3140,6 +3140,38 @@ def test_cli_resolves_shortened_ids_and_says_so(
     assert "no experiment request matches 'nothing'" in capsys.readouterr().err
 
 
+def test_show_describes_a_request_on_a_terminal_and_keeps_json_otherwise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _example_repo(tmp_path)
+    monkeypatch.setattr(core, "find_repo_root", lambda: repo)
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: 4)
+
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: False)
+    assert core.main(["show", EXAMPLE_ID]) == 0
+    assert json.loads(capsys.readouterr().out)["title"] == "Example sweep"
+
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: True)
+    assert core.main(["show", EXAMPLE_ID, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["id"] == EXAMPLE_ID
+
+    assert core.main(["show", EXAMPLE_ID]) == 0
+    human = capsys.readouterr().out
+    assert human.startswith("REQUEST\n")
+    assert "Does the framework parse a well-formed request?" in human
+    assert "Status" in human and "requested" in human
+    assert "Max nodes" in human and "NUM_SAMPLES=256" in human
+    assert f"expctl submit {EXAMPLE_ID} --dry-run" in human
+
+    _fake_receipt(repo, EXAMPLE_ID)
+    assert core.main(["show", EXAMPLE_ID]) == 0
+    human = capsys.readouterr().out
+    assert "submitted (slurm job 123)" in human
+    assert f"expctl status {EXAMPLE_ID}" in human
+
+
 def test_validate_all_reports_every_invalid_request_and_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

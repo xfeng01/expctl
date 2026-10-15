@@ -325,7 +325,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl list [--table\|--tsv\|--json] [--status <states>] [--sort newest\|oldest] [--limit <n>\|--all] [--no-color]` | 列出请求及实时状态；默认数量可由 `display.list_limit` 配置，`--all` 显示全部 |
 | `expctl validate <id> [--json]` | 验证请求、固定提交和作业脚本策略 |
 | `expctl validate --all [--json]` | 校验全部请求并列出无效项；有无效请求时退出码非零，适合 CI |
-| `expctl show <id>` | 将验证后的请求输出为 JSON |
+| `expctl show <id> [--json]` | 终端下显示请求摘要（问题、判定规则、代码、后端、输出、已记录状态和下一步）；重定向或 `--json` 时输出 JSON |
 | `expctl submit <id> [--json]` | 准备 worktree，并通过请求声明的后端启动作业 |
 | `expctl submit <id> --backend local\|slurm` | 覆盖请求声明的后端；`--backend local` 在本机运行 `[slurm]` 请求的脚本 |
 | `expctl submit <id> --dry-run` | 验证并预览提交，不创建资源或启动作业 |

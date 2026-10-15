@@ -49,8 +49,10 @@ expctl new <id> [--from ID] [--title TEXT] [--allow-dirty] [--json]
 # List, filter, sort, and limit experiment requests.
 expctl list [--table | --tsv | --json] [--status STATUS[,STATUS...]] [--sort newest|oldest] [--limit N | --all] [--no-color]
 
-# Print one validated request as JSON.
-expctl show <id>
+# Describe one validated request. A terminal gets a summary of its question,
+# decision rule, code, backend, outputs, and recorded state with next steps;
+# redirected output or --json prints the request as JSON.
+expctl show <id> [--json]
 
 # Validate the request, pinned commit, script, and resource policy; a terminal
 # also gets a one-screen summary of what was pinned.

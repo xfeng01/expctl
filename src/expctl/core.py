@@ -4531,6 +4531,69 @@ def _render_validate_summary(
     )
 
 
+def _render_show_result(
+    experiment_id: str, request: dict[str, Any], state: dict[str, Any]
+) -> str:
+    code, outputs = request["code"], request["outputs"]
+    backend, execution = _execution_table(request)
+    notes = request.get("notes", {})
+    status = str(state["status"])
+    if state.get("job_id"):
+        ran_on = state.get("backend", backend)
+        if state.get("emulated_backend"):
+            ran_on = f"{ran_on}, emulating {state['emulated_backend']}"
+        status = f"{status} ({ran_on} job {state['job_id']})"
+    elif state.get("detail"):
+        status = f"{status} ({state['detail']})"
+    rerun_of = request.get("rerun_of")
+    if rerun_of and request.get("rerun_reason"):
+        rerun_of = f"{rerun_of} ({request['rerun_reason']})"
+    max_nodes = execution.get("max_concurrent_nodes")
+    next_steps = {
+        "requested": [
+            shlex.join(["expctl", "validate", experiment_id]),
+            shlex.join(["expctl", "submit", experiment_id, "--dry-run"]),
+        ],
+        "submitted": [shlex.join(["expctl", "status", experiment_id])],
+        "cancel_requested": [shlex.join(["expctl", "status", experiment_id])],
+        "collected": [shlex.join(["expctl", "report", experiment_id])],
+    }.get(str(state["status"]))
+    return _render_summary(
+        "REQUEST",
+        [
+            ("Experiment", experiment_id),
+            ("Title", request["title"]),
+            ("Question", request["question"]),
+            ("Decision rule", request["decision_rule"]),
+            ("Rerun of", rerun_of),
+            ("Status", status),
+            ("Backend", backend),
+            ("Commit", f"{code['commit']} ({code['branch']})"),
+            ("Worktree", code["worktree"]),
+            ("Script", execution["script"]),
+            (
+                "Max nodes",
+                (max_nodes or "unlimited") if backend == "slurm" else None,
+            ),
+            (
+                "Args",
+                shlex.join(execution.get("args", [])) if backend == "local" else None,
+            ),
+            (
+                "Env",
+                ", ".join(
+                    f"{k}={v}" for k, v in sorted(execution.get("env", {}).items())
+                ),
+            ),
+            ("Logs", outputs["log_glob"]),
+            ("Metrics", ", ".join(outputs["metrics"])),
+            ("Requires", ", ".join(notes.get("requirements", []))),
+            ("Instructions", notes.get("instructions")),
+        ],
+        next_steps=next_steps,
+    )
+
+
 def _render_validate_batch_result(result: dict[str, Any]) -> str:
     checked = list(result.get("checked", []))
     if not checked:
@@ -5200,6 +5263,29 @@ def _brief_receipt_error(error: ExpctlError) -> str:
     return "invalid receipt: expected a JSON object"
 
 
+def _stored_request_state(
+    repo: Path, config: Config, experiment_id: str
+) -> dict[str, Any]:
+    """What the result directory records about a request, without asking a backend."""
+    receipt_path = result_dir(repo, config, experiment_id) / "receipt.json"
+    if not receipt_path.is_file():
+        return {"status": "requested"}
+    try:
+        receipt = _load_receipt(receipt_path)
+    except ExpctlError as exc:
+        return {"status": "invalid", "detail": _brief_receipt_error(exc)}
+    status = receipt.get("status")
+    if not isinstance(status, str) or not status:
+        status = "invalid"
+    elif status == "collected" and report_path(repo, config, experiment_id).is_file():
+        status = "reviewed"
+    state: dict[str, Any] = {"status": status}
+    for key in ("backend", "emulated_backend", "job_id", "submitted_at", "hostname"):
+        if isinstance(receipt.get(key), str) and receipt[key]:
+            state[key] = receipt[key]
+    return state
+
+
 def _list_row_status(
     repo: Path, config: Config, experiment_id: str
 ) -> tuple[str, str | None]:
@@ -5600,8 +5686,15 @@ def _parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
 
-    show = subparsers.add_parser("show", help="print one validated request as JSON")
+    show = subparsers.add_parser(
+        "show", help="describe one validated request (JSON when redirected)"
+    )
     show.add_argument("experiment_id", metavar="ID")
+    show.add_argument(
+        "--json",
+        action="store_true",
+        help="print the request as JSON even in an interactive terminal",
+    )
 
     submit = subparsers.add_parser(
         "submit", help="start one request, or every request without a receipt"
@@ -5928,7 +6021,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"valid: {args.experiment_id}")
         elif args.command == "show":
             request, _ = load_request(repo, config, args.experiment_id)
-            print(json.dumps(request, indent=2, sort_keys=True))
+            if sys.stdout.isatty() and not args.json:
+                state = _stored_request_state(repo, config, args.experiment_id)
+                print(
+                    _stdout_safe(
+                        _render_show_result(args.experiment_id, request, state)
+                    )
+                )
+            else:
+                print(json.dumps(request, indent=2, sort_keys=True))
         elif args.command == "submit":
             if args.all == (args.experiment_id is not None):
                 raise ExpctlError(

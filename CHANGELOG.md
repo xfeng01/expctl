@@ -29,6 +29,10 @@
   ID first, with the same batched Git queries as `list`, lists each invalid
   request with its reason, and exits non-zero if any is invalid, so it can
   gate CI or a pre-commit hook. `validate` also gained `--json`.
+- `expctl show` now prints a readable summary in a terminal: title,
+  question, decision rule, recorded status and job, pinned code, backend
+  settings, outputs, notes, and the next step. Redirected output is
+  unchanged JSON, and `--json` forces it in a terminal.
 
 ## 0.12.0 — 2026-09-19
 
