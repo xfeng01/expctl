@@ -52,7 +52,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 CONFIG_NAME = "expctl.toml"
 # Overrides worktree.root on one machine without editing the shared policy.

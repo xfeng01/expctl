@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 — 2026-10-14
 
 - Every command that takes the ID of an existing request now accepts a
   shortened reference: the short name after the date, or any part of the ID
