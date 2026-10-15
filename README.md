@@ -95,6 +95,13 @@ expctl --help
 expctl <command> --help
 ```
 
+Every `<id>` that names an existing request can be shortened. The short name
+after the date (`cross-probe` for `20260829-cross-probe`) or any part of the ID
+that matches exactly one request is enough, and `@` names the newest request in
+`list` order. An ambiguous reference is refused with the matching IDs, and the
+expansion is echoed on stderr, for example `expctl: cross-probe ->
+20260829-cross-probe`. PowerShell needs the quoted form `'@'`.
+
 `--skip-node-check` applies only to SLURM submissions. It bypasses the
 cross-job node-budget check and requires explicit operator authorization.
 

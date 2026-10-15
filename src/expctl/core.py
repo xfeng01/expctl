@@ -624,6 +624,51 @@ def result_dir(repo: Path, config: Config, experiment_id: str) -> Path:
     return repo / config.root / "results" / experiment_id
 
 
+def resolve_experiment_id(repo: Path, config: Config, reference: str) -> str:
+    """Expand a command-line reference to the ID of one existing request.
+
+    An ID with a request file is returned as is, and `@` names the newest
+    request in `list` order. Otherwise the reference must match exactly one
+    request: a short name (the part after the date) equal to the reference
+    wins, else the reference must occur in exactly one ID.
+    """
+    if ID_RE.fullmatch(reference) and request_path(repo, config, reference).is_file():
+        return reference
+    ids = sorted(
+        path.stem
+        for path in (repo / config.root / "requests").glob("*.toml")
+        if ID_RE.fullmatch(path.stem)
+    )
+    if reference == "@":
+        if not ids:
+            raise ExpctlError("no experiment requests yet; `@` names the newest one")
+        creation_times = (
+            _request_creation_times(repo, config)
+            if len({experiment_id[:8] for experiment_id in ids}) < len(ids)
+            else {}
+        )
+        return max(
+            ids, key=lambda experiment_id: _list_sort_key(experiment_id, creation_times)
+        )
+    needle = reference.casefold()
+    matches = [
+        experiment_id
+        for experiment_id in ids
+        if experiment_id.split("-", 1)[1] == needle
+    ] or [experiment_id for experiment_id in ids if needle and needle in experiment_id]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        if ID_RE.fullmatch(reference):
+            return reference  # let the command report the missing request file
+        raise ExpctlError(f"no experiment request matches {reference!r}")
+    shown = ", ".join(matches[:10]) + (", ..." if len(matches) > 10 else "")
+    raise ExpctlError(
+        f"{reference!r} matches {len(matches)} requests: {shown}; "
+        "use more of the ID to pick one"
+    )
+
+
 def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     value = data.get(key)
     if not isinstance(value, dict):
@@ -5292,6 +5337,10 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="expctl",
         description="Manage repository-backed asynchronous experiment handoffs.",
+        epilog=(
+            "An ID argument naming an existing request may be shortened to its "
+            "short name or any part that matches one request; @ names the newest."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"expctl {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -5609,6 +5658,11 @@ def main(argv: list[str] | None = None) -> int:
                 ready = bool(result.get("local_ready", result["cluster_ready"]))
             return 0 if ready else 1
         config = load_config(repo)
+        reference = getattr(args, "experiment_id", None)
+        if args.command != "new" and reference is not None:
+            args.experiment_id = resolve_experiment_id(repo, config, reference)
+            if args.experiment_id != reference:
+                print(f"expctl: {reference} -> {args.experiment_id}", file=sys.stderr)
         if args.command == "new":
             result = new_request(
                 repo,

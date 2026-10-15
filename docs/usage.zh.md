@@ -326,6 +326,8 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl report <id> [--json]` | 从请求、回执和指标生成 `results/<id>/report.md` 骨架；已存在时拒绝覆盖 |
 | `expctl rerun <id> [--as <new-id>] [--reason <text>] [--json]` | 把已提交的请求复制为新 ID（默认 `<id>-r2`、`-r3`……），写入 `rerun_of`，供再次提交；commit 和 worktree 不变 |
 
+所有指向已有请求的 `<id>` 都可以简写：写日期之后的短名（如 `20260829-cross-probe` 写成 `cross-probe`），或写 ID 中任意一段只匹配一个请求的片段；`@` 表示按 `list` 顺序最新的请求。匹配到多个请求时会报错并列出候选；展开结果会打印到 stderr，例如 `expctl: cross-probe -> 20260829-cross-probe`。PowerShell 中需写成 `'@'`。
+
 `expctl list` 显示的标准状态：
 
 ```text

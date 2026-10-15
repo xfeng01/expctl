@@ -2941,6 +2941,57 @@ def test_validate_cli_prints_a_summary_on_a_terminal(
     assert "Metrics" in human and "gen_ppl" in human
 
 
+def test_id_references_expand_to_exactly_one_existing_request(
+    tmp_path: Path,
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    requests = repo / "expctl" / "requests"
+    for experiment_id in (
+        "20260102-cross-probe",
+        "20260102-cross-probe-r2",
+        "20260103-decoder",
+    ):
+        (requests / f"{experiment_id}.toml").write_text("", encoding="utf-8")
+
+    def resolve(reference: str) -> str:
+        return core.resolve_experiment_id(repo, config, reference)
+
+    assert resolve(EXAMPLE_ID) == EXAMPLE_ID
+    assert resolve("cross-probe") == "20260102-cross-probe"
+    assert resolve("probe-r2") == "20260102-cross-probe-r2"
+    assert resolve("DECODER") == "20260103-decoder"
+    assert resolve("@") == "20260103-decoder"
+    with pytest.raises(ExpctlError, match="matches 2 requests: 20260102-cross-probe,"):
+        resolve("probe")
+    with pytest.raises(ExpctlError, match="no experiment request matches 'nothing'"):
+        resolve("nothing")
+    # A well-formed ID without a file is left for the command to report.
+    assert resolve("20260104-missing") == "20260104-missing"
+
+
+def test_cli_resolves_shortened_ids_and_says_so(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _example_repo(tmp_path)
+    monkeypatch.setattr(core, "find_repo_root", lambda: repo)
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: False)
+
+    assert core.main(["validate", "example"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == f"valid: {EXAMPLE_ID}\n"
+    assert captured.err == f"expctl: example -> {EXAMPLE_ID}\n"
+
+    assert core.main(["validate", EXAMPLE_ID]) == 0
+    assert capsys.readouterr().err == ""
+
+    assert core.main(["show", "nothing"]) == 2
+    assert "no experiment request matches 'nothing'" in capsys.readouterr().err
+
+
 def _collected_receipt(repo: Path, experiment_id: str) -> Path:
     directory = repo / "expctl" / "results" / experiment_id
     directory.mkdir(parents=True)

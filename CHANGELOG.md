@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Every command that takes the ID of an existing request now accepts a
+  shortened reference: the short name after the date, or any part of the ID
+  that matches exactly one request. `@` names the newest request in `list`
+  order. An ambiguous reference is refused with the candidates, and the
+  expansion is echoed on stderr.
+
 ## 0.12.0 — 2026-09-19
 
 - Added `expctl submit --backend local`, which runs a `[slurm]` request's

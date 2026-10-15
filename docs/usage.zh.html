@@ -513,6 +513,8 @@ root = ".."</code></pre>
     </table>
     </div>
 
+    <p>所有指向已有请求的 <code>&lt;id&gt;</code> 都可以简写：写日期之后的短名（如 <code>20260829-cross-probe</code> 写成 <code>cross-probe</code>），或写 ID 中任意一段只匹配一个请求的片段；<code>@</code> 表示按 <code>list</code> 顺序最新的请求。匹配到多个请求时会报错并列出候选；展开结果会打印到 stderr，例如 <code>expctl: cross-probe -&gt; 20260829-cross-probe</code>。PowerShell 中需写成 <code>'@'</code>。</p>
+
     <p>标准状态：</p>
     <div class="states">
       <div>有效请求，无回执<br><span class="pill requested">requested</span></div>
