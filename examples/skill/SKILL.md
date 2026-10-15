@@ -13,8 +13,9 @@ weaken the repository's own cluster and branch rules here.
 ## Choose the operation
 
 - To prepare a handoff, create a new request from
-  `expctl/templates/request.toml`, pin a full Git commit, and run
-  `expctl validate <id>`. State the scientific question and decision rule
+  `expctl/templates/request.toml` with `expctl new <id>` (or copy an earlier
+  request onto the current `HEAD` with `expctl new <id> --from <earlier-id>`),
+  pin a full Git commit, and run `expctl validate <id>`. State the scientific question and decision rule
   before the run. Never reuse an ID for changed settings.
 - To inspect the queue, run `expctl list`, then `show` or `validate` the
   selected request. Report invalid or ambiguous requests instead of guessing.

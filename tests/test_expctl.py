@@ -332,6 +332,42 @@ def test_new_request_dates_a_bare_short_name_and_fills_the_title(
         core.new_request(repo, config, "Not_A_Name")
 
 
+def test_new_request_from_another_request_pins_head_and_keeps_its_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_text = EXAMPLE_REQUEST.replace(
+        "title = ", 'rerun_of = "20251231-older"\nrerun_reason = "preempted"\ntitle = '
+    ).replace("\n", "\r\n")
+    repo = _example_repo(tmp_path)
+    source = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    source.write_bytes(source_text.encode("utf-8"))
+    config = load_config(repo)
+    _fake_new_request_git(monkeypatch, "b" * 40)
+
+    result = core.new_request(
+        repo, config, "20260105-follow-up", source_id=EXAMPLE_ID, title="Follow-up"
+    )
+
+    assert result["copied_from"] == EXAMPLE_ID
+    assert result["commit"] == "b" * 40
+    copy, copy_path = load_request(repo, config, "20260105-follow-up", check_git=False)
+    original, _ = load_request(repo, config, EXAMPLE_ID, check_git=False)
+    assert copy["title"] == "Follow-up"
+    assert copy["code"]["branch"] == "main"
+    assert copy["code"]["commit"] == "b" * 40
+    assert copy["code"]["worktree"].endswith("-follow-up")
+    assert "rerun_of" not in copy and "rerun_reason" not in copy
+    for key in ("question", "decision_rule", "slurm", "outputs"):
+        assert copy[key] == original[key]
+    # The copy keeps the source's line endings.
+    assert b"\n" not in copy_path.read_bytes().replace(b"\r\n", b"")
+    rendered = core._render_new_result(result)
+    assert "Copied from" in rendered and f"Review {result['path']}" in rendered
+
+    with pytest.raises(ExpctlError, match="request not found"):
+        core.new_request(repo, config, "20260105-orphan", source_id="20260104-gone")
+
+
 def test_rerun_as_a_bare_short_name_gets_todays_date(tmp_path: Path) -> None:
     repo = _example_repo(tmp_path)
     config = load_config(repo)

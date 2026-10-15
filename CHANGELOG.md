@@ -11,6 +11,11 @@
   `expctl new lr-sweep` creates `<YYYYMMDD>-lr-sweep`, and `--title` fills in
   the request title. `expctl rerun --as` accepts a bare short name the same
   way.
+- Added `expctl new <id> --from <existing-id>`, which copies every setting of
+  an existing request but pins the current `HEAD`: only the ID, branch,
+  commit, and worktree name are replaced, and `rerun_of`/`rerun_reason` are
+  dropped. It is the counterpart of `rerun` for repeating an experiment on
+  newer code.
 
 ## 0.12.0 — 2026-09-19
 

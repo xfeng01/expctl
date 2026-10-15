@@ -1434,6 +1434,19 @@ def _render_new_request(
     return "".join(output)
 
 
+def _without_rerun_provenance(source: str) -> str:
+    """Drop the top-level `rerun_of`/`rerun_reason` lines of a request file."""
+    output: list[str] = []
+    in_table = False
+    for line in source.splitlines(keepends=True):
+        if line.lstrip().startswith("["):
+            in_table = True
+        if not in_table and re.match(r"^\s*rerun_(of|reason)\s*=", line):
+            continue
+        output.append(line)
+    return "".join(output)
+
+
 def new_request(
     repo: Path,
     config: Config,
@@ -1441,7 +1454,14 @@ def new_request(
     *,
     allow_dirty: bool = False,
     title: str | None = None,
+    source_id: str | None = None,
 ) -> dict[str, Any]:
+    """Create a request pinned to HEAD from the template or another request.
+
+    With `source_id`, every setting is copied from that request; only the ID,
+    branch, commit, worktree name (and `title`, when given) are replaced, and
+    any rerun provenance is dropped because the copy pins different code.
+    """
     experiment_id = _dated_experiment_id(experiment_id)
     destination = request_path(repo, config, experiment_id)
     if destination.exists():
@@ -1455,13 +1475,23 @@ def new_request(
             f"  - {preview}{suffix}\n"
             "commit or stash them first, or rerun with --allow-dirty"
         )
-    template_path = repo / config.root / "templates" / "request.toml"
-    try:
-        template = template_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        raise ExpctlError(
-            f"could not read request template at {template_path}; run `expctl init`: {exc}"
-        ) from exc
+    if source_id is not None:
+        _, source_path = load_request(
+            repo, config, source_id, check_git=False, check_placeholders=False
+        )
+        try:
+            with source_path.open(encoding="utf-8", newline="") as handle:
+                template = _without_rerun_provenance(handle.read())
+        except (OSError, UnicodeError) as exc:
+            raise ExpctlError(f"could not read request {source_path}: {exc}") from exc
+    else:
+        template_path = repo / config.root / "templates" / "request.toml"
+        try:
+            template = template_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ExpctlError(
+                f"could not read request template at {template_path}; run `expctl init`: {exc}"
+            ) from exc
 
     commit = _git_text(repo, "rev-parse", "HEAD").strip()
     if not COMMIT_RE.fullmatch(commit):
@@ -1489,7 +1519,7 @@ def new_request(
     except ExpctlError:
         destination.unlink(missing_ok=True)
         raise
-    return {
+    result: dict[str, Any] = {
         "experiment_id": experiment_id,
         "path": str(destination.relative_to(repo)).replace("\\", "/"),
         "branch": branch,
@@ -1497,6 +1527,9 @@ def new_request(
         "worktree": worktree,
         "uncommitted_changes": uncommitted,
     }
+    if source_id is not None:
+        result["copied_from"] = source_id
+    return result
 
 
 def _doctor_entry(
@@ -4374,6 +4407,7 @@ def _render_new_result(result: dict[str, Any]) -> str:
         [
             ("Experiment", experiment_id),
             ("Path", path),
+            ("Copied from", result.get("copied_from")),
             ("Commit", result["commit"]),
             ("Branch", result["branch"]),
             ("Worktree", result["worktree"]),
@@ -4383,7 +4417,7 @@ def _render_new_result(result: dict[str, Any]) -> str:
             ),
         ],
         next_steps=[
-            f"Edit {path}",
+            f"{'Review' if result.get('copied_from') else 'Edit'} {path}",
             shlex.join(["expctl", "validate", experiment_id]),
         ],
     )
@@ -5394,6 +5428,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     new.add_argument("--title", metavar="TEXT", help="fill in the request title")
     new.add_argument(
+        "--from",
+        dest="source_id",
+        metavar="ID",
+        help="copy every setting from this request instead of the template",
+    )
+    new.add_argument(
         "--allow-dirty",
         action="store_true",
         help="create the request even when changes are not included in HEAD",
@@ -5683,11 +5723,13 @@ def main(argv: list[str] | None = None) -> int:
                 ready = bool(result.get("local_ready", result["cluster_ready"]))
             return 0 if ready else 1
         config = load_config(repo)
-        reference = getattr(args, "experiment_id", None)
-        if args.command != "new" and reference is not None:
-            args.experiment_id = resolve_experiment_id(repo, config, reference)
-            if args.experiment_id != reference:
-                print(f"expctl: {reference} -> {args.experiment_id}", file=sys.stderr)
+        id_argument = "source_id" if args.command == "new" else "experiment_id"
+        reference = getattr(args, id_argument, None)
+        if reference is not None:
+            resolved = resolve_experiment_id(repo, config, reference)
+            setattr(args, id_argument, resolved)
+            if resolved != reference:
+                print(f"expctl: {reference} -> {resolved}", file=sys.stderr)
         if args.command == "new":
             result = new_request(
                 repo,
@@ -5695,6 +5737,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.experiment_id,
                 allow_dirty=args.allow_dirty,
                 title=args.title,
+                source_id=args.source_id,
             )
             _print_command_result(
                 result, _render_new_result(result), force_json=args.json

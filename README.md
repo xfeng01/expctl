@@ -42,8 +42,9 @@ expctl init
 expctl doctor [--backend slurm|local] [--cluster] [--json]
 
 # Create a request from the repository template and fill in Git metadata.
-# A bare short name such as lr-sweep is prefixed with today's date.
-expctl new <id> [--title TEXT] [--allow-dirty] [--json]
+# A bare short name such as lr-sweep is prefixed with today's date. --from
+# copies every setting of an existing request but pins the current HEAD.
+expctl new <id> [--from ID] [--title TEXT] [--allow-dirty] [--json]
 
 # List, filter, sort, and limit experiment requests.
 expctl list [--table | --tsv | --json] [--status STATUS[,STATUS...]] [--sort newest|oldest] [--limit N | --all] [--no-color]
@@ -319,7 +320,12 @@ it with SLURM manually.
 
 Use `expctl new <id>` to start from `expctl/templates/request.toml` with the
 current commit, branch, ID, and worktree name filled in; `expctl new lr-sweep
---title "Learning-rate sweep"` creates `<today>-lr-sweep` with its title. The
+--title "Learning-rate sweep"` creates `<today>-lr-sweep` with its title. To
+repeat an earlier experiment on newer code, `expctl new lr-sweep-v2 --from
+lr-sweep` copies that request's question, backend, environment, and outputs,
+replaces only the ID, branch, commit, and worktree name, and drops any
+`rerun_of`. (`rerun` is for the same code; `new --from` pins the current
+`HEAD`.) The
 [detailed guide (Chinese)](docs/usage.zh.md) covers every request field,
 configuration option, and recovery procedure. For an AI runner, adapt
 [`examples/skill/SKILL.md`](examples/skill/SKILL.md) with project-specific
