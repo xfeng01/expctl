@@ -60,6 +60,10 @@ WORKTREE_ROOT_ENV = "EXPCTL_WORKTREE_ROOT"
 DEFAULT_ROOT = "expctl"
 DEFAULT_SHARED_DIRS = (".venv", "data", "runs", "logs")
 DEFAULT_CREATE_MISSING = ("runs", "logs")
+# Host-wide GPU claims for local jobs, shared by every user and repository on
+# the host. A claim is an flock that the job's supervisor holds, so it ends
+# with the job and never needs cleaning up.
+GPU_LOCK_DIR = Path("/tmp/expctl-gpu-locks")
 
 ID_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]*$")
 SHORT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -135,10 +139,12 @@ EXAMPLE_OPTION = "value"
 
 # To run directly on the current compute node, delete the [slurm] tables above
 # and uncomment this block instead. A local script must be executable in Git;
-# `args` is optional.
+# `args` is optional. `gpus` is how many of this host's GPUs the job claims;
+# without it the job claims every GPU on the host.
 # [local]
 # script = "scripts/example.sh"
 # args = ["--example"]
+# gpus = 1
 #
 # [local.env]
 # EXAMPLE_OPTION = "value"
@@ -953,6 +959,11 @@ def validate_request(
             raise ExpctlError(
                 "local.args must be an array of strings without NUL bytes"
             )
+        gpus = execution.get("gpus")
+        if gpus is not None and (
+            not isinstance(gpus, int) or isinstance(gpus, bool) or gpus < 0
+        ):
+            raise ExpctlError("local.gpus must be an integer >= 0")
 
     env = execution.get("env", {})
     if not isinstance(env, dict):
@@ -1713,6 +1724,23 @@ def doctor_repo(repo: Path) -> dict[str, Any]:
             scope="local",
         )
     )
+    host_ok, host_detail = _local_host_role()
+    checks.append(_doctor_entry("Execution host", host_ok, host_detail, scope="local"))
+    pool, source = _host_gpus(repo)
+    if pool is None:
+        gpu_detail = f"not assigned to jobs: {source}"
+    elif not pool:
+        gpu_detail = f"none (from {source})"
+    else:
+        gpu_detail = f"{','.join(pool)} (from {source})"
+        used = _gpu_usage(pool)
+        if used:
+            gpu_detail += f"; in use: {_gpu_holders_text(used)}"
+    checks.append(
+        _doctor_entry(
+            "GPUs", pool is not None, gpu_detail, scope="local", required=False
+        )
+    )
     for command in ("sbatch", "squeue", "sacct", "scancel"):
         command_path = shutil.which(command)
         checks.append(
@@ -2125,6 +2153,235 @@ def _local_host_error(receipt: dict[str, Any]) -> str | None:
     return None
 
 
+def _slurmd_running(proc: Path = Path("/proc")) -> bool:
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            if (entry / "comm").read_text(encoding="utf-8").strip() == "slurmd":
+                return True
+        except (OSError, UnicodeError):
+            continue
+    return False
+
+
+def _local_host_role() -> tuple[bool, str]:
+    """Whether local jobs may run on this host, and why.
+
+    A host with SLURM's client tools but no slurmd is where people submit
+    jobs, not where jobs run. Anything slurmd started (a batch script, an
+    srun step, an interactive allocation) carries SLURMD_NODENAME.
+    """
+    if shutil.which("sbatch") is None:
+        return True, "no SLURM client tools on PATH"
+    node = os.environ.get("SLURMD_NODENAME")
+    if node:
+        return True, f"inside a SLURM allocation on {node}"
+    if _slurmd_running():
+        return True, "slurmd runs on this host"
+    return False, "SLURM login node: sbatch is on PATH, but no slurmd runs here"
+
+
+def _host_gpus(repo: Path) -> tuple[list[str] | None, str]:
+    """The GPUs local jobs may claim on this host, and where the list came from.
+
+    A set CUDA_VISIBLE_DEVICES is the pool: it is what a SLURM allocation
+    grants, and how to keep some of a workstation's GPUs away from expctl.
+    Otherwise the pool is every GPU nvidia-smi reports. None means the GPUs
+    could not be listed.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        gpus = [item.strip() for item in visible.split(",") if item.strip()]
+        return gpus, "CUDA_VISIBLE_DEVICES"
+    if shutil.which("nvidia-smi") is None:
+        return None, "nvidia-smi is not on PATH"
+    try:
+        result = _run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            cwd=repo,
+            check=False,
+        )
+    except ExpctlError as exc:
+        return None, str(exc)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        return None, f"nvidia-smi failed: {detail or result.returncode}"
+    gpus = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return gpus, "nvidia-smi"
+
+
+def _gpu_lock_path(gpu: str) -> Path:
+    # GPU numbers inside a SLURM allocation count only what the job was
+    # granted, so two allocations on one node can each have a GPU 0.
+    job = os.environ.get("SLURM_JOB_ID")
+    scope = f"slurm-{job}" if job else "host"
+    return GPU_LOCK_DIR / re.sub(r"[^A-Za-z0-9_.-]", "_", f"{scope}-gpu-{gpu}.lock")
+
+
+def _open_gpu_lock(path: Path) -> int:
+    """Open a GPU lock that every user on the host can lock and annotate.
+
+    An existing lock is opened without O_CREAT, which protected_regular
+    refuses for another user's file in a sticky directory.
+    """
+    try:
+        return os.open(path, os.O_RDWR)
+    except FileNotFoundError:
+        pass
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        return os.open(path, os.O_RDWR)
+    with contextlib.suppress(OSError):
+        os.fchmod(descriptor, 0o666)
+    return descriptor
+
+
+def _gpu_holder(descriptor: int) -> str:
+    try:
+        holder = json.loads(os.pread(descriptor, 4096, 0).decode("utf-8"))
+        return f"{holder['experiment_id']} ({holder['user']}, {holder['repository']})"
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+        return "another local job"
+
+
+def _gpu_usage(pool: list[str]) -> dict[str, str]:
+    """Which GPUs in the pool local jobs hold right now, and who holds them."""
+    used: dict[str, str] = {}
+    if fcntl is None:
+        return used
+    for gpu in pool:
+        try:
+            descriptor = os.open(_gpu_lock_path(gpu), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            used[gpu] = _gpu_holder(descriptor)
+        finally:
+            os.close(descriptor)
+    return used
+
+
+def _gpu_holders_text(holders: dict[str, str]) -> str:
+    """Describe {gpu: holder} as `GPU 0,1 by <holder>; GPU 2 by <holder>`."""
+    grouped: dict[str, list[str]] = {}
+    for gpu, holder in holders.items():
+        grouped.setdefault(holder, []).append(gpu)
+    return "; ".join(f"GPU {','.join(gpus)} by {who}" for who, gpus in grouped.items())
+
+
+def _claim_gpus(
+    repo: Path, experiment_id: str, wanted: int | None
+) -> tuple[list[str] | None, tuple[int, ...]]:
+    """Lock `wanted` free GPUs on this host for one job; None wants them all.
+
+    Returns the claimed GPUs and their locked descriptors. The job's
+    supervisor inherits the descriptors, so the claim lasts exactly as long
+    as the job. The GPUs are None, leaving the job's environment alone, only
+    when the host's GPUs cannot be listed and the job did not ask for any
+    number of them.
+    """
+    pool, source = _host_gpus(repo)
+    if pool is None:
+        if wanted is None:
+            return None, ()
+        if wanted == 0:
+            return [], ()
+        raise ExpctlError(
+            f"the job needs {wanted} GPU(s), but expctl cannot list this host's "
+            f"GPUs ({source}); set CUDA_VISIBLE_DEVICES to the GPUs it may use"
+        )
+    count = len(pool) if wanted is None else wanted
+    if count > len(pool):
+        raise ExpctlError(
+            f"the job needs {count} GPU(s), but this host has {len(pool)} "
+            f"(from {source})"
+        )
+    if count == 0:
+        return [], ()
+    if fcntl is None:
+        raise ExpctlError("local execution requires a Linux compute node")
+    try:
+        GPU_LOCK_DIR.mkdir(mode=0o777, exist_ok=True)
+    except OSError as exc:
+        raise ExpctlError(f"could not create {GPU_LOCK_DIR}: {exc}") from exc
+    with contextlib.suppress(OSError):  # Only the directory's owner can do this.
+        os.chmod(GPU_LOCK_DIR, 0o1777)
+
+    claimed: list[str] = []
+    descriptors: list[int] = []
+    busy: dict[str, str] = {}
+    try:
+        for gpu in pool:
+            if len(claimed) == count:
+                break
+            path = _gpu_lock_path(gpu)
+            try:
+                descriptor = _open_gpu_lock(path)
+            except OSError as exc:
+                raise ExpctlError(f"could not open GPU lock {path}: {exc}") from exc
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                busy[gpu] = _gpu_holder(descriptor)
+                os.close(descriptor)
+                continue
+            except OSError as exc:
+                os.close(descriptor)
+                raise ExpctlError(f"could not lock GPU {gpu}: {exc}") from exc
+            descriptors.append(descriptor)
+            claimed.append(gpu)
+        if len(claimed) < count:
+            in_use = _gpu_holders_text(busy)
+            hint = (
+                "; a [local] request without gpus claims every GPU, so set "
+                "[local] gpus to share the host"
+                if wanted is None
+                else "; submit it again once they are free"
+            )
+            raise ExpctlError(
+                f"the job needs {count} GPU(s), but only {len(claimed)} of "
+                f"{len(pool)} are free (from {source}); in use: {in_use}{hint}"
+            )
+        holder = json.dumps(
+            {
+                "experiment_id": experiment_id,
+                "repository": str(repo),
+                "user": getpass.getuser(),
+                "claimed_at": dt.datetime.now(dt.UTC).isoformat(),
+            }
+        ).encode("utf-8")
+        for descriptor in descriptors:
+            with contextlib.suppress(OSError):  # The note only explains refusals.
+                os.ftruncate(descriptor, 0)
+                os.pwrite(descriptor, holder, 0)
+    except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+    return claimed, tuple(descriptors)
+
+
+def _gpu_environment(
+    gpus: list[str] | None, request_env: dict[str, str]
+) -> dict[str, str]:
+    """The variables that confine a local job to the GPUs it claimed."""
+    if gpus is None:
+        return {}
+    environment = {"CUDA_VISIBLE_DEVICES": ",".join(gpus)}
+    # Number GPUs the way nvidia-smi and SLURM do, not fastest first.
+    if gpus and "CUDA_DEVICE_ORDER" not in {**os.environ, **request_env}:
+        environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    return environment
+
+
 def _local_status_path(repo: Path, config: Config, experiment_id: str) -> Path:
     return result_dir(repo, config, experiment_id) / "local-status.json"
 
@@ -2299,6 +2556,7 @@ def _local_status_request(
         "job_id": job_id,
         "pid": receipt.get("pid"),
         "hostname": receipt.get("hostname"),
+        "gpus": receipt.get("gpus"),
         "receipt_status": receipt.get("status"),
         "in_queue": running,
         "queue_counts": {"RUNNING": 1} if running else {},
@@ -2328,6 +2586,8 @@ def _start_local_process(
     worktree: Path,
     *,
     job_id: str,
+    gpus: list[str] | None = None,
+    gpu_locks: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     if fcntl is None or os.name != "posix":
         raise ExpctlError("local execution requires a Linux compute node")
@@ -2354,6 +2614,7 @@ def _start_local_process(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
     environment.update(local.get("env", {}))
+    environment.update(_gpu_environment(gpus, local.get("env", {})))
     environment.update(
         {
             "EXPCTL_BACKEND": "local",
@@ -2382,6 +2643,7 @@ def _start_local_process(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
+                pass_fds=gpu_locks,
             )
     except FileExistsError as exc:
         raise ExpctlError(f"local log already exists: {log_path}") from exc
@@ -2414,6 +2676,48 @@ _LOCAL_SLURM_PASSTHROUGH: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 SLURM_FILENAME_SPEC_RE = re.compile(r"%(\d*)([A-Za-z%])")
 # What SLURM expands `%a` to outside an array job.
 _NOT_AN_ARRAY_TASK = "4294967294"
+
+
+def _sbatch_gpu_count(script_lines: list[str]) -> int:
+    """How many GPUs a pinned SLURM script asks for on its one node.
+
+    --gpus-per-node and --gres=gpu count per node, --gpus per job (one node
+    here), and --gpus-per-task once per --ntasks. GPU types such as `a100:2`
+    are ignored. A script that asks for no GPUs gets none, as under SLURM.
+    """
+
+    def counted(option: str, value: str) -> int:
+        total = 0
+        for item in value.split(","):
+            match = re.fullmatch(r"(?:[^:]+:)?(\d+)", item.strip())
+            if match is None:
+                raise ExpctlError(
+                    f"cannot read a GPU count from #SBATCH {option}={value}"
+                )
+            total += int(match.group(1))
+        return total
+
+    counts: list[int] = []
+    for long_name, short_name in (
+        ("--gpus-per-node", "--gpus-per-node"),
+        ("--gpus", "-G"),
+    ):
+        value = _sbatch_option(script_lines, long_name, short_name)
+        if value is not None:
+            counts.append(counted(long_name, value))
+    gres = _sbatch_option(script_lines, "--gres", "--gres")
+    for item in [] if gres is None else gres.split(","):
+        name, _, detail = item.strip().partition(":")
+        if name == "gpu":  # gpu, gpu:2, gpu:a100, gpu:a100:2
+            last = detail.rpartition(":")[2]
+            counts.append(int(last) if last.isdigit() else 1)
+    per_task = _sbatch_option(script_lines, "--gpus-per-task", "--gpus-per-task")
+    if per_task is not None:
+        tasks = _sbatch_option(script_lines, "--ntasks", "-n") or "1"
+        if not tasks.isdigit():
+            raise ExpctlError(f"cannot read a task count from #SBATCH --ntasks={tasks}")
+        counts.append(counted("--gpus-per-task", per_task) * int(tasks))
+    return max(counts, default=0)
 
 
 def _local_job_id() -> str:
@@ -2594,6 +2898,8 @@ def _start_local_slurm_process(
     experiment_id: str,
     worktree: Path,
     plan: dict[str, Any],
+    *,
+    gpu_locks: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     """Start the supervisor that runs a pinned SLURM script on this host.
 
@@ -2649,6 +2955,7 @@ def _start_local_slurm_process(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            pass_fds=gpu_locks,
         )
         started = True
     except OSError as exc:
@@ -2677,6 +2984,7 @@ def submit_request(
     skip_node_check: bool,
     worktree_root: Path | None,
     backend: str | None = None,
+    allow_login_node: bool = False,
 ) -> dict[str, Any]:
     path = request_path(repo, config, experiment_id)
     if not path.is_file():
@@ -2702,12 +3010,32 @@ def submit_request(
     emulate_slurm = backend == "local" and request_backend == "slurm"
     if backend == "local" and skip_node_check:
         raise ExpctlError("--skip-node-check applies only to SLURM submissions")
+    if backend == "local":
+        host_ok, host_detail = _local_host_role()
+        if not host_ok and not allow_login_node:
+            instead = (
+                "submit it to the cluster without --backend local"
+                if emulate_slurm
+                else "run expctl inside a SLURM allocation (srun --pty bash)"
+            )
+            raise ExpctlError(
+                f"{host_detail}, so the job would run on the login node; {instead}, "
+                "or pass --allow-login-node if this host is meant to run jobs"
+            )
+    if request_backend == "local" and "CUDA_VISIBLE_DEVICES" in execution.get(
+        "env", {}
+    ):
+        raise ExpctlError(
+            "local.env cannot set CUDA_VISIBLE_DEVICES: expctl assigns a local "
+            "job its GPUs; set [local] gpus instead"
+        )
     code = _table(request, "code")
     worktree = _worktree_path(repo, config, request, worktree_root)
     verified_nodes = None
     plan: dict[str, Any] = {}
     warnings: list[str] = []
     job_id = ""
+    gpus_wanted = execution.get("gpus") if request_backend == "local" else None
     if request_backend == "slurm":
         script_lines = _git_text(
             repo, "show", f"{code['commit']}:{execution['script']}"
@@ -2728,6 +3056,7 @@ def submit_request(
         warnings = _local_slurm_warnings(
             request, plan, verified_nodes=verified_nodes, job_id=job_id
         )
+        gpus_wanted = _sbatch_gpu_count(script_lines)
         command = plan["argv"]
         execution_environment = None
         cleared_environment = []
@@ -2769,6 +3098,10 @@ def submit_request(
     else:
         preview["log"] = request["outputs"]["log_glob"]
     if dry_run:
+        if backend == "local":
+            preview["gpus"], probe = _claim_gpus(repo, experiment_id, gpus_wanted)
+            for descriptor in probe:
+                os.close(descriptor)
         return preview
 
     attempt_id = uuid.uuid4().hex
@@ -2825,7 +3158,21 @@ def submit_request(
         raise
 
     submission_started = False
+    gpus: list[str] | None = None
+    gpu_locks: tuple[int, ...] = ()
     try:
+        if backend == "local":
+            gpus, gpu_locks = _claim_gpus(repo, experiment_id, gpus_wanted)
+            pending["gpus"] = gpus
+            if emulate_slurm:
+                plan["env"].update(_gpu_environment(gpus, execution.get("env", {})))
+                if gpus:
+                    plan["env"].update(
+                        {
+                            "SLURM_GPUS_ON_NODE": str(len(gpus)),
+                            "SLURM_JOB_GPUS": ",".join(gpus),
+                        }
+                    )
         with _worktree_submission_guard(repo, worktree):
             _check_worktree_available(repo, config, worktree, experiment_id)
             _ensure_worktree(
@@ -2892,7 +3239,7 @@ def submit_request(
                         )
                 elif emulate_slurm:
                     local_details = _start_local_slurm_process(
-                        repo, config, experiment_id, worktree, plan
+                        repo, config, experiment_id, worktree, plan, gpu_locks=gpu_locks
                     )
                     local_details["log"] = request["outputs"]["log_glob"].format(
                         job_id=job_id
@@ -2907,6 +3254,8 @@ def submit_request(
                         request,
                         worktree,
                         job_id=job_id,
+                        gpus=gpus,
+                        gpu_locks=gpu_locks,
                     )
                     submission_started = True
 
@@ -2934,6 +3283,10 @@ def submit_request(
             except (ExpctlError, OSError):
                 pass
         raise
+    finally:
+        # A started job's supervisor holds its own copies of the GPU locks.
+        for descriptor in gpu_locks:
+            os.close(descriptor)
 
 
 def requested_experiment_ids(repo: Path, config: Config) -> list[str]:
@@ -2954,12 +3307,14 @@ def submit_requested(
     skip_node_check: bool,
     worktree_root: Path | None,
     backend: str | None = None,
+    allow_login_node: bool = False,
 ) -> dict[str, Any]:
     """Submit every request without a receipt, continuing past failures.
 
     Requests are handled oldest first. Each one is validated and submitted on
-    its own, so an invalid request or an exhausted node budget only skips
-    that request; the others still run. Failures are reported in the result.
+    its own, so an invalid request, an exhausted node budget, or a busy GPU
+    only skips that request; the others still run. Failures are reported in
+    the result.
     """
     requested = requested_experiment_ids(repo, config)
     results: list[dict[str, Any]] = []
@@ -2975,6 +3330,7 @@ def submit_requested(
                     skip_node_check=skip_node_check,
                     worktree_root=worktree_root,
                     backend=backend,
+                    allow_login_node=allow_login_node,
                 )
             )
         except ExpctlError as exc:
@@ -4175,6 +4531,7 @@ def _render_report(
         ("Request", request_line),
         ("Backend", receipt.get("backend", "slurm")),
         ("Host", receipt.get("hostname")),
+        ("GPUs", _format_gpus(receipt.get("gpus"))),
         ("Commit", f"`{code['commit']}` ({code['branch']})"),
         ("Job", submitted),
         ("Execution", verdict),
@@ -4524,6 +4881,7 @@ def _render_validate_summary(
                 "Args",
                 shlex.join(execution.get("args", [])) if backend == "local" else None,
             ),
+            ("GPUs", _request_gpus(execution) if backend == "local" else None),
             ("Env", ", ".join(f"{k}={v}" for k, v in sorted(env.items())) or None),
             ("Logs", outputs["log_glob"]),
             ("Metrics", f"{len(metrics)}: {shown_metrics}"),
@@ -4581,6 +4939,7 @@ def _render_show_result(
                 "Args",
                 shlex.join(execution.get("args", [])) if backend == "local" else None,
             ),
+            ("GPUs", _request_gpus(execution) if backend == "local" else None),
             (
                 "Env",
                 ", ".join(
@@ -4692,7 +5051,7 @@ def _render_doctor_result(
         ]
     elif selected == "local" and not local_ready:
         next_steps = [
-            "Run expctl on a Linux compute node with fcntl and /proc support."
+            "Run expctl on a Linux compute node (fcntl, /proc), not a login node."
         ]
     elif selected is None and (not local_ready or not slurm_ready):
         next_steps = [
@@ -4714,6 +5073,19 @@ def _format_node_envelope(verified: object, declared: object) -> str:
     return f"{verified_text} / {declared_text}"
 
 
+def _request_gpus(local: dict[str, Any]) -> str:
+    """How many GPUs a [local] request claims, as its summaries show it."""
+    gpus = local.get("gpus")
+    return "every GPU on the host" if gpus is None else str(gpus)
+
+
+def _format_gpus(gpus: object) -> str | None:
+    """A local job's claimed GPUs; None when expctl did not manage them."""
+    if not isinstance(gpus, list):
+        return None
+    return ",".join(str(gpu) for gpu in gpus) or "none"
+
+
 def _render_submit_result(
     result: dict[str, Any],
     *,
@@ -4721,6 +5093,7 @@ def _render_submit_result(
     worktree_root: Path | None,
     skip_node_check: bool,
     backend: str | None = None,
+    allow_login_node: bool = False,
 ) -> str:
     experiment_id = str(result["experiment_id"])
     result_backend = str(result.get("backend", "slurm"))
@@ -4742,6 +5115,7 @@ def _render_submit_result(
         ("Array", result.get("array")),
         ("PID", result.get("pid")),
         ("Host", result.get("hostname")),
+        ("GPUs", _format_gpus(result.get("gpus"))),
         ("Commit", result.get("commit")),
         ("Worktree", result.get("worktree")),
         ("Log", result.get("log")),
@@ -4757,6 +5131,8 @@ def _render_submit_result(
             submit_command.extend(["--worktree-root", str(worktree_root)])
         if skip_node_check:
             submit_command.append("--skip-node-check")
+        if allow_login_node:
+            submit_command.append("--allow-login-node")
         return _render_summary(
             "SUBMISSION PREVIEW",
             fields,
@@ -4776,6 +5152,7 @@ def _render_submit_batch_result(
     worktree_root: Path | None,
     skip_node_check: bool,
     backend: str | None = None,
+    allow_login_node: bool = False,
 ) -> str:
     requested = list(result.get("requested", []))
     if not requested:
@@ -4787,6 +5164,7 @@ def _render_submit_batch_result(
             worktree_root=worktree_root,
             skip_node_check=skip_node_check,
             backend=backend,
+            allow_login_node=allow_login_node,
         )
         for item in result.get("results", [])
     ]
@@ -4807,6 +5185,8 @@ def _render_submit_batch_result(
             submit_command.extend(["--worktree-root", str(worktree_root)])
         if skip_node_check:
             submit_command.append("--skip-node-check")
+        if allow_login_node:
+            submit_command.append("--allow-login-node")
         summary.extend(["", _render_next_steps([shlex.join(submit_command)])])
     elif done:
         summary.extend(["", _render_next_steps(["expctl list"])])
@@ -4855,6 +5235,7 @@ def _render_status_result(result: dict[str, Any], *, result_path: str) -> str:
         ("Job", result.get("job_id")),
         ("PID", result.get("pid")),
         ("Host", result.get("hostname")),
+        ("GPUs", _format_gpus(result.get("gpus"))),
         ("Receipt", receipt_status),
         ("Queue", queue_summary),
         ("Source", result.get("source")),
@@ -5998,6 +6379,14 @@ def _parser() -> argparse.ArgumentParser:
         help="skip the SLURM node-budget check; requires operator authorization",
     )
     submit.add_argument(
+        "--allow-login-node",
+        action="store_true",
+        help=(
+            "run a local job even though this host looks like a SLURM login "
+            "node (sbatch on PATH, no slurmd)"
+        ),
+    )
+    submit.add_argument(
         "--worktree-root",
         type=Path,
         help=(
@@ -6346,6 +6735,7 @@ def main(argv: list[str] | None = None) -> int:
                     skip_node_check=args.skip_node_check,
                     worktree_root=args.worktree_root,
                     backend=args.backend,
+                    allow_login_node=args.allow_login_node,
                 )
                 _print_command_result(
                     batch,
@@ -6355,6 +6745,7 @@ def main(argv: list[str] | None = None) -> int:
                         worktree_root=args.worktree_root,
                         skip_node_check=args.skip_node_check,
                         backend=args.backend,
+                        allow_login_node=args.allow_login_node,
                     ),
                     force_json=args.json,
                 )
@@ -6374,6 +6765,7 @@ def main(argv: list[str] | None = None) -> int:
                 skip_node_check=args.skip_node_check,
                 worktree_root=args.worktree_root,
                 backend=args.backend,
+                allow_login_node=args.allow_login_node,
             )
             _print_command_result(
                 result,
@@ -6383,6 +6775,7 @@ def main(argv: list[str] | None = None) -> int:
                     worktree_root=args.worktree_root,
                     skip_node_check=args.skip_node_check,
                     backend=args.backend,
+                    allow_login_node=args.allow_login_node,
                 ),
                 force_json=args.json,
             )

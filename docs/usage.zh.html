@@ -359,7 +359,7 @@ expctl/
 └── templates/request.toml  <span class="c"># 请求模板</span></code></pre>
     <p>随后编辑 <code>expctl.toml</code>，确认共享运行时目录和 worktree 位置；使用 SLURM 时还要确认脚本策略和节点上限。</p>
     <p>若修改 <code>paths.root</code>，再次运行 <code>expctl init</code> 会在新位置补齐目录，但不会移动或删除旧目录。将配置、请求、模板和结果元数据纳入版本控制；不要提交数据集、模型权重、缓存或密钥。</p>
-    <p><code>expctl doctor</code> 分别报告仓库、local 和 SLURM 是否可用。默认只有仓库检查影响退出码；<code>--backend local</code> 或 <code>--backend slurm</code> 会要求对应后端可用。旧的 <code>--cluster</code> 等价于 <code>--backend slurm</code>。</p>
+    <p><code>expctl doctor</code> 分别报告仓库、local 和 SLURM 是否可用；local 部分还会检查本机是否像 SLURM 登录节点，并列出本机 GPU 及其占用情况。默认只有仓库检查影响退出码；<code>--backend local</code> 或 <code>--backend slurm</code> 会要求对应后端可用。旧的 <code>--cluster</code> 等价于 <code>--backend slurm</code>。</p>
     <div class="note"><p>expctl 只读写文件，不会自动执行 <code>git add</code>、<code>git commit</code> 或 <code>git push</code>。</p></div>
 
     <h2 id="author"><span class="num">三</span>创建并发布实验请求</h2>
@@ -381,14 +381,25 @@ expctl new lr-sweep --title "Learning-rate sweep"   # 自动补上当天日期</
     <p><code>expctl validate --all</code> 按 ID 从旧到新一次校验全部请求文件（与 <code>list</code> 一样使用批量 Git 查询），逐个列出无效请求及原因，有任何无效请求时退出码为非零，适合放进 CI 或 pre-commit 钩子。</p>
 
     <h2 id="runner"><span class="num">四</span>提交、查看和收集</h2>
-    <p>每个请求必须且只能选择一种后端。SLURM 使用 <code>[slurm]</code>、<code>script</code>、可选的 <code>max_concurrent_nodes</code> 和可选的 <code>[slurm.env]</code>；计算节点直跑使用 <code>[local]</code>、<code>script</code>、可选的 <code>args</code> 和 <code>[local.env]</code>。</p>
-    <div class="note"><p>local 脚本必须在 Git 中带可执行位；<code>outputs.log_glob</code> 必须是含 <code>{job_id}</code> 的精确路径，不能使用通配符。local 会捕获 stdout/stderr，固定启动节点主机名，并用 Linux <code>/proc</code> 核对 PID 身份；状态、取消和收集必须在同一节点执行。它不提供排队、资源隔离或主机重启恢复。</p></div>
+    <p>每个请求必须且只能选择一种后端。SLURM 使用 <code>[slurm]</code>、<code>script</code>、可选的 <code>max_concurrent_nodes</code> 和可选的 <code>[slurm.env]</code>；计算节点直跑使用 <code>[local]</code>、<code>script</code>、可选的 <code>args</code>、可选的 <code>gpus</code> 和 <code>[local.env]</code>。</p>
+    <div class="note"><p>local 脚本必须在 Git 中带可执行位；<code>outputs.log_glob</code> 必须是含 <code>{job_id}</code> 的精确路径，不能使用通配符。local 会捕获 stdout/stderr，固定启动节点主机名，并用 Linux <code>/proc</code> 核对 PID 身份；状态、取消和收集必须在同一节点执行。除下面的 GPU 认领外，它不提供排队、资源隔离或主机重启恢复。</p></div>
+
+    <h3>GPU 与登录节点</h3>
+    <p>无论来自 <code>[local]</code> 请求还是 <code>--backend local</code>，每个本机作业都会在所在主机上认领 GPU，并通过 <code>CUDA_VISIBLE_DEVICES</code> 只看到这些 GPU：</p>
+    <ul>
+      <li><code>[local]</code> 请求认领 <code>local.gpus</code> 张，省略 <code>gpus</code> 时认领本机全部 GPU。用 <code>--backend local</code> 运行的 <code>[slurm]</code> 请求按脚本里的 <code>#SBATCH --gpus-per-node</code>、<code>--gres=gpu</code>、<code>--gpus</code> 或 <code>--gpus-per-task</code> 认领；一个都没写就不分配 GPU，和 SLURM 一样。它还会拿到 <code>SLURM_GPUS_ON_NODE</code> 和 <code>SLURM_JOB_GPUS</code>。</li>
+      <li>本机可用的 GPU 是运行 <code>expctl submit</code> 时的 <code>CUDA_VISIBLE_DEVICES</code>，未设置时是 <code>nvidia-smi</code> 列出的全部 GPU。在 SLURM 分配里，这就是分到的那几张卡；在工作站上，<code>CUDA_VISIBLE_DEVICES=2,3 expctl submit &lt;id&gt;</code> 可以把 0、1 号卡留给自己用。GPU 编号与 <code>nvidia-smi</code> 一致（未设置 <code>CUDA_DEVICE_ORDER</code> 时导出 <code>PCI_BUS_ID</code>）。</li>
+      <li>认领是 <code>/tmp/expctl-gpu-locks</code> 下由作业监督进程持有的 <code>flock</code>，对本机所有仓库和用户都生效，作业无论以何种方式结束都会随之释放。空闲 GPU 不够时 <code>submit</code> 直接拒绝并指出占用者，不会排队；<code>submit --all</code> 先提交放得下的请求，其余请求报错跳过、不生成回执，下次 <code>submit --all</code> 会接着提交。</li>
+      <li><code>local.env</code> 不能设置 <code>CUDA_VISIBLE_DEVICES</code>。没有 <code>nvidia-smi</code> 且未设置 <code>CUDA_VISIBLE_DEVICES</code> 时，需要一定数量 GPU 的作业会被拒绝，未写 <code>gpus</code> 的 <code>[local]</code> 请求则按原有环境运行。</li>
+    </ul>
+    <p>回执、<code>status</code> 和报告都会记录认领到的 GPU，<code>doctor</code> 会列出本机 GPU 以及哪些正被占用。</p>
+    <div class="note"><p>有 <code>sbatch</code> 却没有运行 <code>slurmd</code> 的主机是 SLURM 登录节点，在这里本机执行会被拒绝：把请求提交到集群，或进入分配（<code>srun --pty bash</code>，此时会设置 <code>SLURMD_NODENAME</code>）后再运行 expctl。确实要在这台主机上跑作业时，用 <code>--allow-login-node</code> 跳过检查。<code>doctor --backend local</code> 中对应的检查项是 <code>Execution host</code>。</p></div>
 
     <h3>在本机运行 SLURM 请求</h3>
 <pre data-lang="bash"><code>expctl submit &lt;id&gt; --backend local</code></pre>
     <p><code>--backend local</code> 不调用 <code>sbatch</code>，而是把 <code>[slurm]</code> 请求固定的脚本放在当前主机上跑；请求、worktree、回执和收集到的证据都不变。脚本里的 <code>#SBATCH</code> 行仍然只是注释，expctl 读它来复现调度器本会做的事：脚本在自己的 worktree 中由 <code>bash</code> 执行、进程组独立，并导出 <code>SLURM_SUBMIT_DIR</code>、<code>SLURM_JOB_ID</code>、<code>SLURM_JOB_NAME</code> 以及由 <code>--partition</code>、<code>--account</code>、<code>--cpus-per-task</code>、<code>--ntasks</code>、<code>--gpus-per-node</code> 推出的资源变量；<code>--array</code> 的任务按下标顺序一个接一个地跑，各自带齐 <code>SLURM_ARRAY_*</code>；<code>--output</code> 和 <code>--error</code> 按 <code>%j</code>、<code>%A</code>、<code>%a</code> 等规则展开，所有日志在任何任务开始前创建。</p>
     <p>作业号是本机生成的八位数字，数组任务为 <code>&lt;作业号&gt;_&lt;任务号&gt;</code>。回执记录 <code>backend = "local"</code> 与 <code>emulated_backend = "slurm"</code>；<code>status</code> 改看进程和退出状态文件，<code>cancel</code> 改向进程组发 <code>SIGTERM</code>，<code>collect</code> 写入与 <code>sacct</code> 同形状的逐任务终态。</p>
-    <div class="note"><p>单机不执行 <code>#SBATCH</code> 的资源申请：没有分区、节点隔离或时间上限。<code>submit</code> 会对可能占用多节点的脚本，以及与 <code>outputs.log_glob</code> 对不上的 <code>--output</code> 文件名给出警告。<code>--skip-node-check</code> 属于 SLURM，不能与 <code>--backend local</code> 同用；<code>--backend slurm</code> 会拒绝 <code>[local]</code> 请求。</p></div>
+    <div class="note"><p>除 GPU 外，单机不执行 <code>#SBATCH</code> 的资源申请：没有分区、节点隔离或时间上限。<code>submit</code> 会对可能占用多节点的脚本，以及与 <code>outputs.log_glob</code> 对不上的 <code>--output</code> 文件名给出警告。<code>--skip-node-check</code> 属于 SLURM，不能与 <code>--backend local</code> 同用；<code>--backend slurm</code> 会拒绝 <code>[local]</code> 请求。</p></div>
 
     <p>不确定下一步该做什么时，直接运行不带子命令的 <code>expctl</code>。它按 <code>list</code> 的方式刷新状态，列出所有还没有 <code>reviewed</code> 的实验，并给出每个实验下一步要执行的命令：</p>
 <pre data-lang="text"><code>OPEN EXPERIMENTS
@@ -410,7 +421,7 @@ expctl show &lt;id&gt;
 expctl submit &lt;id&gt; --dry-run
 expctl submit &lt;id&gt;
 expctl submit --all</code></pre>
-    <p><code>expctl submit --all</code> 会按 ID 从旧到新提交所有还没有回执的请求。每个请求单独验证和提交，某个请求失败时只跳过它并记录错误，其余继续；有任何失败时退出码为非零。</p>
+    <p><code>expctl submit --all</code> 会按 ID 从旧到新提交所有还没有回执的请求。每个请求单独验证和提交，某个请求无效、节点预算不足或空闲 GPU 不够时只跳过它并记录错误，其余继续；有任何失败时退出码为非零。</p>
     <p><code>expctl list</code> 在交互终端中显示对齐表格，管道输出保持稳定 TSV。它批量刷新 SLURM 状态，并从进程身份和退出状态文件刷新 local 状态；刷新只读且不修改回执。可用 <code>--table</code>、<code>--tsv</code>、<code>--json</code> 强制格式。</p>
     <p><code>list</code> 默认从新到旧排列：先按 ID 中的日期，同一天的请求再按其文件首次提交的 Git 时间排序（尚未提交的文件视为当天最新）；<code>--sort oldest</code> 可反转。<code>--status running,failed</code> 按实时或回执状态筛选。<code>display.list_limit</code> 设置仓库默认显示数量，<code>--limit 20</code> 可临时覆盖，<code>--all</code> 显示全部。没有状态筛选时只处理最终可能显示的 N 个请求；带状态筛选时分批扫描，找到 N 个匹配项后停止；<code>--all</code> 才完整扫描。未配置该字段的旧仓库仍显示所有请求。</p>
     <p><code>list --long</code>（或 <code>-l</code>）额外显示回执记录的后端、作业号、提交时间和执行主机；用 <code>--backend local</code> 运行的 <code>[slurm]</code> 请求显示为 <code>local (slurm)</code>。表格中提交时间换算为本地时间，并省略所有行都为空的详情列；TSV 和 JSON 始终包含全部列。</p>
@@ -464,6 +475,7 @@ expctl clean &lt;id&gt;</code></pre>
         <tr><td><code>slurm.env</code></td><td>传给 <code>sbatch --export</code> 的环境变量；名称须匹配 <code>[A-Za-z_][A-Za-z0-9_]*</code> 且不能是 <code>GROUPS</code>，值必须是字符串且不能包含逗号或换行</td></tr>
         <tr><td><code>local.script</code></td><td>固定提交中的仓库相对可执行文件；必须带 Git 可执行位</td></tr>
         <tr><td><code>local.args</code></td><td>可选字符串数组，按顺序作为参数，不经过 shell 展开</td></tr>
+        <tr><td><code>local.gpus</code></td><td>可选的非负整数，作业在本机认领的 GPU 数；省略时认领全部 GPU</td></tr>
         <tr><td><code>local.env</code></td><td>传给本地进程的环境变量</td></tr>
         <tr><td><code>outputs.log_glob</code></td><td>相对于 worktree 且必须包含 <code>{job_id}</code>；SLURM 可使用 glob，local 必须是精确路径</td></tr>
         <tr><td><code>outputs.metrics</code></td><td>非空指标名数组；可提取的名称须匹配 <code>[A-Za-z_][A-Za-z0-9_.-]*</code>，对应值必须是独占一行的数字</td></tr>
@@ -522,6 +534,7 @@ root = ".."</code></pre>
         <tr><td><code>expctl submit &lt;id&gt; --backend local|slurm</code></td><td>覆盖请求声明的后端；<code>--backend local</code> 在本机运行 <code>[slurm]</code> 请求的脚本</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; --dry-run</code></td><td>验证并预览提交，不创建资源或启动作业</td></tr>
         <tr><td><code>expctl submit &lt;id&gt; --worktree-root &lt;dir&gt;</code></td><td>本次提交使用指定的 worktree 父目录</td></tr>
+        <tr><td><code>expctl submit &lt;id&gt; --allow-login-node</code></td><td>在看起来像 SLURM 登录节点的主机上仍然启动本机作业</td></tr>
         <tr><td><code>expctl submit --all [--dry-run] [--json]</code></td><td>按 ID 从旧到新提交所有还没有回执的请求；单个失败不影响其余请求</td></tr>
         <tr><td><code>expctl status &lt;id&gt; [--watch [SECONDS]] [--json]</code></td><td>查询一次状态，或按所选后端定时刷新到终态</td></tr>
         <tr><td><code>expctl logs &lt;id&gt; [--tail N] [--follow] [--worktree-root DIR]</code></td><td>查看运行中或已收集日志；默认显示末尾 100 行</td></tr>

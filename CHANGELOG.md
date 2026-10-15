@@ -46,6 +46,23 @@
 - `expctl --help` groups the commands by workflow stage instead of one flat
   list, and each `expctl <command> --help` now starts with a description of
   the command.
+- Local jobs now claim GPUs on their host and see only those through
+  `CUDA_VISIBLE_DEVICES`, so several jobs can share a multi-GPU machine. A
+  `[local]` request claims the new optional `local.gpus` (every GPU when it
+  is left out); a `[slurm]` request run with `--backend local` claims what its
+  `#SBATCH --gpus-per-node`, `--gres=gpu`, `--gpus`, or `--gpus-per-task`
+  lines ask for, and none otherwise. The host's GPUs are the submitting
+  shell's `CUDA_VISIBLE_DEVICES`, or else every GPU `nvidia-smi` lists. A claim
+  is an `flock` the job's supervisor holds, so it spans every repository and
+  user on the host and ends with the job. When too few GPUs are free, `submit`
+  refuses and names who holds them; `submit --all` submits what fits. The
+  receipt, `status`, the report, and `doctor` show the GPUs. `local.env` can no
+  longer set `CUDA_VISIBLE_DEVICES`.
+- Local execution is refused on a SLURM login node (a host with `sbatch` but
+  no `slurmd`, when expctl is not itself running in an `srun` step or batch
+  script), so a job cannot land on the login node by mistake.
+  `submit --allow-login-node` overrides the check, and
+  `doctor --backend local` reports it as `Execution host`.
 
 ## 0.12.0 — 2026-09-19
 

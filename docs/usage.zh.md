@@ -69,7 +69,7 @@ expctl doctor --backend local
 expctl doctor --backend slurm
 ```
 
-`doctor` 分别报告仓库、local 和 SLURM 是否可用。默认只有仓库检查影响退出码；`--backend local` 或 `--backend slurm` 会要求对应后端可用。旧的 `--cluster` 等价于 `--backend slurm`。使用 `--json` 可供脚本读取。
+`doctor` 分别报告仓库、local 和 SLURM 是否可用；local 部分还会检查本机是否像 SLURM 登录节点，并列出本机 GPU 及其占用情况。默认只有仓库检查影响退出码；`--backend local` 或 `--backend slurm` 会要求对应后端可用。旧的 `--cluster` 等价于 `--backend slurm`。使用 `--json` 可供脚本读取。
 
 将 `expctl.toml`、请求、模板和结果元数据纳入版本控制。不要提交数据集、模型权重、缓存或密钥。expctl 只读写文件，不会自动执行 `git add`、`git commit` 或 `git push`。
 
@@ -130,12 +130,26 @@ CONFIG = "configs/run.toml"
 [local]
 script = "scripts/train.py"
 args = ["--config", "configs/run.toml"]
+gpus = 1
 
 [local.env]
 MODE = "evaluation"
 ```
 
-local 脚本必须在固定提交中带可执行位，例如先运行 `git update-index --chmod=+x scripts/train.py` 并提交。local 的 `outputs.log_glob` 必须是包含 `{job_id}` 的单个精确路径，不能包含通配符；expctl 会把 stdout 和 stderr 都写入该文件。回执会固定启动节点的主机名，local 的状态、取消和收集必须在同一节点执行，并用 `/proc` 防止 PID 复用误判。local 不提供排队、资源隔离或机器重启后的自动恢复。
+local 脚本必须在固定提交中带可执行位，例如先运行 `git update-index --chmod=+x scripts/train.py` 并提交。local 的 `outputs.log_glob` 必须是包含 `{job_id}` 的单个精确路径，不能包含通配符；expctl 会把 stdout 和 stderr 都写入该文件。回执会固定启动节点的主机名，local 的状态、取消和收集必须在同一节点执行，并用 `/proc` 防止 PID 复用误判。除下面的 GPU 认领外，local 不提供排队、资源隔离或机器重启后的自动恢复。
+
+### GPU 与登录节点
+
+无论来自 `[local]` 请求还是 `--backend local`，每个本机作业都会在所在主机上认领 GPU，并通过 `CUDA_VISIBLE_DEVICES` 只看到这些 GPU：
+
+- `[local]` 请求认领 `local.gpus` 张，省略 `gpus` 时认领本机全部 GPU。用 `--backend local` 运行的 `[slurm]` 请求按脚本里的 `#SBATCH --gpus-per-node`、`--gres=gpu`、`--gpus` 或 `--gpus-per-task` 认领；一个都没写就不分配 GPU，和 SLURM 一样。它还会拿到 `SLURM_GPUS_ON_NODE` 和 `SLURM_JOB_GPUS`。
+- 本机可用的 GPU 是运行 `expctl submit` 时的 `CUDA_VISIBLE_DEVICES`，未设置时是 `nvidia-smi` 列出的全部 GPU。在 SLURM 分配里，这就是分到的那几张卡；在工作站上，`CUDA_VISIBLE_DEVICES=2,3 expctl submit <id>` 可以把 0、1 号卡留给自己用。GPU 编号与 `nvidia-smi` 一致（未设置 `CUDA_DEVICE_ORDER` 时导出 `PCI_BUS_ID`）。
+- 认领是 `/tmp/expctl-gpu-locks` 下由作业监督进程持有的 `flock`，因此对本机所有仓库和用户都生效，作业无论以何种方式结束都会随之释放。空闲 GPU 不够时 `submit` 直接拒绝并指出占用者，不会排队；`submit --all` 先提交放得下的请求，其余请求报错跳过、不生成回执，下次 `submit --all` 会接着提交。
+- `local.env` 不能设置 `CUDA_VISIBLE_DEVICES`。没有 `nvidia-smi` 且未设置 `CUDA_VISIBLE_DEVICES` 时，需要一定数量 GPU 的作业会被拒绝，未写 `gpus` 的 `[local]` 请求则按原有环境运行。
+
+回执、`status` 和报告都会记录认领到的 GPU，`doctor` 会列出本机 GPU 以及哪些正被占用。
+
+有 `sbatch` 却没有运行 `slurmd` 的主机是 SLURM 登录节点，在这里本机执行会被拒绝：把请求提交到集群，或进入分配（`srun --pty bash`，此时会设置 `SLURMD_NODENAME`）后再运行 expctl。确实要在这台主机上跑作业时，用 `--allow-login-node` 跳过检查。`doctor --backend local` 中对应的检查项是 `Execution host`。
 
 ### 在本机运行 SLURM 请求
 
@@ -154,7 +168,7 @@ expctl submit <id> --backend local
 
 作业号是本机生成的八位数字；数组任务的 `SLURM_JOB_ID` 形如 `<作业号>_<任务号>`。回执记录 `backend = "local"` 和 `emulated_backend = "slurm"`，`collect` 写入的每个任务的 `job_id`、`state`、`exit_code` 与 `sacct` 的形状一致，因此报告和指标仍是集群那套格式。`status` 改为核对记录的进程和退出状态文件，不再调用 `squeue` 和 `sacct`；`cancel` 改为向进程组发送 `SIGTERM`，不再调用 `scancel`，正在跑的任务和后面尚未开始的数组任务都会停下。
 
-`submit` 会对单机无法复现的地方给出警告：脚本在 SLURM 上可能占用多个节点，或 `#SBATCH --output` 的文件名与 `outputs.log_glob` 对不上。`#SBATCH` 里其余的资源申请不会被强制执行——没有分区、没有节点隔离、没有时间上限。
+`submit` 会对单机无法复现的地方给出警告：脚本在 SLURM 上可能占用多个节点，或 `#SBATCH --output` 的文件名与 `outputs.log_glob` 对不上。除 GPU 外，`#SBATCH` 里的资源申请不会被强制执行——没有分区、没有节点隔离、没有时间上限。
 
 对已经声明 `[local]` 的请求，`--backend local` 不产生任何变化，因此混合仓库里 `submit --all --backend local` 依然可用；`--backend slurm` 会拒绝 `[local]` 请求；`--skip-node-check` 属于 SLURM，与 `--backend local` 同时使用会报错。
 
@@ -187,7 +201,7 @@ expctl submit <id> --dry-run
 expctl submit <id>
 ```
 
-`expctl submit --all` 会按 ID 从旧到新提交所有还没有回执的请求（即 `list` 中状态为 `requested` 的请求）。每个请求单独验证和提交：某个请求无效或节点预算不足时只跳过该请求并记录错误，其余请求继续；有任何失败时退出码为非零。`--backend`、`--dry-run`、`--worktree-root` 和 `--skip-node-check` 同样适用于每个请求。
+`expctl submit --all` 会按 ID 从旧到新提交所有还没有回执的请求（即 `list` 中状态为 `requested` 的请求）。每个请求单独验证和提交：某个请求无效、节点预算不足或空闲 GPU 不够时只跳过该请求并记录错误，其余请求继续；有任何失败时退出码为非零。`--backend`、`--dry-run`、`--worktree-root`、`--skip-node-check` 和 `--allow-login-node` 同样适用于每个请求。
 
 `expctl list` 在交互终端中显示对齐表格，管道或文件输出默认使用稳定 TSV。它批量刷新 SLURM 作业状态，并从记录的进程身份和退出状态文件刷新 local 状态；刷新是只读的，不修改回执。SLURM 查询失败时，受影响的行回退为 `submitted` 并只在标准错误输出一条警告。可用 `--table`、`--tsv`、`--json` 强制格式，或用 `--no-color` 关闭颜色。
 
@@ -289,6 +303,7 @@ expctl clean <id>
 | `slurm.env` | 传给 `sbatch --export` 的环境变量；名称须匹配 `[A-Za-z_][A-Za-z0-9_]*` 且不能是 `GROUPS`，值必须是字符串且不能包含逗号或换行 |
 | `local.script` | 固定提交中的仓库相对可执行文件；必须带 Git 可执行位 |
 | `local.args` | 可选的字符串数组，按顺序作为脚本参数，不经过 shell 展开 |
+| `local.gpus` | 可选的非负整数，作业在本机认领的 GPU 数；省略时认领全部 GPU |
 | `local.env` | 传给本地进程的环境变量；名称须合法、值必须是字符串且不能包含 NUL |
 | `outputs.log_glob` | 相对于实验 worktree，且必须包含 `{job_id}`；SLURM 可使用 glob，local 必须是一个不含通配符的精确路径 |
 | `outputs.metrics` | 非空指标名数组；可提取的名称须匹配 `[A-Za-z_][A-Za-z0-9_.-]*`，对应值必须是独占一行的数字 |
@@ -350,6 +365,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl submit <id> --backend local\|slurm` | 覆盖请求声明的后端；`--backend local` 在本机运行 `[slurm]` 请求的脚本 |
 | `expctl submit <id> --dry-run` | 验证并预览提交，不创建资源或启动作业 |
 | `expctl submit <id> --worktree-root <dir>` | 本次提交使用指定的 worktree 父目录 |
+| `expctl submit <id> --allow-login-node` | 在看起来像 SLURM 登录节点的主机上仍然启动本机作业 |
 | `expctl submit --all [--dry-run] [--json]` | 按 ID 从旧到新提交所有还没有回执的请求；单个失败不影响其余请求 |
 | `expctl status <id> [--watch [<seconds>]] [--json]` | 查询一次状态，或按所选后端定时刷新直到终态 |
 | `expctl logs <id> [--tail <n>] [--follow] [--worktree-root <dir>]` | 查看运行中或已收集的日志；默认显示末尾 100 行 |

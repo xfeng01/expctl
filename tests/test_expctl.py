@@ -93,6 +93,17 @@ metrics = ["score"]
 """
 
 
+@pytest.fixture(autouse=True)
+def _neutral_execution_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep local runs off this machine's GPUs, GPU locks, and login-node check."""
+    monkeypatch.setattr(core, "GPU_LOCK_DIR", tmp_path_factory.mktemp("gpu-locks"))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("SLURMD_NODENAME", "test-node")
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+
+
 def _example_repo(tmp_path: Path, request_text: str = EXAMPLE_REQUEST) -> Path:
     (tmp_path / "expctl.toml").write_text(EXAMPLE_CONFIG, encoding="utf-8")
     requests = tmp_path / "expctl" / "requests"
@@ -252,6 +263,29 @@ def test_request_requires_one_backend_and_local_logs_are_exact(tmp_path: Path) -
     request_file.write_text(wildcard, encoding="utf-8")
     with pytest.raises(ExpctlError, match="exact log file"):
         load_request(repo, config, EXAMPLE_ID, check_git=False)
+
+
+def test_local_gpus_must_be_a_non_negative_integer(tmp_path: Path) -> None:
+    repo = _example_repo(tmp_path, LOCAL_REQUEST)
+    config = load_config(repo)
+    request_file = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    for value in ("-1", "true", '"2"', "1.5"):
+        request_file.write_text(
+            LOCAL_REQUEST.replace("[local.env]", f"gpus = {value}\n\n[local.env]"),
+            encoding="utf-8",
+        )
+        with pytest.raises(ExpctlError, match=r"local\.gpus must be an integer"):
+            load_request(repo, config, EXAMPLE_ID, check_git=False)
+
+    request_file.write_text(
+        LOCAL_REQUEST.replace("[local.env]", "gpus = 0\n\n[local.env]"),
+        encoding="utf-8",
+    )
+    request, _ = load_request(repo, config, EXAMPLE_ID, check_git=False)
+    assert request["local"]["gpus"] == 0
+    summary = core._render_validate_summary(EXAMPLE_ID, request, verified_nodes=None)
+    assert "GPUs" in summary
+    assert core._request_gpus({"script": "run.sh"}) == "every GPU on the host"
 
 
 def test_new_request_fills_git_identity_and_never_overwrites(
@@ -1376,12 +1410,18 @@ def test_doctor_reports_repository_and_cluster_readiness(
     monkeypatch.setattr(core.shutil, "which", lambda command: f"/bin/{command}")
     monkeypatch.setattr(core, "fcntl", object())
     monkeypatch.setattr(core, "_process_start_token", lambda pid: "42")
+    monkeypatch.setattr(core, "GPU_LOCK_DIR", tmp_path / "gpu-locks")
+    monkeypatch.setenv("SLURMD_NODENAME", "gpu07")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
 
     result = core.doctor_repo(repo)
 
     assert result["repository_ready"] is True
     assert result["cluster_ready"] is True
     assert all(check["ok"] for check in result["checks"])
+    details = {check["name"]: check["detail"] for check in result["checks"]}
+    assert details["Execution host"] == "inside a SLURM allocation on gpu07"
+    assert details["GPUs"] == "0,1 (from CUDA_VISIBLE_DEVICES)"
     rendered = core._render_doctor_result(result)
     assert "EXPCTL DOCTOR" in rendered
     assert "AREA" in rendered and "STATUS" in rendered and "SLURM" in rendered
@@ -2068,6 +2108,8 @@ def test_local_submit_records_process_identity_without_calling_slurm(
         worktree: Path,
         *,
         job_id: str,
+        gpus: list[str] | None,
+        gpu_locks: tuple[int, ...],
     ) -> dict[str, object]:
         started.update(
             {
@@ -2077,6 +2119,7 @@ def test_local_submit_records_process_identity_without_calling_slurm(
                 "request": loaded_request,
                 "worktree": worktree,
                 "job_id": job_id,
+                "gpus": gpus,
             }
         )
         return {
@@ -2113,6 +2156,8 @@ def test_local_submit_records_process_identity_without_calling_slurm(
         *request["local"]["args"],
     ]
     assert started["job_id"] == receipt["job_id"]
+    # This host's pool is empty, so the job is told it has no GPUs.
+    assert started["gpus"] == receipt["gpus"] == []
 
 
 def test_preflight_failure_removes_pending_receipt(
@@ -3771,6 +3816,313 @@ def test_cancelling_a_local_slurm_array_stops_its_remaining_tasks(
     collection = core.collect_request(repo, config, EXAMPLE_ID)
     assert collection["scheduler"]["state"] == "CANCELLED"
     assert len(collection["logs"]) == 2
+
+
+def test_sbatch_gpu_count_reads_each_way_a_script_asks_for_gpus() -> None:
+    def count(*directives: str) -> int:
+        return core._sbatch_gpu_count(
+            ["#!/bin/bash", *(f"#SBATCH {line}" for line in directives), "echo run"]
+        )
+
+    assert count("--nodes=1") == 0
+    assert count("--gpus-per-node=2") == 2
+    assert count("--gpus-per-node=a100:2") == 2
+    assert count("--gres=gpu:a100:2,tmpfs:10G") == 2
+    assert count("--gres=gpu") == 1
+    assert count("--gres=gpu:4") == 4
+    assert count("-G 3") == 3
+    assert count("--gpus=a100:1,v100:1") == 2
+    assert count("--gpus-per-task=1", "--ntasks=4") == 4
+    with pytest.raises(ExpctlError, match="cannot read a GPU count"):
+        count("--gpus-per-node=all")
+
+
+def test_local_host_role_tells_compute_nodes_from_login_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc = tmp_path / "proc"
+    for pid, name in (("1", "systemd"), ("812", "slurmd"), ("self", "slurmd")):
+        (proc / pid).mkdir(parents=True)
+        (proc / pid / "comm").write_text(f"{name}\n", encoding="utf-8")
+    assert core._slurmd_running(proc) is True
+    (proc / "812" / "comm").write_text("slurmstepd\n", encoding="utf-8")
+    assert core._slurmd_running(proc) is False
+
+    monkeypatch.delenv("SLURMD_NODENAME")
+    monkeypatch.setattr(core.shutil, "which", lambda command: None)
+    assert core._local_host_role() == (True, "no SLURM client tools on PATH")
+    monkeypatch.setattr(core.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(core, "_slurmd_running", lambda: True)
+    assert core._local_host_role() == (True, "slurmd runs on this host")
+    monkeypatch.setattr(core, "_slurmd_running", lambda: False)
+    ok, detail = core._local_host_role()
+    assert not ok and detail.startswith("SLURM login node")
+    monkeypatch.setenv("SLURMD_NODENAME", "gpu07")
+    assert core._local_host_role() == (True, "inside a SLURM allocation on gpu07")
+
+
+def test_local_submission_refuses_a_slurm_login_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SLURMD_NODENAME")
+    monkeypatch.setattr(core.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(core, "_slurmd_running", lambda: False)
+    repo = _example_repo(tmp_path, LOCAL_REQUEST)
+    config = load_config(repo)
+    _stub_submit_preflight(monkeypatch, repo, tomllib.loads(LOCAL_REQUEST))
+
+    with pytest.raises(ExpctlError, match="SLURM login node") as refused:
+        submit_request(
+            repo,
+            config,
+            EXAMPLE_ID,
+            dry_run=True,
+            skip_node_check=False,
+            worktree_root=None,
+        )
+    assert "inside a SLURM allocation" in str(refused.value)
+    preview = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=True,
+        skip_node_check=False,
+        worktree_root=None,
+        allow_login_node=True,
+    )
+    assert preview["backend"] == "local"
+    rendered = core._render_submit_result(
+        preview,
+        dry_run=True,
+        worktree_root=None,
+        skip_node_check=False,
+        allow_login_node=True,
+    )
+    assert f"expctl submit {EXAMPLE_ID} --allow-login-node" in rendered
+    assert "GPUs" in rendered
+    parsed = core._parser().parse_args(["submit", "--all", "--allow-login-node"])
+    assert parsed.allow_login_node is True
+
+    cluster = tmp_path / "cluster"
+    cluster.mkdir()
+    repo = _example_repo(cluster)
+    config = load_config(repo)
+    _stub_submit_preflight(monkeypatch, repo, tomllib.loads(EXAMPLE_REQUEST))
+    with pytest.raises(ExpctlError, match="without --backend local"):
+        submit_request(
+            repo,
+            config,
+            EXAMPLE_ID,
+            dry_run=True,
+            skip_node_check=False,
+            worktree_root=None,
+            backend="local",
+        )
+    sbatch_preview = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=True,
+        skip_node_check=False,
+        worktree_root=None,
+    )
+    assert sbatch_preview["backend"] == "slurm"
+    assert "gpus" not in sbatch_preview
+
+
+def test_local_env_cannot_set_cuda_visible_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = LOCAL_REQUEST.replace(
+        'LOCAL_VALUE = "3.5"', 'LOCAL_VALUE = "3.5"\nCUDA_VISIBLE_DEVICES = "1"'
+    )
+    repo = _example_repo(tmp_path, text)
+    config = load_config(repo)
+    _stub_submit_preflight(monkeypatch, repo, tomllib.loads(text))
+
+    with pytest.raises(ExpctlError, match=r"set \[local\] gpus instead"):
+        submit_request(
+            repo,
+            config,
+            EXAMPLE_ID,
+            dry_run=True,
+            skip_node_check=False,
+            worktree_root=None,
+        )
+
+
+def test_host_gpus_come_from_cuda_visible_devices_or_nvidia_smi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2, 3")
+    assert core._host_gpus(tmp_path) == (["2", "3"], "CUDA_VISIBLE_DEVICES")
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES")
+    monkeypatch.setattr(core.shutil, "which", lambda command: None)
+    assert core._host_gpus(tmp_path) == (None, "nvidia-smi is not on PATH")
+    assert core._claim_gpus(tmp_path, EXAMPLE_ID, None) == (None, ())
+    assert core._claim_gpus(tmp_path, EXAMPLE_ID, 0) == ([], ())
+    with pytest.raises(ExpctlError, match="set CUDA_VISIBLE_DEVICES"):
+        core._claim_gpus(tmp_path, EXAMPLE_ID, 1)
+
+    monkeypatch.setattr(core.shutil, "which", lambda command: f"/usr/bin/{command}")
+    answers = iter(
+        [
+            subprocess.CompletedProcess([], 0, "0\n1\n", ""),
+            subprocess.CompletedProcess([], 6, "No devices were found\n", ""),
+        ]
+    )
+    monkeypatch.setattr(core, "_run", lambda *args, **kwargs: next(answers))
+    assert core._host_gpus(tmp_path) == (["0", "1"], "nvidia-smi")
+    assert core._host_gpus(tmp_path) == (
+        None,
+        "nvidia-smi failed: No devices were found",
+    )
+
+    assert core._gpu_environment(None, {}) == {}
+    assert core._gpu_environment([], {}) == {"CUDA_VISIBLE_DEVICES": ""}
+    assert core._gpu_environment(["2"], {}) == {
+        "CUDA_VISIBLE_DEVICES": "2",
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    }
+    assert core._gpu_environment(["2"], {"CUDA_DEVICE_ORDER": "FASTEST_FIRST"}) == {
+        "CUDA_VISIBLE_DEVICES": "2"
+    }
+
+
+@pytest.mark.skipif(core.fcntl is None, reason="GPU claims are flocks")
+def test_gpu_claims_hand_out_free_gpus_and_name_who_holds_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2")
+    first, first_locks = core._claim_gpus(tmp_path, "20260101-first", 2)
+    assert first == ["0", "1"]
+    with pytest.raises(ExpctlError, match="only 1 of 3 are free") as refused:
+        core._claim_gpus(tmp_path, "20260101-second", 2)
+    assert "GPU 0,1 by 20260101-first" in str(refused.value)
+    assert "submit it again once they are free" in str(refused.value)
+    with pytest.raises(ExpctlError, match="claims every GPU"):
+        core._claim_gpus(tmp_path, "20260101-whole", None)
+    with pytest.raises(ExpctlError, match="this host has 3"):
+        core._claim_gpus(tmp_path, "20260101-big", 4)
+    assert core._claim_gpus(tmp_path, "20260101-cpu", 0) == ([], ())
+
+    # GPU numbers inside an allocation are the allocation's own.
+    monkeypatch.setenv("SLURM_JOB_ID", "777")
+    allocated, allocated_locks = core._claim_gpus(tmp_path, "20260101-alloc", 2)
+    assert allocated == ["0", "1"]
+    monkeypatch.delenv("SLURM_JOB_ID")
+
+    second, second_locks = core._claim_gpus(tmp_path, "20260101-second", 1)
+    assert second == ["2"]
+    assert set(core._gpu_usage(["0", "1", "2"])) == {"0", "1", "2"}
+    for descriptor in first_locks + second_locks + allocated_locks:
+        os.close(descriptor)
+    assert core._gpu_usage(["0", "1", "2"]) == {}
+    whole, whole_locks = core._claim_gpus(tmp_path, "20260101-whole", None)
+    assert whole == ["0", "1", "2"]
+    for descriptor in whole_locks:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="local execution is Linux-only")
+def test_a_running_local_job_holds_its_gpus_until_it_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = tmp_path / "release"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("RELEASE_FILE", str(release))
+    repo, config = _local_e2e_repo(
+        tmp_path,
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, time\n"
+        "env = os.environ\n"
+        "print('devices', env['CUDA_VISIBLE_DEVICES'], env['CUDA_DEVICE_ORDER'])\n"
+        "deadline = time.monotonic() + 20\n"
+        "while not pathlib.Path(env['RELEASE_FILE']).exists():\n"
+        "    if time.monotonic() > deadline:\n"
+        "        raise SystemExit(1)\n"
+        "    time.sleep(0.05)\n"
+        "print('score: 1')\n",
+    )
+    request_file = repo / "expctl" / "requests" / f"{EXAMPLE_ID}.toml"
+    request_file.write_text(
+        request_file.read_text(encoding="utf-8").replace(
+            "[local.env]", "gpus = 1\n\n[local.env]"
+        ),
+        encoding="utf-8",
+    )
+
+    receipt = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=False,
+        skip_node_check=False,
+        worktree_root=None,
+    )
+    assert receipt["gpus"] == ["0"]
+    with pytest.raises(ExpctlError, match=f"GPU 0 by {EXAMPLE_ID}"):
+        core._claim_gpus(repo, "20260101-other", 2)
+
+    release.touch()
+    status = _await_terminal_status(repo, config, timeout=20)
+    assert core._status_state(status) == "COMPLETED"
+    assert status["gpus"] == ["0"]
+    log = core.logs_request(repo, config, EXAMPLE_ID)["logs"][0]["content"]
+    assert "devices 0 PCI_BUS_ID" in log
+    deadline = time.monotonic() + 10
+    while core._gpu_usage(["0", "1"]):
+        if time.monotonic() >= deadline:
+            pytest.fail("the finished job kept its GPU")
+        time.sleep(0.05)
+    claimed, locks = core._claim_gpus(repo, "20260101-other", 2)
+    assert claimed == ["0", "1"]
+    for descriptor in locks:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="local execution is Linux-only")
+def test_backend_local_gives_a_slurm_script_the_gpus_it_asks_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6")
+    repo, config = _local_slurm_e2e_repo(
+        tmp_path,
+        "#!/bin/bash\n"
+        "#SBATCH -p example-partition\n"
+        "#SBATCH --nodes=1\n"
+        "#SBATCH --gres=gpu:2\n"
+        "#SBATCH --array=0\n"
+        "#SBATCH --output=logs/example-%A_%a.out\n"
+        'echo "devices $CUDA_VISIBLE_DEVICES, $SLURM_GPUS_ON_NODE: $SLURM_JOB_GPUS"\n'
+        'echo "gen_ppl: 1.5"\n',
+    )
+
+    preview = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=True,
+        skip_node_check=False,
+        worktree_root=None,
+        backend="local",
+    )
+    assert preview["gpus"] == ["4", "5"]
+    receipt = submit_request(
+        repo,
+        config,
+        EXAMPLE_ID,
+        dry_run=False,
+        skip_node_check=False,
+        worktree_root=None,
+        backend="local",
+    )
+    assert receipt["gpus"] == ["4", "5"]
+    status = _await_terminal_status(repo, config, timeout=30)
+    assert core._status_state(status) == "COMPLETED"
+    log = Path(receipt["worktree"]) / "logs" / f"example-{receipt['job_id']}_0.out"
+    assert "devices 4,5, 2: 4,5" in log.read_text(encoding="utf-8")
 
 
 def test_version_matches_pyproject() -> None:

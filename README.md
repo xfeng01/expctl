@@ -89,12 +89,12 @@ expctl validate --all [--json]
 
 # Preview or submit through the backend declared by the request.
 # --backend local runs a [slurm] request's pinned script on this host.
-expctl submit <id> [--backend slurm|local] [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
+expctl submit <id> [--backend slurm|local] [--dry-run] [--worktree-root DIR] [--skip-node-check] [--allow-login-node] [--json]
 
 # Submit every request that has no receipt yet, oldest ID first. Each request
 # is validated and submitted on its own; failures are reported and the rest
 # continue, and the exit status is non-zero if any failed.
-expctl submit --all [--backend slurm|local] [--dry-run] [--worktree-root DIR] [--skip-node-check] [--json]
+expctl submit --all [--backend slurm|local] [--dry-run] [--worktree-root DIR] [--skip-node-check] [--allow-login-node] [--json]
 
 # Show detailed state once, or refresh until the job finishes.
 expctl status <id> [--watch [SECONDS]] [--json]
@@ -138,6 +138,8 @@ expansion is echoed on stderr, for example `expctl: cross-probe ->
 
 `--skip-node-check` applies only to SLURM submissions. It bypasses the
 cross-job node-budget check and requires explicit operator authorization.
+`--allow-login-node` lets a local job start on a host that looks like a SLURM
+login node; see [GPUs and login nodes](#gpus-and-login-nodes).
 
 Set a repository-wide default row count in `expctl.toml`:
 
@@ -183,6 +185,7 @@ count, which is then reserved against the budget.
 [local]
 script = "scripts/train.py"
 args = ["--config", "configs/run.toml"]
+gpus = 1
 
 [local.env]
 MODE = "evaluation"
@@ -199,8 +202,44 @@ collection must run on that same host. Cancellation sends `SIGTERM` to the
 recorded process group.
 
 Local mode is intended for a machine where compute resources are already
-allocated. It provides no queue, resource isolation, or restart after the host
-reboots.
+allocated. Apart from the GPU claims below, it provides no queue, resource
+isolation, or restart after the host reboots.
+
+### GPUs and login nodes
+
+Every local job, from a `[local]` request or from `--backend local`, claims
+GPUs on its host and sees only those, through `CUDA_VISIBLE_DEVICES`:
+
+- A `[local]` request claims `local.gpus` GPUs, or every GPU when `gpus` is
+  left out. A `[slurm]` request run with `--backend local` claims what its
+  `#SBATCH --gpus-per-node`, `--gres=gpu`, `--gpus`, or `--gpus-per-task`
+  lines ask for, and none when it asks for none, as under SLURM; it also gets
+  `SLURM_GPUS_ON_NODE` and `SLURM_JOB_GPUS`.
+- The host's GPUs are the `CUDA_VISIBLE_DEVICES` that `expctl submit` itself
+  runs with, or else every GPU `nvidia-smi` lists. Inside a SLURM allocation
+  that is the allocation's GPUs; on a workstation,
+  `CUDA_VISIBLE_DEVICES=2,3 expctl submit <id>` keeps GPUs 0 and 1 out of
+  expctl's hands. GPUs are numbered the way `nvidia-smi` numbers them
+  (`CUDA_DEVICE_ORDER=PCI_BUS_ID` unless it is already set).
+- A claim is an `flock` in `/tmp/expctl-gpu-locks` that the job's supervisor
+  holds, so it covers every repository and user on the host and ends when the
+  job ends, however it ends. When too few GPUs are free, `submit` refuses and
+  names the jobs holding them; it does not queue. `submit --all` submits the
+  requests that fit and reports the rest, which keep no receipt and are picked
+  up by the next `submit --all`.
+- `local.env` cannot set `CUDA_VISIBLE_DEVICES`. When `nvidia-smi` is missing
+  and `CUDA_VISIBLE_DEVICES` is unset, a job that needs a number of GPUs is
+  refused, and a `[local]` request without `gpus` keeps the environment it was
+  started with.
+
+The receipt, `status`, and the report record the claimed GPUs, and `doctor`
+lists the host's GPUs and which of them are in use.
+
+A host with `sbatch` but no `slurmd` is a SLURM login node, and local
+execution there is refused: submit the request to the cluster, or run expctl
+inside an allocation (`srun --pty bash`), where `SLURMD_NODENAME` is set.
+`--allow-login-node` overrides the check on a host that really is meant to run
+jobs. `doctor --backend local` reports it as `Execution host`.
 
 ### Running a SLURM request locally
 
@@ -245,8 +284,9 @@ running task and every array task after it.
 
 `submit` warns when a single host cannot reproduce the submission: a script
 that could occupy several nodes under SLURM, or `#SBATCH --output` names that
-`outputs.log_glob` does not match. Nothing enforces the rest of the `#SBATCH`
-resource request — there is no partition, node isolation, or time limit.
+`outputs.log_glob` does not match. Apart from GPUs, nothing enforces the
+`#SBATCH` resource request — there is no partition, node isolation, or time
+limit.
 
 `--backend local` on a request that already declares `[local]` changes nothing,
 so `submit --all --backend local` stays usable in a mixed repository.

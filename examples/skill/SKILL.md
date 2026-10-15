@@ -66,6 +66,11 @@ weaken the repository's own cluster and branch rules here.
 - Do not use SLURM's `--skip-node-check` autonomously. If scheduler status is
   unavailable, stop before submission unless the operator supplies independent
   node-budget evidence and explicitly authorizes the override.
+- Do not pass `--allow-login-node` autonomously. When `submit` refuses a SLURM
+  login node, report it and offer the cluster submission or an allocation
+  instead; only the operator can decide this host is meant to run jobs.
+- When `submit` refuses because too few GPUs are free, report which jobs hold
+  them. Do not poll and resubmit until they finish unless the operator asks.
 - Do not retry a failed or preempted job automatically. Collect the evidence
   and request a new ID or an explicit rerun decision.
 - Preparing result files does not authorize committing, pushing, merging, or
