@@ -80,7 +80,10 @@ expctl doctor --backend slurm
 
    ```bash
    expctl new 20260901-lr-sweep
+   expctl new lr-sweep --title "Learning-rate sweep"   # 自动补上当天日期
    ```
+
+   只写短名时自动加上当天日期前缀；`--title` 直接填好标题。`rerun --as` 同样接受只写短名的新 ID。
 
    若工作树存在未提交改动，`new` 默认拒绝创建，因为这些内容不属于固定的 `HEAD`。应先提交或暂存；只有明确接受该风险时才使用 `--allow-dirty`。
 
@@ -308,7 +311,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 |---|---|
 | `expctl init` | 补齐配置和 `paths.root` 指定的目录结构 |
 | `expctl doctor [--backend local\|slurm] [--cluster] [--json]` | 检查仓库和两个后端；选择 `--backend` 后对应检查计入退出码，`--cluster` 是 SLURM 别名 |
-| `expctl new <id> [--allow-dirty] [--json]` | 从模板创建请求并填写 Git 元数据；默认拒绝未提交改动 |
+| `expctl new <id> [--title <text>] [--allow-dirty] [--json]` | 从模板创建请求并填写 Git 元数据；只写短名时自动加当天日期；默认拒绝未提交改动 |
 | `expctl list [--table\|--tsv\|--json] [--status <states>] [--sort newest\|oldest] [--limit <n>\|--all] [--no-color]` | 列出请求及实时状态；默认数量可由 `display.list_limit` 配置，`--all` 显示全部 |
 | `expctl validate <id>` | 验证请求、固定提交和作业脚本策略 |
 | `expctl show <id>` | 将验证后的请求输出为 JSON |

@@ -366,7 +366,9 @@ expctl/
     <ol class="steps">
       <li>提交并推送本次实验所需的脚本、配置和评测代码。</li>
       <li>从模板创建请求；命令会自动填写 ID、当前 commit、branch 和 worktree 名称：
-<pre data-lang="bash"><code>expctl new 20260901-lr-sweep</code></pre></li>
+<pre data-lang="bash"><code>expctl new 20260901-lr-sweep
+expctl new lr-sweep --title "Learning-rate sweep"   # 自动补上当天日期</code></pre>
+      只写短名时自动加上当天日期前缀；<code>--title</code> 直接填好标题。<code>rerun --as</code> 同样接受只写短名的新 ID。</li>
       <li>编辑生成的请求，填写实验问题、判定规则、输出和指标，并且只保留 <code>[slurm]</code> 或 <code>[local]</code> 其中一种后端，然后验证：
 <pre data-lang="bash"><code>expctl validate 20260901-lr-sweep</code></pre></li>
       <li>将请求文件提交并推送到 Git 仓库。</li>
@@ -492,7 +494,7 @@ root = ".."</code></pre>
       <tbody>
         <tr><td><code>expctl init</code></td><td>补齐配置和 <code>paths.root</code> 指定的目录结构</td></tr>
         <tr><td><code>expctl doctor [--backend local|slurm] [--cluster] [--json]</code></td><td>检查仓库和两个后端；选择后端时对应检查计入退出码</td></tr>
-        <tr><td><code>expctl new &lt;id&gt; [--allow-dirty] [--json]</code></td><td>从模板创建请求并填写 Git 元数据；默认拒绝未提交改动</td></tr>
+        <tr><td><code>expctl new &lt;id&gt; [--title &lt;text&gt;] [--allow-dirty] [--json]</code></td><td>从模板创建请求并填写 Git 元数据；只写短名时自动加当天日期；默认拒绝未提交改动</td></tr>
         <tr><td><code>expctl list [--table|--tsv|--json] [--status &lt;states&gt;] [--sort newest|oldest] [--limit &lt;n&gt;|--all] [--no-color]</code></td><td>列出请求及实时状态；默认数量可由 <code>display.list_limit</code> 配置，<code>--all</code> 显示全部</td></tr>
         <tr><td><code>expctl validate &lt;id&gt;</code></td><td>验证请求、固定提交和作业脚本策略</td></tr>
         <tr><td><code>expctl show &lt;id&gt;</code></td><td>将验证后的请求输出为 JSON</td></tr>

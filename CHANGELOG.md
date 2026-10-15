@@ -7,6 +7,10 @@
   that matches exactly one request. `@` names the newest request in `list`
   order. An ambiguous reference is refused with the candidates, and the
   expansion is echoed on stderr.
+- `expctl new` prefixes a bare short name with today's date, so
+  `expctl new lr-sweep` creates `<YYYYMMDD>-lr-sweep`, and `--title` fills in
+  the request title. `expctl rerun --as` accepts a bare short name the same
+  way.
 
 ## 0.12.0 — 2026-09-19
 

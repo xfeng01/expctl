@@ -58,6 +58,7 @@ DEFAULT_SHARED_DIRS = (".venv", "data", "runs", "logs")
 DEFAULT_CREATE_MISSING = ("runs", "logs")
 
 ID_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]*$")
+SHORT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 METRIC_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
@@ -1376,6 +1377,13 @@ def _uncommitted_changes(repo: Path) -> list[str]:
     return [line for line in result.stdout.splitlines() if line]
 
 
+def _dated_experiment_id(value: str) -> str:
+    """Prefix a bare short name with today's date; leave anything else as is."""
+    if ID_RE.fullmatch(value) or not SHORT_NAME_RE.fullmatch(value):
+        return value
+    return f"{dt.date.today():%Y%m%d}-{value}"
+
+
 def _render_new_request(
     template: str,
     *,
@@ -1383,6 +1391,7 @@ def _render_new_request(
     branch: str,
     commit: str,
     worktree: str,
+    title: str | None = None,
 ) -> str:
     replacements = {
         ("", "id"): experiment_id,
@@ -1390,6 +1399,8 @@ def _render_new_request(
         ("code", "commit"): commit,
         ("code", "worktree"): worktree,
     }
+    if title is not None:
+        replacements[("", "title")] = title
     found: set[tuple[str, str]] = set()
     output: list[str] = []
     section = ""
@@ -1429,7 +1440,9 @@ def new_request(
     experiment_id: str,
     *,
     allow_dirty: bool = False,
+    title: str | None = None,
 ) -> dict[str, Any]:
+    experiment_id = _dated_experiment_id(experiment_id)
     destination = request_path(repo, config, experiment_id)
     if destination.exists():
         raise ExpctlError(f"request already exists: {destination}")
@@ -1466,6 +1479,7 @@ def new_request(
         branch=branch,
         commit=commit,
         worktree=worktree,
+        title=title,
     )
     _exclusive_write_text(destination, content)
     try:
@@ -4243,8 +4257,11 @@ def rerun_request(
             f"nothing to rerun safely: {experiment_id} has no confirmed job ID "
             f"(receipt status: {receipt.get('status', 'invalid')})"
         )
-    if new_id is None:
-        new_id = _next_rerun_id(repo, config, experiment_id)
+    new_id = (
+        _next_rerun_id(repo, config, experiment_id)
+        if new_id is None
+        else _dated_experiment_id(new_id)
+    )
     new_path = request_path(repo, config, new_id)
     if new_path.exists():
         raise ExpctlError(f"request already exists: {new_path}")
@@ -5370,7 +5387,12 @@ def _parser() -> argparse.ArgumentParser:
     new = subparsers.add_parser(
         "new", help="create a request from the repository template"
     )
-    new.add_argument("experiment_id", metavar="ID")
+    new.add_argument(
+        "experiment_id",
+        metavar="ID",
+        help="new request ID; a bare short name is prefixed with today's date",
+    )
+    new.add_argument("--title", metavar="TEXT", help="fill in the request title")
     new.add_argument(
         "--allow-dirty",
         action="store_true",
@@ -5590,7 +5612,10 @@ def _parser() -> argparse.ArgumentParser:
         "--as",
         dest="new_id",
         metavar="NEW_ID",
-        help="ID for the copy (default: <id>-r2, then -r3, ...)",
+        help=(
+            "ID for the copy, or a short name to prefix with today's date "
+            "(default: <id>-r2, then -r3, ...)"
+        ),
     )
     rerun.add_argument(
         "--reason",
@@ -5669,6 +5694,7 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 args.experiment_id,
                 allow_dirty=args.allow_dirty,
+                title=args.title,
             )
             _print_command_result(
                 result, _render_new_result(result), force_json=args.json

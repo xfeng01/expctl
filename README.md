@@ -42,7 +42,8 @@ expctl init
 expctl doctor [--backend slurm|local] [--cluster] [--json]
 
 # Create a request from the repository template and fill in Git metadata.
-expctl new <id> [--allow-dirty] [--json]
+# A bare short name such as lr-sweep is prefixed with today's date.
+expctl new <id> [--title TEXT] [--allow-dirty] [--json]
 
 # List, filter, sort, and limit experiment requests.
 expctl list [--table | --tsv | --json] [--status STATUS[,STATUS...]] [--sort newest|oldest] [--limit N | --all] [--no-color]
@@ -86,7 +87,8 @@ expctl clean <id> [--dry-run] [--worktree-root DIR] [--json]
 # Scaffold results/<id>/report.md from the request, receipt, and metrics.
 expctl report <id> [--json]
 
-# Create a new request for the same pinned code.
+# Create a new request for the same pinned code. --as also accepts a bare
+# short name, which is prefixed with today's date.
 expctl rerun <id> [--as NEW_ID] [--reason TEXT] [--json]
 
 # Show version or help.
@@ -316,7 +318,8 @@ it with SLURM manually.
 - `expctl` never runs `git add`, `git commit`, or `git push`.
 
 Use `expctl new <id>` to start from `expctl/templates/request.toml` with the
-current commit, branch, ID, and worktree name filled in. The
+current commit, branch, ID, and worktree name filled in; `expctl new lr-sweep
+--title "Learning-rate sweep"` creates `<today>-lr-sweep` with its title. The
 [detailed guide (Chinese)](docs/usage.zh.md) covers every request field,
 configuration option, and recovery procedure. For an AI runner, adapt
 [`examples/skill/SKILL.md`](examples/skill/SKILL.md) with project-specific

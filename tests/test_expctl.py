@@ -295,6 +295,54 @@ def test_new_request_fills_git_identity_and_never_overwrites(
     assert path.read_text(encoding="utf-8") == original
 
 
+def _fake_new_request_git(monkeypatch: pytest.MonkeyPatch, commit: str) -> None:
+    monkeypatch.setattr(core, "_git_text", lambda *args: commit + "\n")
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        output = "" if args[:2] == ["git", "status"] else "main\n"
+        return subprocess.CompletedProcess(args, 0, output, "")
+
+    monkeypatch.setattr(core, "_run", fake_run)
+
+
+def test_new_request_dates_a_bare_short_name_and_fills_the_title(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    template = repo / "expctl" / "templates" / "request.toml"
+    template.parent.mkdir()
+    template.write_text(core.STARTER_TEMPLATE, encoding="utf-8")
+    _fake_new_request_git(monkeypatch, "a" * 40)
+    today = core.dt.date.today().strftime("%Y%m%d")
+
+    result = core.new_request(repo, config, "lr-sweep", title='LR "sweep" 学习率')
+
+    assert result["experiment_id"] == f"{today}-lr-sweep"
+    request, _ = load_request(
+        repo, config, f"{today}-lr-sweep", check_git=False, check_placeholders=False
+    )
+    assert request["title"] == 'LR "sweep" 学习率'
+    assert request["code"]["worktree"].endswith("-lr-sweep")
+
+    with pytest.raises(ExpctlError, match="request.title must be a non-empty"):
+        core.new_request(repo, config, "blank-title", title="  ")
+    assert not (repo / "expctl" / "requests" / f"{today}-blank-title.toml").exists()
+    with pytest.raises(ExpctlError, match="must look like YYYYMMDD"):
+        core.new_request(repo, config, "Not_A_Name")
+
+
+def test_rerun_as_a_bare_short_name_gets_todays_date(tmp_path: Path) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    _fake_receipt(repo, EXAMPLE_ID)
+    today = core.dt.date.today().strftime("%Y%m%d")
+
+    result = rerun_request(repo, config, EXAMPLE_ID, new_id="retry", check_git=False)
+
+    assert result["experiment_id"] == f"{today}-retry"
+
+
 def test_new_request_uses_real_git_metadata(tmp_path: Path) -> None:
     repo = tmp_path / "My Project"
     repo.mkdir()
