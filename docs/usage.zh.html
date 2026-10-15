@@ -413,12 +413,12 @@ expctl status &lt;id&gt; --watch</code></pre>
 expctl logs &lt;id&gt; --follow
 expctl cancel &lt;id&gt; --reason "superseded" --dry-run
 expctl cancel &lt;id&gt; --reason "superseded"</code></pre>
-    <p><code>logs</code> 在运行中读取回执核验的 worktree，收集后读取结果目录。取消时 SLURM 调用 <code>scancel</code>，local 向核验后的进程组发送 <code>SIGTERM</code>；两者都会记录审计信息。取消后的日志仍应收集。</p>
+    <p><code>logs</code> 在运行中读取回执核验的 worktree，收集后读取结果目录；提交时即使用了 <code>--worktree-root</code>，这里也无需重复传入。取消时 SLURM 调用 <code>scancel</code>，local 向核验后的进程组发送 <code>SIGTERM</code>；两者都会记录审计信息。取消后的日志仍应收集。</p>
 
     <h3>收集结果</h3>
 <pre data-lang="bash"><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;]
 expctl collect --all [--worktree-root &lt;dir&gt;]</code></pre>
-    <p><code>collect</code> 会先确认所选后端已经终止，校验请求和 worktree，再暂存并发布日志、提取 <code>metrics.json</code>，最后记录执行终态。</p>
+    <p><code>collect</code> 会先确认所选后端已经终止，校验请求和 worktree，再暂存并发布日志、提取 <code>metrics.json</code>，最后记录执行终态。<code>logs</code>、<code>collect</code> 和 <code>clean</code> 都直接使用回执记录的 worktree（核对其目录名等于 <code>code.worktree</code> 且不在主仓库内），无需重复传入提交时的 <code>--worktree-root</code>；显式传入时则要求两者一致。</p>
     <p><code>collect</code> 不会等待作业，也不会覆盖已经收集或残留的结果；同一请求的收集过程使用互斥锁串行化。作业仍在队列、没有匹配日志、worktree 不一致、结果已存在或目标文件名冲突时都会报错。</p>
     <p><code>expctl collect --all</code> 会按 ID 从旧到新处理所有已有回执但尚未收集的请求。每个请求单独收集：作业仍在队列或仍在运行的请求只标记为未完成并跳过，待作业结束后再次运行该命令即可；其他错误（如请求被修改、worktree 不一致、没有匹配日志）只跳过该请求并记录，其余继续；有任何失败时退出码为非零。<code>--worktree-root</code> 同样适用于每个请求。</p>
 
@@ -485,7 +485,7 @@ root = ".."</code></pre>
       <li><code>scheduler.max_total_nodes</code>：仅用于 SLURM；当前用户的跨作业节点上限，<code>0</code> 表示禁用检查。</li>
       <li><code>runtime.shared_dirs</code>：从主工作树链接到实验 worktree 的顶层目录名。源目录不存在时跳过。</li>
       <li><code>runtime.create_missing</code>：提交前可自动创建的共享目录，必须是 <code>shared_dirs</code> 的子集。</li>
-      <li><code>worktree.root</code>：实验 worktree 的父目录；相对路径以仓库根目录为基准。</li>
+      <li><code>worktree.root</code>：实验 worktree 的父目录；相对路径以仓库根目录为基准。<code>expctl.toml</code> 由所有人共享，若某台机器需要放到别处（例如集群的 scratch 文件系统），设置环境变量 <code>EXPCTL_WORKTREE_ROOT</code> 即可在本机覆盖它（支持 <code>~</code>）；<code>submit --worktree-root</code> 仍可单次覆盖两者，<code>doctor</code> 会显示当前生效的目录。</li>
     </ul>
     <p>节点预算会统计所有占用或正在申请资源的相关状态，并加上请求中的 <code>slurm.max_concurrent_nodes</code>（未声明时为脚本推导值）。数组任务使用 <code>squeue -r</code> 展开，因此检查有意偏保守。同一 Git checkout 内的查询—提交窗口会串行化；跨 clone 和人工提交的硬上限仍需 SLURM QOS/account 保证。</p>
     <div class="warn"><p><code>--skip-node-check</code> 仅用于 SLURM，会跳过节点预算检查，只应在操作者明确授权后使用。</p></div>
@@ -509,7 +509,7 @@ root = ".."</code></pre>
         <tr><td><code>expctl status &lt;id&gt; [--watch [SECONDS]] [--json]</code></td><td>查询一次状态，或按所选后端定时刷新到终态</td></tr>
         <tr><td><code>expctl logs &lt;id&gt; [--tail N] [--follow] [--worktree-root DIR]</code></td><td>查看运行中或已收集日志；默认显示末尾 100 行</td></tr>
         <tr><td><code>expctl cancel &lt;id&gt; [--reason TEXT] [--dry-run] [--json]</code></td><td>预览或执行后端取消，并记录审计信息</td></tr>
-        <tr><td><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;] [--json]</code></td><td>复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致</td></tr>
+        <tr><td><code>expctl collect &lt;id&gt; [--worktree-root &lt;dir&gt;] [--json]</code></td><td>复制日志、提取指标并更新回执；默认使用回执记录的 worktree</td></tr>
         <tr><td><code>expctl collect --all [--worktree-root &lt;dir&gt;] [--json]</code></td><td>按 ID 从旧到新收集所有尚未收集的回执；未结束的作业跳过，单个失败不影响其余请求</td></tr>
         <tr><td><code>expctl clean &lt;id&gt; [--dry-run] [--worktree-root DIR] [--json]</code></td><td>收集后验证并删除 detached worktree，不删除结果证据</td></tr>
         <tr><td><code>expctl report &lt;id&gt; [--json]</code></td><td>从请求、回执和指标生成 <code>results/&lt;id&gt;/report.md</code> 骨架；已存在时拒绝覆盖</td></tr>

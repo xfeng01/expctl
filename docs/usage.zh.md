@@ -203,7 +203,7 @@ expctl logs <id> --tail 100
 expctl logs <id> --follow
 ```
 
-运行时从回执核验的 worktree 读取 `outputs.log_glob`，收集后则从结果目录读取。若提交时指定了 `--worktree-root`，运行中查看日志也须传入同一目录；`--follow` 以 Ctrl+C 结束。
+运行时从回执核验的 worktree 读取 `outputs.log_glob`，收集后则从结果目录读取。提交时即使用了 `--worktree-root`，这里也无需重复传入；`--follow` 以 Ctrl+C 结束。
 
 不再需要作业时先预览，再发出取消请求：
 
@@ -224,7 +224,7 @@ expctl collect --all [--worktree-root <dir>]
 `collect` 会：
 
 - 校验请求文件的 SHA-256 是否与回执一致；
-- 根据请求重新计算 worktree 并与回执核对；若 `submit` 使用了 `--worktree-root`，`collect` 必须传入相同目录；
+- 使用回执记录的 worktree，并核对其目录名等于 `code.worktree`、且不在主仓库内；提交时用过的 `--worktree-root` 无需重复传入，显式传入时则要求两者一致；
 - 确认后端已经终止，再将匹配 `outputs.log_glob` 且文件名不冲突的日志暂存并发布到 `<root>/results/<id>/logs/`；
 - 从复制后的日志提取指标并写入 `metrics.json`，在回执中记录 `missing_metrics`；
 - 将后端终态写入回执，并把回执状态改为 `collected`。
@@ -248,7 +248,7 @@ expctl clean <id> --dry-run
 expctl clean <id>
 ```
 
-`clean` 重新核对回执、固定提交、仓库归属和工作树内容，只允许 `collected` 回执，并拒绝仍被未收集 rerun 使用的 worktree。它只删除 worktree，不删除结果证据；共享目录的符号链接目标不会被删除。若提交时使用了自定义 worktree 根目录，这里也必须传入相同的 `--worktree-root`。
+`clean` 重新核对回执、固定提交、仓库归属和工作树内容，只允许 `collected` 回执，并拒绝仍被未收集 rerun 使用的 worktree。它只删除 worktree，不删除结果证据；共享目录的符号链接目标不会被删除。与 `logs`、`collect` 一样，它直接使用回执记录的 worktree，无需重复传入提交时的 `--worktree-root`。
 
 ## 六、请求文件参考
 
@@ -309,7 +309,7 @@ root = ".."
 - `scheduler.max_total_nodes`：仅用于 SLURM；当前用户的跨作业节点上限，`0` 表示禁用检查。
 - `runtime.shared_dirs`：从主工作树链接到实验 worktree 的顶层目录名。源目录不存在时跳过。
 - `runtime.create_missing`：提交前可在主工作树中自动创建的共享目录，必须是 `shared_dirs` 的子集。
-- `worktree.root`：实验 worktree 的父目录；相对路径以仓库根目录为基准。
+- `worktree.root`：实验 worktree 的父目录；相对路径以仓库根目录为基准。`expctl.toml` 由所有人共享，若某台机器需要放到别处（例如集群的 scratch 文件系统），设置环境变量 `EXPCTL_WORKTREE_ROOT` 即可在本机覆盖它（支持 `~`）；`submit --worktree-root` 仍可单次覆盖两者，`doctor` 会显示当前生效的目录。
 
 SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURING`、`SUSPENDED` 和 `RESIZING` 作业按实际节点名去重，`PENDING` 作业按 `squeue` 报告的节点数累加，再加上请求中的 `slurm.max_concurrent_nodes`（未声明时使用脚本推导出的节点数）。数组任务使用 `squeue -r` 展开，因此该检查有意偏保守。expctl 会在同一 Git checkout 内串行化预算查询和 `sbatch`，但不同 clone 或人工提交之间的硬上限仍应由 SLURM QOS/account 策略保证。`--skip-node-check` 仅适用于 SLURM，并且只应在操作者明确授权后使用。
 
@@ -331,7 +331,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl status <id> [--watch [<seconds>]] [--json]` | 查询一次状态，或按所选后端定时刷新直到终态 |
 | `expctl logs <id> [--tail <n>] [--follow] [--worktree-root <dir>]` | 查看运行中或已收集的日志；默认显示末尾 100 行 |
 | `expctl cancel <id> [--reason <text>] [--dry-run] [--json]` | 预览或执行后端取消，并在回执中记录审计信息 |
-| `expctl collect <id> [--worktree-root <dir>] [--json]` | 复制日志、提取指标并更新回执；自定义 worktree 根目录须与提交时一致 |
+| `expctl collect <id> [--worktree-root <dir>] [--json]` | 复制日志、提取指标并更新回执；默认使用回执记录的 worktree |
 | `expctl collect --all [--worktree-root <dir>] [--json]` | 按 ID 从旧到新收集所有尚未收集的回执；未结束的作业跳过，单个失败不影响其余请求 |
 | `expctl clean <id> [--dry-run] [--worktree-root <dir>] [--json]` | 结果收集后验证并删除 detached worktree，不删除结果证据 |
 | `expctl report <id> [--json]` | 从请求、回执和指标生成 `results/<id>/report.md` 骨架；已存在时拒绝覆盖 |

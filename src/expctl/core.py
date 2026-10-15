@@ -53,6 +53,8 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 __version__ = "0.12.0"
 
 CONFIG_NAME = "expctl.toml"
+# Overrides worktree.root on one machine without editing the shared policy.
+WORKTREE_ROOT_ENV = "EXPCTL_WORKTREE_ROOT"
 DEFAULT_ROOT = "expctl"
 DEFAULT_SHARED_DIRS = (".venv", "data", "runs", "logs")
 DEFAULT_CREATE_MISSING = ("runs", "logs")
@@ -575,9 +577,10 @@ def load_config(repo: Path) -> Config:
                 f"runtime.create_missing entry must also be in shared_dirs: {name}"
             )
 
-    root = tables["worktree"].get("root", "..")
+    root = os.environ.get(WORKTREE_ROOT_ENV) or tables["worktree"].get("root", "..")
     if not isinstance(root, str) or not root.strip():
         raise ExpctlError("worktree.root must be a non-empty string")
+    root = os.path.expanduser(root)
 
     required_script_lines = _config_list(
         tables["scheduler"], "required_script_lines", "scheduler", ()
@@ -1613,13 +1616,11 @@ def doctor_repo(repo: Path) -> dict[str, Any]:
             reasons.append(f"nearest existing parent is not writable: {writable_path}")
         if worktree_root.exists() and not worktree_root.is_dir():
             reasons.append("path exists but is not a directory")
+        detail = str(worktree_root) if root_ok else "; ".join(reasons)
+        if os.environ.get(WORKTREE_ROOT_ENV):
+            detail += f" (from {WORKTREE_ROOT_ENV})"
         checks.append(
-            _doctor_entry(
-                "Worktree root",
-                root_ok,
-                str(worktree_root) if root_ok else "; ".join(reasons),
-                scope="repository",
-            )
+            _doctor_entry("Worktree root", root_ok, detail, scope="repository")
         )
 
     checks.append(
@@ -3241,9 +3242,12 @@ def _verified_receipt_worktree(
     *,
     worktree_root: Path | None,
 ) -> Path:
-    expected_worktree = _worktree_path(
-        repo, config, request, override_root=worktree_root
-    )
+    """Return the worktree a receipt recorded, checked against its request.
+
+    Without `worktree_root` the recorded path is used wherever `submit` put
+    it, as long as it still ends in the request's `code.worktree` and stays
+    out of the main repository. An explicit `worktree_root` must match it.
+    """
     worktree_text = receipt.get("worktree")
     if (
         not isinstance(worktree_text, str)
@@ -3252,12 +3256,33 @@ def _verified_receipt_worktree(
     ):
         raise ExpctlError("submission receipt has no valid absolute worktree path")
     recorded_worktree = Path(worktree_text).resolve()
-    if recorded_worktree != expected_worktree:
-        raise ExpctlError(
-            f"receipt worktree {recorded_worktree} does not match expected worktree "
-            f"{expected_worktree}; pass the same --worktree-root used for submit"
+    if worktree_root is not None:
+        expected_worktree = _worktree_path(
+            repo, config, request, override_root=worktree_root
         )
-    return expected_worktree
+        if recorded_worktree != expected_worktree:
+            raise ExpctlError(
+                f"receipt worktree {recorded_worktree} does not match expected "
+                f"worktree {expected_worktree}; omit --worktree-root to use the "
+                "worktree recorded at submission"
+            )
+        return expected_worktree
+    name = _plain_name(_table(request, "code")["worktree"], "code.worktree")
+    if recorded_worktree.name != name:
+        raise ExpctlError(
+            f"receipt worktree {recorded_worktree} does not match "
+            f"code.worktree {name!r}"
+        )
+    repo = repo.resolve()
+    if (
+        recorded_worktree == repo
+        or recorded_worktree in repo.parents
+        or repo in recorded_worktree.parents
+    ):
+        raise ExpctlError(
+            f"receipt worktree {recorded_worktree} overlaps the main repository"
+        )
+    return recorded_worktree
 
 
 def _log_sources(
@@ -3873,23 +3898,9 @@ def collect_request(
                 )
             execution_status = None
 
-        expected_worktree = _worktree_path(
-            repo, config, request, override_root=worktree_root
+        expected_worktree = _verified_receipt_worktree(
+            repo, config, request, receipt, worktree_root=worktree_root
         )
-        worktree_text = receipt.get("worktree")
-        if (
-            not isinstance(worktree_text, str)
-            or not worktree_text
-            or not Path(worktree_text).is_absolute()
-        ):
-            raise ExpctlError("submission receipt has no valid absolute worktree path")
-        recorded_worktree = Path(worktree_text).resolve()
-        if recorded_worktree != expected_worktree:
-            raise ExpctlError(
-                f"receipt worktree {recorded_worktree} does not match expected "
-                f"worktree {expected_worktree}; pass the same --worktree-root used "
-                "for submit"
-            )
         if not expected_worktree.is_dir():
             raise ExpctlError(f"submission worktree is missing: {expected_worktree}")
         pattern = request["outputs"]["log_glob"].format(job_id=job_id)
@@ -4889,17 +4900,7 @@ def _render_clean_result(result: dict[str, Any]) -> str:
         heading = "CLEANUP PREVIEW"
         action = "would remove" if result.get("worktree_exists") else "already absent"
         next_steps = (
-            [
-                shlex.join(
-                    [
-                        "expctl",
-                        "clean",
-                        experiment_id,
-                        "--worktree-root",
-                        str(Path(result["worktree"]).parent),
-                    ]
-                )
-            ]
+            [shlex.join(["expctl", "clean", experiment_id])]
             if result.get("worktree_exists")
             else None
         )
@@ -5536,7 +5537,10 @@ def _parser() -> argparse.ArgumentParser:
     submit.add_argument(
         "--worktree-root",
         type=Path,
-        help="parent directory for detached experiment worktrees",
+        help=(
+            "parent directory for detached experiment worktrees "
+            f"(default: ${WORKTREE_ROOT_ENV}, else worktree.root)"
+        ),
     )
     submit.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
@@ -5589,7 +5593,10 @@ def _parser() -> argparse.ArgumentParser:
     logs.add_argument(
         "--worktree-root",
         type=Path,
-        help="parent directory used for the submitted experiment worktree",
+        help=(
+            "require the submitted worktree to be in this directory "
+            "(default: use the worktree recorded in the receipt)"
+        ),
     )
 
     collect = subparsers.add_parser(
@@ -5610,7 +5617,10 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument(
         "--worktree-root",
         type=Path,
-        help="parent directory used for the submitted experiment worktree",
+        help=(
+            "require the submitted worktree to be in this directory "
+            "(default: use the worktree recorded in the receipt)"
+        ),
     )
     collect.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
@@ -5628,7 +5638,10 @@ def _parser() -> argparse.ArgumentParser:
     clean.add_argument(
         "--worktree-root",
         type=Path,
-        help="parent directory used for the submitted experiment worktree",
+        help=(
+            "require the submitted worktree to be in this directory "
+            "(default: use the worktree recorded in the receipt)"
+        ),
     )
     clean.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"

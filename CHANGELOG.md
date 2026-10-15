@@ -16,6 +16,15 @@
   commit, and worktree name are replaced, and `rerun_of`/`rerun_reason` are
   dropped. It is the counterpart of `rerun` for repeating an experiment on
   newer code.
+- `logs`, `collect`, and `clean` now use the worktree recorded in the
+  receipt instead of recomputing it from `worktree.root`, so a
+  `--worktree-root` given to `submit` no longer has to be repeated (it used
+  to fail with "pass the same --worktree-root used for submit"). The
+  recorded path must still end in the request's `code.worktree` and lie
+  outside the repository; an explicit `--worktree-root` must match it.
+- The `EXPCTL_WORKTREE_ROOT` environment variable overrides `worktree.root`
+  on one machine without editing the shared `expctl.toml`; `doctor` reports
+  when it is in effect.
 
 ## 0.12.0 — 2026-09-19
 

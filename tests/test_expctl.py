@@ -2823,6 +2823,70 @@ def test_collect_rejects_a_receipt_worktree_outside_the_expected_root(
         core.collect_request(repo, config, EXAMPLE_ID, worktree_root=worktree_root)
 
 
+def test_receipt_worktree_is_used_without_repeating_the_worktree_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    config = load_config(repo)
+    worktree_root, worktree = _collect_worktree(tmp_path)
+    (worktree / "logs").mkdir(parents=True)
+    (worktree / "logs" / "example-123_0.out").write_text(
+        "gen_ppl: 9.5\n", encoding="utf-8"
+    )
+    receipt_path = _collectable_receipt(repo, worktree)
+    _disable_collection_lock(monkeypatch)
+    monkeypatch.setattr(core, "_queue_status", lambda *args: [])
+    monkeypatch.setattr(
+        core, "_scheduler_status", lambda *args: {"state": "COMPLETED", "jobs": []}
+    )
+
+    # worktree.root is "..", but submit put the worktree somewhere else.
+    logs = core.logs_request(repo, config, EXAMPLE_ID, tail=5)
+    assert logs["logs"][0]["content"] == "gen_ppl: 9.5\n"
+    with pytest.raises(ExpctlError, match="omit --worktree-root"):
+        core.logs_request(repo, config, EXAMPLE_ID, tail=5, worktree_root=repo.parent)
+    collected = core.collect_request(repo, config, EXAMPLE_ID)
+    assert collected["missing_metrics"] == []
+    assert collected["logs"] == [f"expctl/results/{EXAMPLE_ID}/logs/example-123_0.out"]
+
+    # The recorded path must still name the request's worktree outside the repo.
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    for recorded, message in (
+        (worktree_root / "someone-else", "does not match code.worktree"),
+        (repo / "myproject-example", "overlaps the main repository"),
+    ):
+        receipt["worktree"] = str(recorded)
+        with pytest.raises(ExpctlError, match=message):
+            core._verified_receipt_worktree(
+                repo,
+                config,
+                load_request(repo, config, EXAMPLE_ID, check_git=False)[0],
+                receipt,
+                worktree_root=None,
+            )
+
+
+def test_worktree_root_environment_overrides_the_shared_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    monkeypatch.setenv("EXPCTL_WORKTREE_ROOT", "")
+    assert load_config(repo).worktree_root == ".."
+
+    monkeypatch.setenv("EXPCTL_WORKTREE_ROOT", "~/expctl-worktrees")
+    config = load_config(repo)
+    assert config.worktree_root == os.path.expanduser("~/expctl-worktrees")
+    request, _ = load_request(repo, config, EXAMPLE_ID, check_git=False)
+    assert (
+        core._worktree_path(repo, config, request)
+        == (
+            Path(os.path.expanduser("~/expctl-worktrees")) / "myproject-example"
+        ).resolve()
+    )
+    checks = {check["name"]: check for check in core.doctor_repo(repo)["checks"]}
+    assert checks["Worktree root"]["detail"].endswith("(from EXPCTL_WORKTREE_ROOT)")
+
+
 def test_rerun_needs_a_receipt(tmp_path: Path) -> None:
     repo = _example_repo(tmp_path)
     config = load_config(repo)

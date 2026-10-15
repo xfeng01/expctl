@@ -119,6 +119,13 @@ list_limit = 20
 matching requests. Existing configurations without `display.list_limit`
 continue to show every request.
 
+`expctl.toml` is shared, but where worktrees fit often depends on the machine.
+Set `EXPCTL_WORKTREE_ROOT` (for example, to a scratch filesystem on the
+cluster) to override `worktree.root` on one machine; `~` is expanded and a
+relative path is resolved against the repository root. `submit
+--worktree-root DIR` still overrides both for one submission, and `doctor`
+reports which root is in effect.
+
 ## Execution backends
 
 A request must contain exactly one backend table.
@@ -309,10 +316,13 @@ it with SLURM manually.
 - An unreadable or structurally invalid receipt blocks worktree reuse and
   cleanup until its ownership evidence is restored; expctl never assumes a
   corrupt receipt is unrelated.
-- `collect` verifies the submitted worktree and publishes results once. If
-  `submit` used `--worktree-root`, pass the same directory to `collect`.
+- `collect` verifies the submitted worktree and publishes results once.
   `collect --all` does this for every uncollected receipt and skips jobs
   that have not finished.
+- `logs`, `collect`, and `clean` use the worktree recorded in the receipt,
+  provided it still ends in the request's `code.worktree` and lies outside
+  the repository, so a `--worktree-root` given to `submit` need not be
+  repeated. Passing `--worktree-root` to them asserts that location instead.
 - `cancel` records the operator, time, and optional reason after the backend
   accepts the request. `clean` never removes an uncollected worktree.
 - `expctl.toml` defines repository policy and should be committed.
