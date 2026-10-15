@@ -1226,6 +1226,9 @@ def test_list_batches_local_script_mode_checks(
     scripts.mkdir()
     for name in ("run-local.py", "plain.py"):
         (scripts / name).write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    # With core.filemode, the `git add -A` in _commit_all restages the mode on
+    # disk, so the executable bit has to be there too and not only in the index.
+    (scripts / "run-local.py").chmod(0o755)
     _git(repo, "add", "-A")
     _git(repo, "update-index", "--chmod=+x", "scripts/run-local.py")
     commit = _commit_all(repo, "local scripts")
