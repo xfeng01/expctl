@@ -34,10 +34,12 @@ import string
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import tomllib
 import unicodedata
 import uuid
+from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -5597,6 +5599,130 @@ def list_requests(
     return selected[:limit] if limit is not None else selected
 
 
+# Lifecycle stages of an open experiment, in the order the overview lists them.
+OVERVIEW_STAGES = ("submit", "running", "collect", "report", "attention")
+OVERVIEW_HEADERS = ("EXPERIMENT ID", "STATUS", "NEXT")
+
+
+def _short_references(experiment_ids: list[str]) -> dict[str, str]:
+    """Map each ID to the shortest reference that resolves back to it.
+
+    That is the short name after the date when no other request shares it,
+    since `resolve_experiment_id` matches a short name exactly before trying
+    substrings, and the full ID otherwise.
+    """
+    short_names = {
+        experiment_id: experiment_id.split("-", 1)[1]
+        for experiment_id in experiment_ids
+        if ID_RE.fullmatch(experiment_id)
+    }
+    counts = Counter(short_names.values())
+    return {
+        experiment_id: (
+            short_name
+            if (short_name := short_names.get(experiment_id))
+            and counts[short_name] == 1
+            and not ID_RE.fullmatch(short_name)
+            else experiment_id
+        )
+        for experiment_id in experiment_ids
+    }
+
+
+def _overview_step(
+    repo: Path, config: Config, row: dict[str, str], reference: str
+) -> tuple[str, str] | None:
+    """Return the lifecycle stage of a `list` row and the action it needs next.
+
+    A reviewed experiment has nothing left to do and returns None.
+    """
+    experiment_id, status = row["id"], row["status"]
+    folded = status.casefold()
+    if folded == "reviewed":
+        return None
+    if folded == "requested":
+        return "submit", shlex.join(["expctl", "submit", reference])
+    if folded == "collected":
+        return "report", shlex.join(["expctl", "report", reference])
+    if folded == "invalid":
+        if _stored_request_state(repo, config, experiment_id)["status"] != "invalid":
+            return "attention", shlex.join(["expctl", "validate", reference])
+        receipt = result_dir(repo, config, experiment_id) / "receipt.json"
+        return "attention", f"Inspect {receipt.relative_to(repo).as_posix()}"
+    if folded in {"preparing", "submitting", "submission_unknown"}:
+        return "attention", shlex.join(["expctl", "status", reference])
+    states = {_slurm_state_name(part) for part in status.split(",")}
+    if None in states or folded in {"submitted", "cancel_requested"}:
+        # No live state: the scheduler did not answer or the job ran elsewhere.
+        return "running", shlex.join(["expctl", "status", reference])
+    if states <= TERMINAL_SLURM_STATES:
+        return "collect", shlex.join(["expctl", "collect", reference])
+    return "running", shlex.join(["expctl", "status", reference, "--watch"])
+
+
+def overview(repo: Path, config: Config) -> dict[str, Any]:
+    """List every experiment that is not reviewed yet with its next action.
+
+    States are refreshed exactly as `list` refreshes them. Rows are ordered by
+    lifecycle stage, oldest ID first within a stage, and a stage with several
+    rows also gets the `--all` command that handles them together.
+    """
+    rows = list_requests(repo, config, sort_order="oldest")
+    references = _short_references([row["id"] for row in rows])
+    experiments: list[dict[str, str]] = []
+    for row in rows:
+        step = _overview_step(repo, config, row, references[row["id"]])
+        if step is not None:
+            experiments.append({**row, "stage": step[0], "next": step[1]})
+    experiments.sort(key=lambda row: OVERVIEW_STAGES.index(row["stage"]))
+    stages = Counter(row["stage"] for row in experiments)
+    batch = [
+        command
+        for stage, command in (
+            ("submit", "expctl submit --all"),
+            ("collect", "expctl collect --all"),
+        )
+        if stages[stage] > 1
+    ]
+    return {
+        "experiments": experiments,
+        "batch": batch,
+        "reviewed": len(rows) - len(experiments),
+        "total": len(rows),
+    }
+
+
+def _render_overview(result: dict[str, Any]) -> str:
+    experiments = result["experiments"]
+    reviewed = result["reviewed"]
+    start = 'expctl new <name> --title "<title>"'
+    if not experiments and reviewed:
+        lines = [
+            "Nothing to do: every experiment is reviewed.",
+            f"Start another with: {start}",
+        ]
+    elif not experiments:
+        lines = ["No experiment requests yet.", f"Start one with: {start}"]
+    else:
+        lines = [
+            "OPEN EXPERIMENTS",
+            _render_table(
+                OVERVIEW_HEADERS,
+                [(row["id"], row["status"], row["next"]) for row in experiments],
+            ),
+            "",
+        ]
+        if result["batch"]:
+            lines.append(f"All at once: {', '.join(result['batch'])}")
+        if reviewed:
+            lines.append(
+                f"{reviewed} reviewed experiment{'s' if reviewed != 1 else ''} "
+                "not shown: expctl list --status reviewed"
+            )
+    lines.append("Every command, by workflow stage: expctl --help")
+    return "\n".join(lines)
+
+
 def _status_filter_argument(value: str) -> tuple[str, ...]:
     statuses = tuple(status.strip().casefold() for status in value.split(","))
     if not statuses or any(not status for status in statuses):
@@ -5654,9 +5780,49 @@ def _select_list_rows(
     return selected[:limit] if limit is not None else selected
 
 
+# How `expctl --help` groups the subcommands. A command missing here is listed
+# under "Other" rather than hidden.
+COMMAND_GROUPS = (
+    ("Everyday, in order", ("new", "submit", "status", "collect", "report")),
+    ("Inspect", ("list", "show", "logs", "validate")),
+    ("Cancel, repeat, clean up", ("cancel", "rerun", "clean")),
+    ("Set up", ("init", "doctor")),
+)
+
+
+def _command_listing(summaries: dict[str, str], width: int) -> str:
+    """Render subcommand summaries grouped by workflow stage."""
+    grouped = {name for _, names in COMMAND_GROUPS for name in names}
+    groups = [
+        *(
+            (title, [name for name in names if name in summaries])
+            for title, names in COMMAND_GROUPS
+        ),
+        ("Other", [name for name in summaries if name not in grouped]),
+    ]
+    column = max(map(len, summaries)) + 4
+    blocks = []
+    for title, names in groups:
+        if names:
+            lines = [f"{title}:"]
+            lines.extend(
+                textwrap.fill(
+                    summaries[name],
+                    width,
+                    initial_indent=f"  {name:<{column - 2}}",
+                    subsequent_indent=" " * column,
+                )
+                for name in names
+            )
+            blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="expctl",
+        usage="%(prog)s [-h] [--version] [COMMAND ...]",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Manage repository-backed asynchronous experiment handoffs.",
         epilog=(
             "An ID argument naming an existing request may be shortened to its "
@@ -5664,7 +5830,10 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="version", version=f"expctl {__version__}")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # The grouped listing in the description replaces argparse's flat one.
+    subparsers = parser.add_subparsers(
+        dest="command", metavar="COMMAND", help=argparse.SUPPRESS
+    )
 
     subparsers.add_parser(
         "init", help=f"create {CONFIG_NAME} and the configured data skeleton"
@@ -5972,6 +6141,30 @@ def _parser() -> argparse.ArgumentParser:
     rerun.add_argument(
         "--json", action="store_true", help="emit JSON even in an interactive terminal"
     )
+
+    width = max(40, min(79, shutil.get_terminal_size().columns - 2))
+    summaries = {action.dest: action.help for action in subparsers._choices_actions}
+    for name, summary in summaries.items():
+        command = subparsers.choices[name]
+        if command.description is None:
+            command.description = f"{summary[0].upper()}{summary[1:]}."
+    parser.description = "\n\n".join(
+        [
+            textwrap.fill(
+                f"{parser.description} Run expctl with no command to see what "
+                "each open experiment needs next.",
+                width,
+            ),
+            _command_listing(summaries, width),
+        ]
+    )
+    parser.epilog = "\n\n".join(
+        textwrap.fill(text, width)
+        for text in (
+            'Run "expctl COMMAND --help" for the options of one command.',
+            parser.epilog,
+        )
+    )
     return parser
 
 
@@ -6003,7 +6196,8 @@ def _watch_status_command(
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     try:
         repo = find_repo_root()
         if args.command == "init":
@@ -6030,6 +6224,10 @@ def main(argv: list[str] | None = None) -> int:
                 ready = bool(result.get("local_ready", result["cluster_ready"]))
             return 0 if ready else 1
         config = load_config(repo)
+        if args.command is None:
+            result = overview(repo, config)
+            _print_command_result(result, _render_overview(result), force_json=False)
+            return 0
         id_argument = "source_id" if args.command == "new" else "experiment_id"
         reference = getattr(args, id_argument, None)
         if reference is not None:
@@ -6320,6 +6518,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
         return 0
     except ExpctlError as exc:
+        if args.command is None:
+            # Outside an initialized repository there is no overview to show,
+            # so show what expctl offers instead.
+            parser.print_help()
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

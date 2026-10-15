@@ -31,9 +31,34 @@ Run all commands inside the target Git working tree.
 
 ## Commands
 
+Day to day, two commands are enough: `expctl new <name>` starts a request,
+and `expctl` with no command lists every experiment that is not reviewed yet,
+each with the exact command it needs next:
+
+```text
+OPEN EXPERIMENTS
+EXPERIMENT ID      STATUS     NEXT
+-----------------  ---------  -----------------------------
+20261014-lr-sweep  requested  expctl submit lr-sweep
+20261012-decoder   RUNNING    expctl status decoder --watch
+20261011-stagger   COMPLETED  expctl collect stagger
+20261009-metric    collected  expctl report metric
+
+3 reviewed experiments not shown: expctl list --status reviewed
+Every command, by workflow stage: expctl --help
+```
+
+`expctl --help` groups the commands by workflow stage: the everyday
+`new`, `submit`, `status`, `collect`, and `report`, then commands to inspect,
+to cancel, repeat, or clean up, and to set up a repository.
+
 Complete command reference:
 
 ```text
+# Show every experiment that is not reviewed yet with the command it needs
+# next; several requests to submit or jobs to collect also get the --all form.
+expctl
+
 # Initialize expctl in the current repository.
 expctl init
 
@@ -284,6 +309,15 @@ collection and refuses one still claimed by an uncollected rerun.
 Human-oriented lifecycle commands show aligned detail and next-step tables in
 a terminal. Redirected output stays JSON unless the command emits raw logs;
 use `--json` to force JSON where supported.
+
+The bare `expctl` overview refreshes states exactly as `list` does and orders
+open experiments by stage: requests to submit, jobs queued or running,
+finished jobs to collect, collected results awaiting a report, and anything
+that needs attention (an invalid request, an unreadable receipt, or a
+submission without a confirmed job ID). Commands name each request by its
+short name when no other request shares it. Redirected output is a JSON object
+whose `experiments` rows carry `stage` and `next`. Outside an initialized
+repository, `expctl` prints the grouped help and the reason.
 
 `submit`, `status`, `logs --follow`, `cancel`, `collect`, and `clean` run on the
 Linux execution host. The other commands also work on Windows; non-following

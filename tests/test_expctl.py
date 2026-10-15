@@ -3865,3 +3865,181 @@ def test_output_dir_materialised_by_the_checkout_is_kept(tmp_path: Path) -> None
     (worktree / "data").mkdir()
     with pytest.raises(ExpctlError, match="already exists"):
         _ensure_runtime_links(repo, config, worktree)
+
+
+def _overview_config() -> Config:
+    return Config(
+        root="expctl",
+        required_script_lines=(),
+        max_total_nodes=0,
+        shared_dirs=(),
+        create_missing=(),
+        worktree_root="..",
+    )
+
+
+def test_short_references_fall_back_to_the_full_id_when_ambiguous() -> None:
+    assert core._short_references(
+        [
+            "20261001-lr-sweep",
+            "20261002-lr-sweep",
+            "20261003-lr-sweep-r2",
+            "20261004-20261001-probe",
+            "not-an-id",
+        ]
+    ) == {
+        "20261001-lr-sweep": "20261001-lr-sweep",
+        "20261002-lr-sweep": "20261002-lr-sweep",
+        "20261003-lr-sweep-r2": "lr-sweep-r2",
+        # A short name shaped like an ID would be read as that ID.
+        "20261004-20261001-probe": "20261004-20261001-probe",
+        "not-an-id": "not-an-id",
+    }
+
+
+def test_overview_orders_open_experiments_by_stage_with_their_next_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = [
+        {"id": "20261001-broken-receipt", "status": "invalid", "title": "bad"},
+        {"id": "20261002-bad-commit", "status": "invalid", "title": "bad"},
+        {"id": "20261003-done", "status": "reviewed", "title": "done"},
+        {"id": "20261004-metric", "status": "collected", "title": "metric"},
+        {"id": "20261005-stagger", "status": "COMPLETED", "title": "stagger"},
+        {"id": "20261006-cancelled", "status": "CANCELLED by 42", "title": "c"},
+        {"id": "20261007-array", "status": "MIXED", "title": "array"},
+        {"id": "20261008-decoder", "status": "RUNNING", "title": "decoder"},
+        {"id": "20261009-quiet", "status": "submitted", "title": "no squeue"},
+        {"id": "20261010-elsewhere", "status": "UNKNOWN", "title": "other host"},
+        {"id": "20261011-lost", "status": "submission_unknown", "title": "lost"},
+        {"id": "20261012-probe", "status": "requested", "title": "probe"},
+        {"id": "20261013-sweep", "status": "requested", "title": "sweep"},
+    ]
+    broken = tmp_path / "expctl" / "results" / "20261001-broken-receipt"
+    broken.mkdir(parents=True)
+    (broken / "receipt.json").write_text("{not json", encoding="utf-8")
+    seen: dict[str, Any] = {}
+
+    def fake_list_requests(repo: Path, config: Config, **options: Any) -> list:
+        seen.update(options)
+        return rows
+
+    monkeypatch.setattr(core, "list_requests", fake_list_requests)
+
+    result = core.overview(tmp_path, _overview_config())
+
+    assert seen == {"sort_order": "oldest"}
+    assert [
+        (row["id"], row["stage"], row["next"]) for row in result["experiments"]
+    ] == [
+        ("20261012-probe", "submit", "expctl submit probe"),
+        ("20261013-sweep", "submit", "expctl submit sweep"),
+        ("20261007-array", "running", "expctl status array --watch"),
+        ("20261008-decoder", "running", "expctl status decoder --watch"),
+        ("20261009-quiet", "running", "expctl status quiet"),
+        ("20261010-elsewhere", "running", "expctl status elsewhere"),
+        ("20261005-stagger", "collect", "expctl collect stagger"),
+        ("20261006-cancelled", "collect", "expctl collect cancelled"),
+        ("20261004-metric", "report", "expctl report metric"),
+        (
+            "20261001-broken-receipt",
+            "attention",
+            "Inspect expctl/results/20261001-broken-receipt/receipt.json",
+        ),
+        ("20261002-bad-commit", "attention", "expctl validate bad-commit"),
+        ("20261011-lost", "attention", "expctl status lost"),
+    ]
+    assert result["experiments"][0]["title"] == "probe"
+    assert result["batch"] == ["expctl submit --all", "expctl collect --all"]
+    assert result["reviewed"] == 1 and result["total"] == len(rows)
+
+    human = core._render_overview(result)
+    assert human.startswith("OPEN EXPERIMENTS\n")
+    assert "EXPERIMENT ID" in human and "NEXT" in human
+    assert "All at once: expctl submit --all, expctl collect --all" in human
+    assert "1 reviewed experiment not shown" in human
+    assert human.endswith("expctl --help")
+
+
+def test_overview_points_to_new_when_nothing_is_open() -> None:
+    empty = {"experiments": [], "batch": [], "reviewed": 0, "total": 0}
+    assert "No experiment requests yet." in core._render_overview(empty)
+    assert "expctl new <name>" in core._render_overview(empty)
+
+    done = {"experiments": [], "batch": [], "reviewed": 3, "total": 3}
+    assert "every experiment is reviewed" in core._render_overview(done)
+    assert "Start another with: expctl new" in core._render_overview(done)
+
+
+def test_bare_expctl_prints_the_overview_on_a_tty_and_json_otherwise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rows = [{"id": EXAMPLE_ID, "status": "requested", "title": "Example sweep"}]
+    monkeypatch.setattr(core, "find_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(core, "load_config", lambda repo: _overview_config())
+    monkeypatch.setattr(core, "list_requests", lambda *args, **options: rows)
+
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: True)
+    assert core.main([]) == 0
+    human = capsys.readouterr().out
+    assert "OPEN EXPERIMENTS" in human
+    assert "expctl submit example" in human
+
+    monkeypatch.setattr(core.sys.stdout, "isatty", lambda: False)
+    assert core.main([]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["experiments"][0]["next"] == "expctl submit example"
+
+
+def test_bare_expctl_outside_a_repository_shows_the_grouped_help(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(core, "find_repo_root", lambda: tmp_path)
+
+    assert core.main([]) == 2
+    captured = capsys.readouterr()
+    assert "Everyday, in order:" in captured.out
+    assert "expctl init" in captured.err
+
+
+def test_help_groups_every_command_by_workflow_stage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = core._parser()
+    grouped = [name for _, names in core.COMMAND_GROUPS for name in names]
+    subcommands = next(
+        action
+        for action in parser._actions
+        if isinstance(action, core.argparse._SubParsersAction)
+    ).choices
+    assert sorted(grouped) == sorted(subcommands)
+    assert grouped[:5] == ["new", "submit", "status", "collect", "report"]
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--help"])
+    help_text = capsys.readouterr().out
+    assert "usage: expctl [-h] [--version] [COMMAND ...]" in help_text
+    assert "Other:" not in help_text
+    for title, names in core.COMMAND_GROUPS:
+        assert f"{title}:" in help_text
+        assert all(f"\n  {name} " in help_text for name in names)
+    assert "expctl COMMAND --help" in help_text
+    assert "@ names the newest" in help_text
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["submit", "--help"])
+    assert "Start one request, or every request without a receipt." in (
+        capsys.readouterr().out
+    )
+
+
+def test_command_listing_keeps_an_ungrouped_command_visible() -> None:
+    listing = core._command_listing(
+        {"new": "create a request", "frobnicate": "something new"}, 79
+    )
+    assert "Everyday, in order:\n  new" in listing
+    assert "Other:\n  frobnicate" in listing

@@ -160,6 +160,23 @@ expctl submit <id> --backend local
 
 ## 五、提交、查看和收集
 
+不确定下一步该做什么时，直接运行不带子命令的 `expctl`。它按 `list` 的方式刷新状态，列出所有还没有 `reviewed` 的实验，并给出每个实验下一步要执行的命令：
+
+```text
+OPEN EXPERIMENTS
+EXPERIMENT ID      STATUS     NEXT
+-----------------  ---------  -----------------------------
+20261014-lr-sweep  requested  expctl submit lr-sweep
+20261012-decoder   RUNNING    expctl status decoder --watch
+20261011-stagger   COMPLETED  expctl collect stagger
+20261009-metric    collected  expctl report metric
+
+3 reviewed experiments not shown: expctl list --status reviewed
+Every command, by workflow stage: expctl --help
+```
+
+各行按阶段排列：待提交、排队或运行中、已结束待收集、已收集待写报告，最后是需要人工处理的（请求无效、回执无法读取、提交没有确认的作业号）。命令里用短名指代请求，只有和其他请求重名时才写完整 ID；同一阶段有多个请求时，还会给出 `expctl submit --all` 或 `expctl collect --all`。输出到管道或文件时是 JSON，每行带 `stage` 和 `next` 字段。`expctl --help` 按工作流阶段分组列出全部命令。
+
 在执行主机上的项目仓库中运行：
 
 ```bash
@@ -321,6 +338,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 
 | 命令 | 作用 |
 |---|---|
+| `expctl` | 列出所有还没有 `reviewed` 的实验及各自的下一步命令；重定向时输出 JSON |
 | `expctl init` | 补齐配置和 `paths.root` 指定的目录结构 |
 | `expctl doctor [--backend local\|slurm] [--cluster] [--json]` | 检查仓库和两个后端；选择 `--backend` 后对应检查计入退出码，`--cluster` 是 SLURM 别名 |
 | `expctl new <id> [--from <id>] [--title <text>] [--allow-dirty] [--json]` | 从模板（或用 `--from` 从已有请求）创建请求并固定当前 `HEAD`；只写短名时自动加当天日期；默认拒绝未提交改动 |

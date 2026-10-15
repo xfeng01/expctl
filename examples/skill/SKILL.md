@@ -19,6 +19,9 @@ weaken the repository's own cluster and branch rules here.
   before the run. Never reuse an ID for changed settings.
 - To inspect the queue, run `expctl list`, then `show` or `validate` the
   selected request. Report invalid or ambiguous requests instead of guessing.
+  Bare `expctl` prints a JSON object whose `experiments` rows name each open
+  request's `stage` and suggested `next` command; treat `next` as a pointer,
+  not as permission, so the rules below still apply to every submission.
 - To submit, first identify the request's `slurm` or `local` backend and show
   the operator the pinned commit, script, runtime requirements, backend
   settings, and `--dry-run` output. An explicit request to consume compute

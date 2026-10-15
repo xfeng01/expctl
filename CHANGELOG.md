@@ -37,6 +37,15 @@
   submission time, and execution host recorded in each receipt. The table
   shows local times and drops detail columns that are empty in every row;
   TSV and JSON carry every column. Default `list` output is unchanged.
+- `expctl` with no command now lists every experiment that is not reviewed
+  yet, ordered by lifecycle stage, with the exact command each one needs
+  next (`submit`, `status --watch`, `collect`, `report`, or what to inspect),
+  plus `submit --all`/`collect --all` when several requests share a stage.
+  States are refreshed as in `list`, and redirected output is JSON. It used
+  to fail with "the following arguments are required: command".
+- `expctl --help` groups the commands by workflow stage instead of one flat
+  list, and each `expctl <command> --help` now starts with a description of
+  the command.
 
 ## 0.12.0 — 2026-09-19
 
