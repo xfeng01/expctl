@@ -29,11 +29,51 @@ Python standard library.
 
 Run all commands inside the target Git working tree.
 
-## Commands
+## Quick start
 
-Day to day, two commands are enough: `expctl new <name>` starts a request,
-and `expctl` with no command lists every experiment that is not reviewed yet,
-each with the exact command it needs next:
+A request is a TOML file that pins the code, the script to run, and the
+question the run answers. Git carries it from the author to the runner and
+the results back; expctl never commits or pushes for you.
+
+Once per repository:
+
+```bash
+expctl init                     # writes expctl.toml and expctl/; edit, then commit
+expctl doctor --backend slurm   # on the execution host, or --backend local
+```
+
+Author a request. `new` pins the current `HEAD`, so commit the code the
+experiment needs first:
+
+```bash
+expctl new lr-sweep --title "Learning-rate sweep"   # expctl/requests/<today>-lr-sweep.toml
+# fill in the question, decision rule, outputs, and metrics, and keep exactly
+# one backend table: [slurm] or [local]
+expctl validate lr-sweep
+git add expctl/requests && git commit -m "Request lr-sweep" && git push
+```
+
+Run it on the execution host:
+
+```bash
+git pull --ff-only
+expctl submit lr-sweep --dry-run   # preview the backend, commit, worktree, and command
+expctl submit lr-sweep
+expctl status lr-sweep --watch     # refresh until the job finishes
+expctl logs lr-sweep --follow      # optional: stream the log
+expctl collect lr-sweep            # copy logs, extract metrics, record the verdict
+```
+
+Conclude:
+
+```bash
+expctl report lr-sweep             # scaffold results/<id>/report.md, then write the conclusion
+git add expctl/results && git commit -m "Results for lr-sweep" && git push
+```
+
+Whenever you are unsure what comes next, run `expctl` with no command. It
+lists every experiment that is not reviewed yet, each with the exact command
+it needs next:
 
 ```text
 OPEN EXPERIMENTS
@@ -48,9 +88,13 @@ EXPERIMENT ID      STATUS     NEXT
 Every command, by workflow stage: expctl --help
 ```
 
-`expctl --help` groups the commands by workflow stage: the everyday
-`new`, `submit`, `status`, `collect`, and `report`, then commands to inspect,
-to cancel, repeat, or clean up, and to set up a repository.
+To repeat an experiment, `expctl rerun lr-sweep` copies it to a new ID for the
+same code, while `expctl new lr-sweep-v2 --from lr-sweep` pins the current
+`HEAD` instead. `expctl cancel` stops a job and records who stopped it and
+why, and `expctl clean` removes a worktree once its results are collected.
+`expctl --help` lists every command grouped by workflow stage.
+
+## Commands
 
 Complete command reference:
 
@@ -136,10 +180,94 @@ that matches exactly one request is enough, and `@` names the newest request in
 expansion is echoed on stderr, for example `expctl: cross-probe ->
 20260829-cross-probe`. PowerShell needs the quoted form `'@'`.
 
+`submit`, `status`, `logs --follow`, `cancel`, `collect`, and `clean` run on the
+Linux execution host. The other commands also work on Windows; non-following
+`logs` works wherever its log path is available.
+
+### Output
+
+Human-oriented lifecycle commands show aligned detail and next-step tables in
+a terminal. Redirected output stays JSON unless the command emits raw logs;
+use `--json` to force JSON where supported.
+
+The bare `expctl` overview refreshes states exactly as `list` does and orders
+open experiments by stage: requests to submit, jobs queued or running,
+finished jobs to collect, collected results awaiting a report, and anything
+that needs attention (an invalid request, an unreadable receipt, or a
+submission without a confirmed job ID). Commands name each request by its
+short name when no other request shares it. Redirected output is a JSON object
+whose `experiments` rows carry `stage` and `next`. Outside an initialized
+repository, `expctl` prints the grouped help and the reason.
+
+In a terminal, `list` renders an aligned table. Redirected output defaults to
+TSV. For example:
+
+```text
+EXPERIMENT ID                 STATUS     TITLE
+----------------------------  ---------  ---------------------------
+20260829-stagger-control      FAILED     Iso-cost stagger control
+20260829-decoder-metric       PENDING    Decoder-induced metric
+20260829-decoder-cross-probe  RUNNING    Decoder block-RoPE probe
+```
+
+SLURM array tasks with mixed states show `MIXED`. If SLURM is unavailable or
+returns no state, `list` warns once on stderr and keeps affected SLURM rows as
+`submitted`. Local rows are refreshed from the recorded process and status
+file. Receipts are never modified by a refresh.
+
+`list --long` (or `-l`) adds the backend, job ID, submission time, and
+execution host recorded in each receipt; a `[slurm]` request run with
+`--backend local` shows as `local (slurm)`. The table shows submission times
+in local time and leaves out detail columns that are empty in every row;
+TSV and JSON always carry all of them, with the recorded ISO timestamps.
+
+`list` sorts newest requests first by default: rows are ordered by the ID's
+date, and same-day requests by the commit time that first added their file
+(an uncommitted request file counts as the newest of its day). `--sort
+oldest` reverses the order. `--status` is case-insensitive, may
+contain comma-separated values, and may be repeated. Filtering uses refreshed
+execution states. Each listing verifies pinned commits and scripts with a
+couple of batched `git cat-file` queries rather than one Git process per
+request. The configured or command-line limit is applied after filtering and
+sorting. Without a status filter, a limited listing validates and refreshes
+only those N request paths. Status-filtered listings scan in bounded batches
+and stop once N matches are found; `--all` performs a complete scan.
+
+For SLURM, `status` falls back to `sacct` when `squeue` is unavailable. For
+local runs, it checks the recorded process identity and exit-status file. With
+`--watch`, it stops at a terminal state; redirected or `--json` watch output
+is newline-delimited JSON.
+
+### Command notes
+
+`expctl new <id>` starts from `expctl/templates/request.toml` with the current
+commit, branch, ID, and worktree name filled in; `expctl new lr-sweep --title
+"Learning-rate sweep"` creates `<today>-lr-sweep` with its title. `new
+lr-sweep-v2 --from lr-sweep` copies that request's question, backend,
+environment, and outputs, replaces only the ID, branch, commit, and worktree
+name, and drops any `rerun_of`. (`rerun` is for the same code; `new --from`
+pins the current `HEAD`.)
+
+`new` refuses a dirty working tree because uncommitted changes are not part of
+the pinned `HEAD`; `--allow-dirty` is an explicit override. `validate` rejects
+a request that still carries starter-template placeholder values (title,
+question, decision rule, script, log glob, metrics, requirements).
+`validate --all` checks every request file in one pass, with the same batched
+Git queries as `list`, and lists each invalid one with its reason. `doctor`
+exits nonzero when a repository check fails; on the execution host add
+`--backend local` or `--backend slurm` to require that backend's checks. The
+legacy `--cluster` flag is an alias for `--backend slurm`.
+
 `--skip-node-check` applies only to SLURM submissions. It bypasses the
 cross-job node-budget check and requires explicit operator authorization.
 `--allow-login-node` lets a local job start on a host that looks like a SLURM
 login node; see [GPUs and login nodes](#gpus-and-login-nodes).
+
+`logs` reads the submitted worktree while a job is active and the collected
+result directory afterward. `clean` only removes a verified worktree after
+collection and refuses one still claimed by an uncollected rerun.
+
+### Settings
 
 Set a repository-wide default row count in `expctl.toml`:
 
@@ -293,76 +421,6 @@ so `submit --all --backend local` stays usable in a mixed repository.
 `--backend slurm` refuses a `[local]` request, and `--skip-node-check` is
 refused with `--backend local`.
 
-`new` refuses a dirty working tree because uncommitted changes are not part of
-the pinned `HEAD`; `--allow-dirty` is an explicit override. `validate` rejects
-a request that still carries starter-template placeholder values (title,
-question, decision rule, script, log glob, metrics, requirements).
-`validate --all` checks every request file in one pass, with the same batched
-Git queries as `list`, and lists each invalid one with its reason. `doctor`
-exits nonzero when a repository check fails; on the execution host add
-`--backend local` or `--backend slurm` to require that backend's checks. The
-legacy `--cluster` flag is an alias for `--backend slurm`.
-
-In a terminal, `list` renders an aligned table. Redirected output defaults to
-TSV. For example:
-
-```text
-EXPERIMENT ID                 STATUS     TITLE
-----------------------------  ---------  ---------------------------
-20260829-stagger-control      FAILED     Iso-cost stagger control
-20260829-decoder-metric       PENDING    Decoder-induced metric
-20260829-decoder-cross-probe  RUNNING    Decoder block-RoPE probe
-```
-
-SLURM array tasks with mixed states show `MIXED`. If SLURM is unavailable or
-returns no state, `list` warns once on stderr and keeps affected SLURM rows as
-`submitted`. Local rows are refreshed from the recorded process and status
-file. Receipts are never modified by a refresh.
-
-`list --long` (or `-l`) adds the backend, job ID, submission time, and
-execution host recorded in each receipt; a `[slurm]` request run with
-`--backend local` shows as `local (slurm)`. The table shows submission times
-in local time and leaves out detail columns that are empty in every row;
-TSV and JSON always carry all of them, with the recorded ISO timestamps.
-
-`list` sorts newest requests first by default: rows are ordered by the ID's
-date, and same-day requests by the commit time that first added their file
-(an uncommitted request file counts as the newest of its day). `--sort
-oldest` reverses the order. `--status` is case-insensitive, may
-contain comma-separated values, and may be repeated. Filtering uses refreshed
-execution states. Each listing verifies pinned commits and scripts with a
-couple of batched `git cat-file` queries rather than one Git process per
-request. The configured or command-line limit is applied after filtering and
-sorting. Without a status filter, a limited listing validates and refreshes
-only those N request paths. Status-filtered listings scan in bounded batches
-and stop once N matches are found; `--all` performs a complete scan.
-
-For SLURM, `status` falls back to `sacct` when `squeue` is unavailable. For
-local runs, it checks the recorded process identity and exit-status file. With
-`--watch`, it stops at a terminal state; redirected or `--json` watch output
-is newline-delimited JSON.
-
-`logs` reads the submitted worktree while a job is active and the collected
-result directory afterward. `clean` only removes a verified worktree after
-collection and refuses one still claimed by an uncollected rerun.
-
-Human-oriented lifecycle commands show aligned detail and next-step tables in
-a terminal. Redirected output stays JSON unless the command emits raw logs;
-use `--json` to force JSON where supported.
-
-The bare `expctl` overview refreshes states exactly as `list` does and orders
-open experiments by stage: requests to submit, jobs queued or running,
-finished jobs to collect, collected results awaiting a report, and anything
-that needs attention (an invalid request, an unreadable receipt, or a
-submission without a confirmed job ID). Commands name each request by its
-short name when no other request shares it. Redirected output is a JSON object
-whose `experiments` rows carry `stage` and `next`. Outside an initialized
-repository, `expctl` prints the grouped help and the reason.
-
-`submit`, `status`, `logs --follow`, `cancel`, `collect`, and `clean` run on the
-Linux execution host. The other commands also work on Windows; non-following
-`logs` works wherever its log path is available.
-
 ## Repository model
 
 Initialization creates:
@@ -416,15 +474,9 @@ it with SLURM manually.
 - `expctl.toml` defines repository policy and should be committed.
 - `expctl` never runs `git add`, `git commit`, or `git push`.
 
-Use `expctl new <id>` to start from `expctl/templates/request.toml` with the
-current commit, branch, ID, and worktree name filled in; `expctl new lr-sweep
---title "Learning-rate sweep"` creates `<today>-lr-sweep` with its title. To
-repeat an earlier experiment on newer code, `expctl new lr-sweep-v2 --from
-lr-sweep` copies that request's question, backend, environment, and outputs,
-replaces only the ID, branch, commit, and worktree name, and drops any
-`rerun_of`. (`rerun` is for the same code; `new --from` pins the current
-`HEAD`.) The
-[detailed guide (Chinese)](docs/usage.zh.md) covers every request field,
+## Further reading
+
+The [detailed guide (Chinese)](docs/usage.zh.md) covers every request field,
 configuration option, and recovery procedure. For an AI runner, adapt
 [`examples/skill/SKILL.md`](examples/skill/SKILL.md) with project-specific
 stopping conditions.
