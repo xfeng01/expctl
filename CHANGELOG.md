@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.1 — 2026-10-14
 
 - The bare `expctl` overview has a new `elsewhere` stage for jobs this host
   cannot check: a local job that runs on another host, and a SLURM job seen
