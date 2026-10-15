@@ -176,6 +176,8 @@ expctl submit <id>
 
 `list` 默认从新到旧排列：先按 ID 中的日期，同一天的请求再按其文件首次提交的 Git 时间排序（尚未提交的文件视为当天最新）；可用 `--sort oldest` 反转。`--status running,failed` 按实时或回执状态筛选且不区分大小写。`display.list_limit` 设置仓库默认显示数量，`--limit 20` 可临时覆盖，`--all` 则忽略默认限制并显示全部；限制在筛选和排序后应用。没有状态筛选时，有限列表只验证和刷新最终可能显示的 N 个请求；带状态筛选时按固定大小分批扫描，找到 N 个匹配项后停止；`--all` 才执行完整扫描。未配置 `display.list_limit` 的旧仓库仍显示所有请求。每批请求的固定 commit 和脚本通过少量批量 `git cat-file` 查询一次校验，而不是每个请求各起一个 Git 进程。
 
+`list --long`（或 `-l`）额外显示回执记录的后端、作业号、提交时间和执行主机；用 `--backend local` 运行的 `[slurm]` 请求显示为 `local (slurm)`。表格中提交时间换算为本地时间，并省略所有行都为空的详情列；TSV 和 JSON 始终包含全部列，时间保留回执中的 ISO 格式。
+
 面向生命周期的命令在交互终端中使用对齐表格显示详情和建议的下一步；输出到管道或文件时保持 JSON，原始日志除外。需要在终端中获取 JSON 时使用命令支持的 `--json`。
 
 `--dry-run` 会验证请求并输出后端、固定提交、worktree 路径和将要执行的命令；SLURM 请求还显示声明和推导的节点上限。它不会创建 worktree、链接共享目录、检查运行时依赖或启动作业。
@@ -322,7 +324,7 @@ SLURM 节点预算按以下方式计算：`RUNNING`、`COMPLETING`、`CONFIGURIN
 | `expctl init` | 补齐配置和 `paths.root` 指定的目录结构 |
 | `expctl doctor [--backend local\|slurm] [--cluster] [--json]` | 检查仓库和两个后端；选择 `--backend` 后对应检查计入退出码，`--cluster` 是 SLURM 别名 |
 | `expctl new <id> [--from <id>] [--title <text>] [--allow-dirty] [--json]` | 从模板（或用 `--from` 从已有请求）创建请求并固定当前 `HEAD`；只写短名时自动加当天日期；默认拒绝未提交改动 |
-| `expctl list [--table\|--tsv\|--json] [--status <states>] [--sort newest\|oldest] [--limit <n>\|--all] [--no-color]` | 列出请求及实时状态；默认数量可由 `display.list_limit` 配置，`--all` 显示全部 |
+| `expctl list [--table\|--tsv\|--json] [-l\|--long] [--status <states>] [--sort newest\|oldest] [--limit <n>\|--all] [--no-color]` | 列出请求及实时状态；默认数量可由 `display.list_limit` 配置，`--all` 显示全部；`--long` 增加后端、作业号、提交时间和执行主机列 |
 | `expctl validate <id> [--json]` | 验证请求、固定提交和作业脚本策略 |
 | `expctl validate --all [--json]` | 校验全部请求并列出无效项；有无效请求时退出码非零，适合 CI |
 | `expctl show <id> [--json]` | 终端下显示请求摘要（问题、判定规则、代码、后端、输出、已记录状态和下一步）；重定向或 `--json` 时输出 JSON |

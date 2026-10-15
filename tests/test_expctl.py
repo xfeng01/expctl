@@ -1450,7 +1450,9 @@ def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
     monkeypatch.setattr(
         core,
         "list_requests",
-        lambda repo, loaded, **options: core._select_list_rows(rows, **options),
+        lambda repo, loaded, details=False, **options: core._select_list_rows(
+            rows, **options
+        ),
     )
 
     assert core.main(["list"]) == 0
@@ -1467,7 +1469,7 @@ def test_list_cli_keeps_tsv_for_pipes_and_supports_json(
     monkeypatch.setattr(
         core,
         "list_requests",
-        lambda repo, loaded, **options: core._select_list_rows(
+        lambda repo, loaded, details=False, **options: core._select_list_rows(
             filtered_rows, **options
         ),
     )
@@ -1593,6 +1595,75 @@ def test_list_refreshes_submitted_receipts_without_mutating_them(
         {"id": EXAMPLE_ID, "status": "RUNNING", "title": "Example sweep"}
     ]
     assert json.loads(receipt.read_text(encoding="utf-8")) == original
+
+
+def test_list_long_adds_backend_job_submission_and_host_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _example_repo(tmp_path)
+    requests = repo / "expctl" / "requests"
+    (requests / "20260102-local.toml").write_text(
+        LOCAL_REQUEST.replace(EXAMPLE_ID, "20260102-local"), encoding="utf-8"
+    )
+    (requests / "20260103-broken.toml").write_text("version = [", encoding="utf-8")
+    receipt_dir = repo / "expctl" / "results" / EXAMPLE_ID
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "receipt.json").write_text(
+        json.dumps(
+            {
+                "backend": "slurm",
+                "job_id": "123",
+                "status": "submitted",
+                "submitted_at": "2026-08-28T00:26:08+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(repo)
+    monkeypatch.setattr(core, "_validate_request_git", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        core, "_live_scheduler_statuses", lambda *args: ({"123": "RUNNING"}, None)
+    )
+
+    rows = core.list_requests(repo, config, sort_order="oldest", details=True)
+
+    assert rows[0] == {
+        "id": EXAMPLE_ID,
+        "status": "RUNNING",
+        "title": "Example sweep",
+        "backend": "slurm",
+        "job_id": "123",
+        "submitted_at": "2026-08-28T00:26:08+00:00",
+        "host": "",
+    }
+    assert rows[1]["backend"] == "local" and rows[1]["job_id"] == ""
+    assert rows[2]["status"] == "invalid" and rows[2]["backend"] == ""
+    first_tsv_row = core._render_list_tsv(rows, details=True).splitlines()[0]
+    assert first_tsv_row.split("\t") == [
+        EXAMPLE_ID,
+        "RUNNING",
+        "slurm",
+        "123",
+        "2026-08-28T00:26:08+00:00",
+        "",
+        "Example sweep",
+    ]
+    table = core._render_long_list_table(rows, terminal_width=200, color=False)
+    header, _, first, *_ = table.splitlines()
+    assert header.split() == [
+        "EXPERIMENT",
+        "ID",
+        "STATUS",
+        "BACKEND",
+        "JOB",
+        "ID",
+        "SUBMITTED",
+        "TITLE",
+    ]
+    assert core._local_timestamp("2026-08-28T00:26:08+00:00") in first
+    assert first.endswith("Example sweep")
+    # Without --long the rows keep their three keys.
+    assert set(core.list_requests(repo, config)[0]) == {"id", "status", "title"}
 
 
 def test_live_list_status_summarizes_queue_and_accounting(

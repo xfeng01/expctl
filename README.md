@@ -47,7 +47,7 @@ expctl doctor [--backend slurm|local] [--cluster] [--json]
 expctl new <id> [--from ID] [--title TEXT] [--allow-dirty] [--json]
 
 # List, filter, sort, and limit experiment requests.
-expctl list [--table | --tsv | --json] [--status STATUS[,STATUS...]] [--sort newest|oldest] [--limit N | --all] [--no-color]
+expctl list [--table | --tsv | --json] [-l | --long] [--status STATUS[,STATUS...]] [--sort newest|oldest] [--limit N | --all] [--no-color]
 
 # Describe one validated request. A terminal gets a summary of its question,
 # decision rule, code, backend, outputs, and recorded state with next steps;
@@ -253,6 +253,12 @@ SLURM array tasks with mixed states show `MIXED`. If SLURM is unavailable or
 returns no state, `list` warns once on stderr and keeps affected SLURM rows as
 `submitted`. Local rows are refreshed from the recorded process and status
 file. Receipts are never modified by a refresh.
+
+`list --long` (or `-l`) adds the backend, job ID, submission time, and
+execution host recorded in each receipt; a `[slurm]` request run with
+`--backend local` shows as `local (slurm)`. The table shows submission times
+in local time and leaves out detail columns that are empty in every row;
+TSV and JSON always carry all of them, with the recorded ISO timestamps.
 
 `list` sorts newest requests first by default: rows are ordered by the ID's
 date, and same-day requests by the commit time that first added their file

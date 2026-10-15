@@ -5086,6 +5086,15 @@ def _print_command_result(
 
 
 LIST_HEADERS = ("EXPERIMENT ID", "STATUS", "TITLE")
+LIST_LONG_COLUMNS = (
+    ("id", "EXPERIMENT ID"),
+    ("status", "STATUS"),
+    ("backend", "BACKEND"),
+    ("job_id", "JOB ID"),
+    ("submitted_at", "SUBMITTED"),
+    ("host", "HOST"),
+    ("title", "TITLE"),
+)
 STATUS_COLORS = {
     "requested": "\x1b[36m",
     "preparing": "\x1b[33m",
@@ -5229,10 +5238,73 @@ def _render_list_table(
     return "\n".join(lines)
 
 
-def _render_list_tsv(rows: list[dict[str, str]]) -> str:
-    return "\n".join(
-        "\t".join(_safe_list_cell(row[key]) for key in ("id", "status", "title"))
+def _local_timestamp(value: str) -> str:
+    """Show a recorded ISO timestamp as local minutes; keep anything else as is."""
+    try:
+        moment = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    return moment.strftime("%Y-%m-%d %H:%M")
+
+
+def _render_long_list_table(
+    rows: list[dict[str, str]], *, terminal_width: int, color: bool
+) -> str:
+    """Render `list --long`, dropping detail columns that are empty in every row."""
+    if not rows:
+        return "No experiment requests."
+    cells = [
+        {
+            key: _safe_list_cell(
+                _local_timestamp(row[key])
+                if key == "submitted_at" and row[key]
+                else row[key]
+            )
+            for key, _ in LIST_LONG_COLUMNS
+        }
         for row in rows
+    ]
+    columns = [
+        (key, header)
+        for key, header in LIST_LONG_COLUMNS
+        if key in {"id", "status", "title"} or any(cell[key] for cell in cells)
+    ]
+    widths = {
+        key: max(_display_width(header), *(_display_width(cell[key]) for cell in cells))
+        for key, header in columns
+    }
+    # Every other column keeps its natural width; the title takes what is
+    # left, but never shrinks below ten columns.
+    fixed = sum(width + 2 for key, width in widths.items() if key != "title")
+    widths["title"] = max(
+        min(widths["title"], 10), min(widths["title"], terminal_width - fixed)
+    )
+    rule = _list_rule_character()
+    lines = [
+        "  ".join(
+            _fit_list_cell(header, widths[key]) for key, header in columns
+        ).rstrip(),
+        "  ".join(rule * widths[key] for key, _ in columns).rstrip(),
+    ]
+    for cell in cells:
+        rendered = []
+        for key, _ in columns:
+            value = _fit_list_cell(cell[key], widths[key])
+            if key == "status" and color and cell[key] in STATUS_COLORS:
+                value = f"{STATUS_COLORS[cell[key]]}{value}{ANSI_RESET}"
+            rendered.append(value)
+        lines.append("  ".join(rendered).rstrip())
+    return "\n".join(lines)
+
+
+def _render_list_tsv(rows: list[dict[str, str]], *, details: bool = False) -> str:
+    keys = (
+        [key for key, _ in LIST_LONG_COLUMNS] if details else ["id", "status", "title"]
+    )
+    return "\n".join(
+        "\t".join(_safe_list_cell(row[key]) for key in keys) for row in rows
     )
 
 
@@ -5326,6 +5398,22 @@ def _list_row_status(
     return status, None
 
 
+def _list_row_details(
+    repo: Path, config: Config, experiment_id: str, request: dict[str, Any]
+) -> dict[str, str]:
+    """The `list --long` columns: where and when a request ran, if it did."""
+    state = _stored_request_state(repo, config, experiment_id)
+    backend = state.get("backend") or _execution_table(request)[0]
+    if state.get("emulated_backend"):
+        backend = f"{backend} ({state['emulated_backend']})"
+    return {
+        "backend": backend,
+        "job_id": state.get("job_id", ""),
+        "submitted_at": state.get("submitted_at", ""),
+        "host": state.get("hostname", ""),
+    }
+
+
 def _list_request_batch(
     repo: Path,
     config: Config,
@@ -5333,6 +5421,7 @@ def _list_request_batch(
     *,
     commit_cache: dict[str, str | None],
     script_cache: dict[tuple[str, str, str], _ScriptCacheEntry],
+    details: bool = False,
 ) -> tuple[list[dict[str, str]], str | None]:
     """Validate and refresh one bounded batch of request paths.
 
@@ -5377,6 +5466,8 @@ def _list_request_batch(
             rows[index] = {"id": experiment_id, "status": "invalid", "title": str(exc)}
             continue
         rows[index]["status"] = status
+        if details:
+            rows[index].update(_list_row_details(repo, config, experiment_id, data))
         if job_id is not None:
             submitted_rows.setdefault(job_id, []).append(rows[index])
 
@@ -5444,6 +5535,7 @@ def list_requests(
     statuses: set[str] | None = None,
     sort_order: str = "oldest",
     limit: int | None = None,
+    details: bool = False,
 ) -> list[dict[str, str]]:
     """List requests while avoiding work for rows that cannot be displayed.
 
@@ -5486,6 +5578,7 @@ def list_requests(
             paths[offset : offset + batch_size],
             commit_cache=commit_cache,
             script_cache=script_cache,
+            details=details,
         )
         if warning and warning not in warnings:
             warnings.append(warning)
@@ -5497,6 +5590,10 @@ def list_requests(
 
     if warnings:
         print(f"warning: {'; '.join(warnings)}", file=sys.stderr)
+    if details:
+        for row in selected:  # invalid rows have no details to show
+            for key, _ in LIST_LONG_COLUMNS:
+                row.setdefault(key, "")
     return selected[:limit] if limit is not None else selected
 
 
@@ -5643,6 +5740,12 @@ def _parser() -> argparse.ArgumentParser:
     listing.set_defaults(list_format="auto")
     listing.add_argument(
         "--no-color", action="store_true", help="disable status colors in table output"
+    )
+    listing.add_argument(
+        "-l",
+        "--long",
+        action="store_true",
+        help="add backend, job ID, submission time, and execution host columns",
     )
     listing.add_argument(
         "--status",
@@ -5961,6 +6064,7 @@ def main(argv: list[str] | None = None) -> int:
                 statuses=statuses,
                 sort_order=args.sort,
                 limit=effective_limit,
+                details=args.long,
             )
             output_format = args.list_format
             if output_format == "auto":
@@ -5968,13 +6072,14 @@ def main(argv: list[str] | None = None) -> int:
             if output_format == "json":
                 output = json.dumps(rows, indent=2, ensure_ascii=True, sort_keys=True)
             elif output_format == "table":
-                output = _render_list_table(
+                render = _render_long_list_table if args.long else _render_list_table
+                output = render(
                     rows,
                     terminal_width=shutil.get_terminal_size(fallback=(120, 24)).columns,
                     color=_list_color_enabled() and not args.no_color,
                 )
             else:
-                output = _render_list_tsv(rows)
+                output = _render_list_tsv(rows, details=args.long)
             if output:
                 print(_stdout_safe(output))
         elif args.command == "validate":

@@ -33,6 +33,10 @@
   question, decision rule, recorded status and job, pinned code, backend
   settings, outputs, notes, and the next step. Redirected output is
   unchanged JSON, and `--json` forces it in a terminal.
+- Added `expctl list --long` (`-l`), which adds the backend, job ID,
+  submission time, and execution host recorded in each receipt. The table
+  shows local times and drops detail columns that are empty in every row;
+  TSV and JSON carry every column. Default `list` output is unchanged.
 
 ## 0.12.0 — 2026-09-19
 
