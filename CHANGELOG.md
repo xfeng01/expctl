@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.2 — 2026-11-08
+
+- `list` and `validate --all` no longer check a request that already has a
+  receipt against the current policy. Such a request can never be submitted
+  again, so a later change to `scheduler.required_script_lines` (for example a
+  narrower partition list) no longer turns every finished request `invalid`;
+  `list` shows its recorded state, and `validate --all` reports it as
+  `submitted` (`ALREADY SUBMITTED` in the summary line, a `submitted` array in
+  JSON) without counting it as invalid. Requests without a receipt, and
+  `submit` itself, are checked against the current policy as before.
+
 ## 0.13.1 — 2026-10-14
 
 - The bare `expctl` overview has a new `elsewhere` stage for jobs this host

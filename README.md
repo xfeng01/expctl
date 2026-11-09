@@ -271,7 +271,11 @@ the pinned `HEAD`; `--allow-dirty` is an explicit override. `validate` rejects
 a request that still carries starter-template placeholder values (title,
 question, decision rule, script, log glob, metrics, requirements).
 `validate --all` checks every request file in one pass, with the same batched
-Git queries as `list`, and lists each invalid one with its reason. `doctor`
+Git queries as `list`, and lists each invalid one with its reason. Requests
+that already have a receipt are reported as submitted and are not held to the
+current policy again, so tightening `scheduler.required_script_lines` affects
+only requests not yet submitted; `list` likewise shows their recorded state.
+`doctor`
 exits nonzero when a repository check fails; on the execution host add
 `--backend local` or `--backend slurm` to require that backend's checks. The
 legacy `--cluster` flag is an alias for `--backend slurm`.

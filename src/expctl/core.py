@@ -52,7 +52,7 @@ except ImportError:  # pragma: no cover - exercised by Windows users, not POSIX 
 
 # Kept in sync with pyproject.toml by tests; duplicated here so the single-file
 # copy still knows its version.
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 
 CONFIG_NAME = "expctl.toml"
 # Overrides worktree.root on one machine without editing the shared policy.
@@ -1366,19 +1366,26 @@ def validate_requests(repo: Path, config: Config) -> dict[str, Any]:
     """Validate every request file, oldest ID first, collecting each failure.
 
     Pinned commits and scripts are verified with the same batched Git queries
-    `list` uses, so checking a whole repository stays cheap.
+    `list` uses, so checking a whole repository stays cheap. A request that
+    already has a receipt is only parsed: it can never be submitted again, so
+    its pinned script is not held to the current policy and it is reported
+    under ``submitted`` rather than ``valid`` or ``invalid``.
     """
     requests_dir = repo / config.root / "requests"
     checked = sorted(path.stem for path in requests_dir.glob("*.toml"))
     loaded: list[tuple[str, dict[str, Any]]] = []
     failures: dict[str, str] = {}
+    submitted: list[str] = []
     for experiment_id in checked:
         try:
             data, _ = load_request(repo, config, experiment_id, check_git=False)
         except ExpctlError as exc:
             failures[experiment_id] = str(exc)
         else:
-            loaded.append((experiment_id, data))
+            if _has_receipt(repo, config, experiment_id):
+                submitted.append(experiment_id)
+            else:
+                loaded.append((experiment_id, data))
 
     commit_cache: dict[str, str | None] = {}
     script_cache: dict[tuple[str, str, str], _ScriptCacheEntry] = {}
@@ -1417,6 +1424,7 @@ def validate_requests(repo: Path, config: Config) -> dict[str, Any]:
             for experiment_id in checked
             if experiment_id in failures
         ],
+        "submitted": submitted,
     }
 
 
@@ -4967,11 +4975,19 @@ def _render_validate_batch_result(result: dict[str, Any]) -> str:
         (str(item["experiment_id"]), ("invalid", str(item.get("error", ""))))
         for item in result.get("invalid", [])
     )
+    submitted = [str(item) for item in result.get("submitted", [])]
+    outcomes.update(
+        (experiment_id, ("submitted", "receipt exists; not checked again"))
+        for experiment_id in submitted
+    )
     invalid = len(result.get("invalid", []))
-    valid = len(checked) - invalid
+    valid = len(checked) - invalid - len(submitted)
+    counts = f"{valid} VALID, {invalid} INVALID"
+    if submitted:
+        counts += f", {len(submitted)} ALREADY SUBMITTED"
     return "\n".join(
         [
-            f"VALIDATED {len(checked)} REQUESTS: {valid} VALID, {invalid} INVALID",
+            f"VALIDATED {len(checked)} REQUESTS: {counts}",
             _render_table(
                 ("EXPERIMENT ID", "RESULT", "DETAIL"),
                 [
@@ -5741,6 +5757,11 @@ def _stored_request_state(
     return state
 
 
+def _has_receipt(repo: Path, config: Config, experiment_id: str) -> bool:
+    """Whether a request was ever submitted (its receipt exists)."""
+    return (result_dir(repo, config, experiment_id) / "receipt.json").is_file()
+
+
 def _list_row_status(
     repo: Path, config: Config, experiment_id: str
 ) -> tuple[str, str | None]:
@@ -5810,10 +5831,13 @@ def _list_request_batch(
 
     Requests are parsed first so their pinned commits and scripts can be
     verified with a couple of batched Git queries instead of one Git process
-    per request.
+    per request. Only requests without a receipt are verified against the
+    pinned Git content: a submitted request can never be submitted again, so
+    a later policy change (such as a new required script line) must not turn
+    its recorded state into ``invalid``.
     """
     rows: list[dict[str, str]] = []
-    loaded: list[tuple[int, str, dict[str, Any]]] = []
+    loaded: list[tuple[int, str, dict[str, Any], bool]] = []
     for path in paths:
         experiment_id = path.stem
         try:
@@ -5821,7 +5845,8 @@ def _list_request_batch(
         except ExpctlError as exc:
             rows.append({"id": experiment_id, "status": "invalid", "title": str(exc)})
             continue
-        loaded.append((len(rows), experiment_id, data))
+        unsubmitted = not _has_receipt(repo, config, experiment_id)
+        loaded.append((len(rows), experiment_id, data, unsubmitted))
         rows.append(
             {"id": experiment_id, "status": "requested", "title": data["title"]}
         )
@@ -5829,21 +5854,22 @@ def _list_request_batch(
     _prefill_git_caches(
         repo,
         config,
-        [data for _, _, data in loaded],
+        [data for _, _, data, unsubmitted in loaded if unsubmitted],
         commit_cache=commit_cache,
         script_cache=script_cache,
     )
 
     submitted_rows: dict[str, list[dict[str, str]]] = {}
-    for index, experiment_id, data in loaded:
+    for index, experiment_id, data, unsubmitted in loaded:
         try:
-            _validate_request_git(
-                repo,
-                config,
-                data,
-                commit_cache=commit_cache,
-                script_cache=script_cache,
-            )
+            if unsubmitted:
+                _validate_request_git(
+                    repo,
+                    config,
+                    data,
+                    commit_cache=commit_cache,
+                    script_cache=script_cache,
+                )
             status, job_id = _list_row_status(repo, config, experiment_id)
         except ExpctlError as exc:
             rows[index] = {"id": experiment_id, "status": "invalid", "title": str(exc)}

@@ -1212,6 +1212,61 @@ def test_list_verifies_distinct_pinned_commits_with_two_git_queries(
     assert ["git", "show", f"{first}:scripts/sweep.slurm"] in commands
 
 
+def test_policy_change_does_not_invalidate_requests_that_already_have_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A later required line applies to new submissions, not to finished ones."""
+    repo = _pinned_repo(tmp_path)
+    script = repo / "scripts" / "sweep.slurm"
+    script.parent.mkdir()
+    script.write_text(
+        "#!/bin/bash\n#SBATCH -p example-partition\n#SBATCH --nodes=1\n",
+        encoding="utf-8",
+    )
+    commit = _commit_all(repo, "old partition line")
+    for experiment_id in ("20260101-done", "20260102-running", "20260103-pending"):
+        _write_pinned_request(repo, experiment_id, commit)
+    results = repo / "expctl" / "results"
+    (results / "20260101-done").mkdir(parents=True)
+    (results / "20260101-done" / "receipt.json").write_text(
+        json.dumps({"status": "collected"}), encoding="utf-8"
+    )
+    (results / "20260101-done" / "report.md").write_text("# done\n", encoding="utf-8")
+    (results / "20260102-running").mkdir(parents=True)
+    (results / "20260102-running" / "receipt.json").write_text(
+        json.dumps({"status": "failed", "backend": "slurm"}), encoding="utf-8"
+    )
+    # The policy changes after all three were filed.
+    (repo / "expctl.toml").write_text(
+        EXAMPLE_CONFIG.replace("example-partition", "new-partition"), encoding="utf-8"
+    )
+    config = load_config(repo)
+
+    rows = {row["id"]: row for row in core.list_requests(repo, config)}
+
+    assert {k: row["status"] for k, row in rows.items()} == {
+        "20260101-done": "reviewed",
+        "20260102-running": "failed",
+        "20260103-pending": "invalid",
+    }
+    assert "missing the required line" in rows["20260103-pending"]["title"]
+
+    result = core.validate_requests(repo, config)
+    assert result["submitted"] == ["20260101-done", "20260102-running"]
+    assert result["valid"] == []
+    assert [item["experiment_id"] for item in result["invalid"]] == ["20260103-pending"]
+    rendered = core._render_validate_batch_result(result)
+    assert rendered.startswith(
+        "VALIDATED 3 REQUESTS: 0 VALID, 1 INVALID, 2 ALREADY SUBMITTED\n"
+    )
+    monkeypatch.setattr(core, "find_repo_root", lambda: repo)
+    assert core.main(["validate", "--all", "--json"]) == 2
+    assert capsys.readouterr().err == "error: 1 of 3 requests are invalid\n"
+    # A new submission is still held to the current policy.
+    with pytest.raises(ExpctlError, match="missing the required line"):
+        core.load_request(repo, config, "20260103-pending")
+
+
 def test_list_batches_local_script_mode_checks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

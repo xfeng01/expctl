@@ -105,7 +105,7 @@ expctl doctor --backend slurm
 
 `validate` 会检查请求格式、固定提交和脚本。SLURM 脚本必须满足 `scheduler.required_script_lines`；local 脚本必须在固定提交中带有可执行位。模板占位符没有改掉、提交不在本地或脚本不在固定提交里时都会直接拒绝并给出提示。在终端中还会打印一屏后端、commit、脚本、环境、日志、指标和依赖摘要。回执生成前可以修正并重新发布请求；回执生成后必须保持文件字节不变。
 
-`expctl validate --all` 按 ID 从旧到新一次校验全部请求文件（与 `list` 一样使用批量 Git 查询），逐个列出无效请求及原因，有任何无效请求时退出码为非零，适合放进 CI 或 pre-commit 钩子。
+`expctl validate --all` 按 ID 从旧到新一次校验全部请求文件（与 `list` 一样使用批量 Git 查询），逐个列出无效请求及原因，有任何无效请求时退出码为非零，适合放进 CI 或 pre-commit 钩子。已有回执的请求不会再按当前策略检查，只标记为 `submitted`（已提交），不算无效；`list` 也直接显示它们回执里记录的状态。所以收紧 `scheduler.required_script_lines`（例如缩小分区列表）只影响还没提交的请求。
 
 ## 四、选择执行后端
 
